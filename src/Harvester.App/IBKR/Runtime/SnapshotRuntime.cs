@@ -259,11 +259,13 @@ public sealed class SnapshotRuntime
                 {
                     Console.WriteLine("[WARN] Completed with broker clock-skew gate failure.");
                 }
+                ExportAdapterTraceArtifact();
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
                 return 1;
             }
 
+            ExportAdapterTraceArtifact();
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
             PersistRuntimeState(runtimeStateStore, session, 0, runStartedUtc);
@@ -271,6 +273,7 @@ public sealed class SnapshotRuntime
         }
         catch (OperationCanceledException) when (_hasConnectivityFailure)
         {
+            ExportAdapterTraceArtifact();
             TransitionLifecycle(RuntimeLifecycleStage.Halted, "connectivity halt escalation");
             Console.WriteLine("[FAIL] Connectivity halt escalation triggered.");
             PrintErrors();
@@ -280,6 +283,7 @@ public sealed class SnapshotRuntime
         }
         catch (TimeoutException ex)
         {
+            ExportAdapterTraceArtifact();
             TransitionLifecycle(RuntimeLifecycleStage.Halted, $"timeout: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
@@ -289,6 +293,7 @@ public sealed class SnapshotRuntime
         }
         catch (Exception ex)
         {
+            ExportAdapterTraceArtifact();
             TransitionLifecycle(RuntimeLifecycleStage.Halted, $"exception: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
@@ -3539,6 +3544,35 @@ public sealed class SnapshotRuntime
         }
     }
 
+    private void ExportAdapterTraceArtifact()
+    {
+        var traces = _requestRegistry
+            .Snapshot()
+            .Where(r => r.Type.StartsWith("adapter:", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(r => r.StartedAtUtc)
+            .Select(r => new AdapterTraceArtifactRow(
+                r.CorrelationId,
+                r.RequestId,
+                r.Type["adapter:".Length..],
+                r.Origin,
+                r.Status,
+                r.StartedAtUtc,
+                r.EndedAtUtc,
+                r.Details))
+            .ToArray();
+
+        if (traces.Length == 0)
+        {
+            return;
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"adapter_trace_{_options.Mode.ToString().ToLowerInvariant()}_{timestamp}.json");
+        WriteJson(path, traces);
+        Console.WriteLine($"[OK] Adapter trace export: {path} (rows={traces.Length})");
+    }
+
     private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
     {
         if (_options.ReconciliationGateAction == ReconciliationGateAction.Off)
@@ -4873,4 +4907,15 @@ public sealed record DisplayGroupActionRow(
     int GroupId,
     string ContractInfo,
     string Action
+);
+
+public sealed record AdapterTraceArtifactRow(
+    Guid CorrelationId,
+    int? RequestId,
+    string Operation,
+    string Adapter,
+    RequestStatus Status,
+    DateTime StartedAtUtc,
+    DateTime? EndedAtUtc,
+    string? Metadata
 );
