@@ -2687,7 +2687,18 @@ public sealed class SnapshotRuntime
         File.WriteAllText(path, JsonSerializer.Serialize(rows, options));
     }
 
-    private static async Task<T> AwaitWithTimeout<T>(Task<T> task, CancellationToken cancellationToken, string stage)
+    private Task<T> AwaitWithTimeout<T>(Task<T> task, CancellationToken cancellationToken, string stage)
+    {
+        return AwaitTrackedWithTimeout(
+            task,
+            cancellationToken,
+            stage,
+            requestId: null,
+            requestType: stage,
+            origin: _options.Mode.ToString());
+    }
+
+    private static async Task<T> AwaitWithTimeoutCore<T>(Task<T> task, CancellationToken cancellationToken, string stage)
     {
         var delayTask = Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
         var winner = await Task.WhenAny(task, delayTask);
@@ -2715,7 +2726,7 @@ public sealed class SnapshotRuntime
 
         try
         {
-            var result = await AwaitWithTimeout(task, cancellationToken, stage);
+            var result = await AwaitWithTimeoutCore(task, cancellationToken, stage);
             _requestRegistry.Complete(correlationId, details: stage);
             return result;
         }
