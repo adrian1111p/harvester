@@ -5,7 +5,8 @@ public static class OrderReconciliation
     public static ReconciliationResult Reconcile(
         IReadOnlyCollection<OpenOrderRow> openOrders,
         IReadOnlyCollection<CompletedOrderRow> completedOrders,
-        IReadOnlyCollection<ExecutionRow> executions)
+        IReadOnlyCollection<ExecutionRow> executions,
+        IReadOnlyCollection<CommissionRow> commissions)
     {
         var rows = new Dictionary<string, CanonicalOrderLedgerRow>(StringComparer.OrdinalIgnoreCase);
         var diagnostics = new List<ReconciliationDiagnosticRow>();
@@ -82,6 +83,7 @@ public static class OrderReconciliation
         {
             var key = executionGroup.Key;
             var execs = executionGroup.ToArray();
+            var execIdSet = execs.Select(e => e.ExecId).Where(e => !string.IsNullOrWhiteSpace(e)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             var totalShares = execs.Sum(e => Math.Abs(e.Shares));
             var weightedNotional = execs.Sum(e => Math.Abs(e.Shares) * e.Price);
@@ -89,6 +91,8 @@ public static class OrderReconciliation
             var netFilled = execs.Sum(e => e.Side.Equals("BOT", StringComparison.OrdinalIgnoreCase) || e.Side.Equals("BUY", StringComparison.OrdinalIgnoreCase)
                 ? Math.Abs(e.Shares)
                 : -Math.Abs(e.Shares));
+            var matchedCommissions = commissions.Where(c => execIdSet.Contains(c.ExecId)).ToArray();
+            var commissionTotal = matchedCommissions.Length > 0 ? matchedCommissions.Sum(c => c.Commission) : (double?)null;
 
             if (!rows.TryGetValue(key, out var existing))
             {
@@ -107,7 +111,7 @@ public static class OrderReconciliation
                     FilledQuantity: Math.Abs(netFilled),
                     AverageFillPrice: avgPrice,
                     ExecutionCount: execs.Length,
-                    Commission: null,
+                    Commission: commissionTotal,
                     Sources: ["execution"]
                 );
 
@@ -124,8 +128,17 @@ public static class OrderReconciliation
                 FilledQuantity = Math.Abs(netFilled),
                 AverageFillPrice = avgPrice,
                 ExecutionCount = execs.Length,
+                Commission = commissionTotal,
                 Sources = MergeSources(existing.Sources, "execution")
             };
+
+            if (execs.Length > 0 && commissionTotal is null)
+            {
+                diagnostics.Add(new ReconciliationDiagnosticRow(
+                    "execution_without_commission",
+                    key,
+                    "Execution rows found without matched commission reports in current snapshot window."));
+            }
         }
 
         foreach (var row in rows.Values)

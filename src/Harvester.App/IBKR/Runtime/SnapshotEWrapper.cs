@@ -40,6 +40,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
     public ConcurrentQueue<CompletedOrderRow> CompletedOrders { get; } = new();
     public ConcurrentQueue<ExecutionRow> Executions { get; } = new();
+    public ConcurrentQueue<CommissionRow> Commissions { get; } = new();
     public ConcurrentQueue<PositionRow> Positions { get; } = new();
     public ConcurrentQueue<WhatIfOrderStateRow> WhatIfOrderStates { get; } = new();
     public ConcurrentQueue<TopTickRow> TopTicks { get; } = new();
@@ -210,6 +211,17 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public override void execDetailsEnd(int reqId)
     {
         _execDetailsEndTcs.TrySetResult(true);
+    }
+
+    public override void commissionReport(CommissionReport commissionReport)
+    {
+        Commissions.Enqueue(new CommissionRow(
+            DateTime.UtcNow,
+            commissionReport.ExecId,
+            commissionReport.Commission,
+            commissionReport.Currency,
+            commissionReport.RealizedPNL
+        ));
     }
 
     public override void position(string account, Contract contract, double pos, double avgCost)
@@ -750,6 +762,14 @@ public sealed record ExecutionRow(
     string Time,
     string Exchange,
     int ClientId
+);
+
+public sealed record CommissionRow(
+    DateTime TimestampUtc,
+    string ExecId,
+    double Commission,
+    string Currency,
+    double RealizedPnl
 );
 
 public sealed record WhatIfOrderStateRow(

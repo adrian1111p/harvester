@@ -285,23 +285,27 @@ public sealed class SnapshotRuntime
         var openOrdersPath = Path.Combine(outputDir, $"open_orders_{timestamp}.json");
         var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
         var executionsPath = Path.Combine(outputDir, $"executions_{timestamp}.json");
+        var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
 
         var reconciliation = OrderReconciliation.Reconcile(
             _wrapper.OpenOrders.ToArray(),
             _wrapper.CompletedOrders.ToArray(),
-            _wrapper.Executions.ToArray());
+            _wrapper.Executions.ToArray(),
+            _wrapper.Commissions.ToArray());
 
         WriteJson(openOrdersPath, _wrapper.OpenOrders.ToArray());
         WriteJson(completedOrdersPath, _wrapper.CompletedOrders.ToArray());
         WriteJson(executionsPath, _wrapper.Executions.ToArray());
+        WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
 
         Console.WriteLine($"[OK] Open orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
         Console.WriteLine($"[OK] Executions snapshot: {executionsPath} (rows={_wrapper.Executions.Count})");
+        Console.WriteLine($"[OK] Commissions snapshot: {commissionsPath} (rows={_wrapper.Commissions.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
     }
@@ -367,6 +371,7 @@ public sealed class SnapshotRuntime
         var openOrdersPath = Path.Combine(outputDir, $"open_orders_{timestamp}.json");
         var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
         var executionsPath = Path.Combine(outputDir, $"executions_{timestamp}.json");
+        var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
         var accountSummaryPath = Path.Combine(outputDir, $"account_summary_{timestamp}.json");
@@ -376,11 +381,13 @@ public sealed class SnapshotRuntime
         var reconciliation = OrderReconciliation.Reconcile(
             _wrapper.OpenOrders.ToArray(),
             _wrapper.CompletedOrders.ToArray(),
-            _wrapper.Executions.ToArray());
+            _wrapper.Executions.ToArray(),
+            _wrapper.Commissions.ToArray());
 
         WriteJson(openOrdersPath, _wrapper.OpenOrders.ToArray());
         WriteJson(completedOrdersPath, _wrapper.CompletedOrders.ToArray());
         WriteJson(executionsPath, _wrapper.Executions.ToArray());
+        WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
         WriteJson(accountSummaryPath, _wrapper.AccountSummaryRows.ToArray());
@@ -390,6 +397,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Open orders: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
         Console.WriteLine($"[OK] Executions: {executionsPath} (rows={_wrapper.Executions.Count})");
+        Console.WriteLine($"[OK] Commissions: {commissionsPath} (rows={_wrapper.Commissions.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
         Console.WriteLine($"[OK] Account summary: {accountSummaryPath} (rows={_wrapper.AccountSummaryRows.Count})");
