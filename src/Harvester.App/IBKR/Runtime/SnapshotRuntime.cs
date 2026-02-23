@@ -3517,6 +3517,7 @@ public sealed class SnapshotRuntime
             _options.Account,
             _options.Symbol,
             _options.ModelCode,
+            "US-EQUITIES",
             runStartedUtc,
             EnsureOutputDir(),
             _options.PreTradeSessionStartUtc,

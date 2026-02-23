@@ -8,6 +8,7 @@ public sealed record StrategyRuntimeContext(
     string Account,
     string Symbol,
     string? ModelCode,
+    string ExchangeCalendar,
     DateTime RunStartedUtc,
     string OutputDirectory,
     string SessionStartUtc,
