@@ -19,6 +19,7 @@ public sealed class SnapshotRuntime
     private bool _hasReconciliationQualityFailure;
     private bool _hasConnectivityFailure;
     private bool _hasPreTradeHalt;
+    private bool _hasClockSkewFailure;
     private int _processedApiErrorCount;
     private int _dailyTransmittedOrderCount;
     private readonly FaRoutingValidator _faRoutingValidator = new();
@@ -77,6 +78,7 @@ public sealed class SnapshotRuntime
                 requestType: "reqCurrentTime",
                 origin: _options.Mode.ToString());
             Console.WriteLine("[OK] currentTime callback received");
+            EvaluateBrokerClockSkew();
             EnterSteadyState(session);
 
             switch (_options.Mode)
@@ -235,7 +237,7 @@ public sealed class SnapshotRuntime
 
             var hasBlockingErrors = _wrapper.ApiErrors
                 .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
-            if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure || _hasPreTradeHalt)
+            if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure || _hasPreTradeHalt || _hasClockSkewFailure)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
                 PrintErrors();
@@ -251,6 +253,10 @@ public sealed class SnapshotRuntime
                 if (_hasPreTradeHalt)
                 {
                     Console.WriteLine("[WARN] Completed with pre-trade control HALT action.");
+                }
+                if (_hasClockSkewFailure)
+                {
+                    Console.WriteLine("[WARN] Completed with broker clock-skew gate failure.");
                 }
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -3177,6 +3183,42 @@ public sealed class SnapshotRuntime
         _dailyTransmittedOrderCount++;
     }
 
+    private void EvaluateBrokerClockSkew()
+    {
+        if (_options.ClockSkewAction == ClockSkewAction.Off)
+        {
+            return;
+        }
+
+        if (_wrapper.LastBrokerCurrentTimeUtc is null)
+        {
+            Console.WriteLine("[WARN] Broker clock-skew check skipped: no broker currentTime payload.");
+            return;
+        }
+
+        var localUtc = DateTime.UtcNow;
+        var skewSeconds = Math.Abs((localUtc - _wrapper.LastBrokerCurrentTimeUtc.Value).TotalSeconds);
+        var warnThreshold = Math.Max(0.1, _options.ClockSkewWarnSeconds);
+        var failThreshold = Math.Max(warnThreshold, _options.ClockSkewFailSeconds);
+
+        Console.WriteLine($"[INFO] Clock skew check: localUtc={localUtc:O} brokerUtc={_wrapper.LastBrokerCurrentTimeUtc.Value:O} skewSeconds={skewSeconds:F3}");
+
+        if (skewSeconds < warnThreshold)
+        {
+            return;
+        }
+
+        var message = $"broker clock skew {skewSeconds:F3}s exceeds warn={warnThreshold:F3}s fail={failThreshold:F3}s";
+        if (_options.ClockSkewAction == ClockSkewAction.Warn || skewSeconds < failThreshold)
+        {
+            Console.WriteLine($"[WARN] {message}");
+            return;
+        }
+
+        Console.WriteLine($"[FAIL] {message}");
+        _hasClockSkewFailure = true;
+    }
+
     private void RegisterPreTradeCostEstimate(int orderId, string route, string symbol, string action, double quantity, double limitPrice, string orderRef)
     {
         var estimate = _preTradeCostEstimator.Estimate(
@@ -3722,6 +3764,9 @@ public sealed record AppOptions(
     int HeartbeatProbeTimeoutSeconds,
     int ReconnectMaxAttempts,
     int ReconnectBackoffSeconds,
+    ClockSkewAction ClockSkewAction,
+    double ClockSkewWarnSeconds,
+    double ClockSkewFailSeconds,
     ReconciliationGateAction ReconciliationGateAction,
     double ReconciliationMinCommissionCoverage,
     double ReconciliationMinOrderCoverage
@@ -3848,6 +3893,9 @@ public sealed record AppOptions(
         var heartbeatProbeTimeoutSeconds = 4;
         var reconnectMaxAttempts = 3;
         var reconnectBackoffSeconds = 2;
+        var clockSkewAction = ClockSkewAction.Warn;
+        var clockSkewWarnSeconds = 2.0;
+        var clockSkewFailSeconds = 15.0;
         var reconciliationGateAction = ReconciliationGateAction.Warn;
         var reconciliationMinCommissionCoverage = 0.80;
         var reconciliationMinOrderCoverage = 0.95;
@@ -4266,6 +4314,17 @@ public sealed record AppOptions(
                     reconnectBackoffSeconds = rbs;
                     i++;
                     break;
+                case "--clock-skew-action" when i + 1 < args.Length:
+                    clockSkewAction = ParseClockSkewAction(args[++i]);
+                    break;
+                case "--clock-skew-warn-seconds" when i + 1 < args.Length && double.TryParse(args[i + 1], out var csw):
+                    clockSkewWarnSeconds = csw;
+                    i++;
+                    break;
+                case "--clock-skew-fail-seconds" when i + 1 < args.Length && double.TryParse(args[i + 1], out var csf):
+                    clockSkewFailSeconds = csf;
+                    i++;
+                    break;
                 case "--recon-gate-action" when i + 1 < args.Length:
                     reconciliationGateAction = ParseReconciliationGateAction(args[++i]);
                     break;
@@ -4400,6 +4459,9 @@ public sealed record AppOptions(
             heartbeatProbeTimeoutSeconds,
             reconnectMaxAttempts,
             reconnectBackoffSeconds,
+            clockSkewAction,
+            clockSkewWarnSeconds,
+            clockSkewFailSeconds,
             reconciliationGateAction,
             reconciliationMinCommissionCoverage,
             reconciliationMinOrderCoverage
@@ -4436,6 +4498,17 @@ public sealed record AppOptions(
             "microequity" => PreTradeCostProfile.MicroEquity,
             "conservative" => PreTradeCostProfile.Conservative,
             _ => throw new ArgumentException($"Unknown pretrade cost profile '{value}'. Use micro|conservative.")
+        };
+    }
+
+    private static ClockSkewAction ParseClockSkewAction(string value)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "off" => ClockSkewAction.Off,
+            "warn" => ClockSkewAction.Warn,
+            "fail" => ClockSkewAction.Fail,
+            _ => throw new ArgumentException($"Unknown clock skew action '{value}'. Use off|warn|fail.")
         };
     }
 
@@ -4498,6 +4571,13 @@ public sealed record AppOptions(
 }
 
 public enum ReconciliationGateAction
+{
+    Off,
+    Warn,
+    Fail
+}
+
+public enum ClockSkewAction
 {
     Off,
     Warn,
