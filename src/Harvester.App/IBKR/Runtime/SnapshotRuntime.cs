@@ -782,12 +782,15 @@ public sealed class SnapshotRuntime
         var outputDir = EnsureOutputDir();
         var ticksPath = Path.Combine(outputDir, $"top_data_{_options.Symbol}_{timestamp}.json");
         var typesPath = Path.Combine(outputDir, $"top_data_type_{_options.Symbol}_{timestamp}.json");
+        var sanitizationPath = Path.Combine(outputDir, $"top_data_sanitization_{_options.Symbol}_{timestamp}.json");
 
         WriteJson(ticksPath, _wrapper.TopTicks.ToArray());
         WriteJson(typesPath, _wrapper.MarketDataTypes.ToArray());
+        WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
 
         Console.WriteLine($"[OK] Top data export: {ticksPath} (rows={_wrapper.TopTicks.Count})");
         Console.WriteLine($"[OK] Market data type export: {typesPath} (rows={_wrapper.MarketDataTypes.Count})");
+        Console.WriteLine($"[OK] Top data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
     private async Task RunMarketDepthMode(EClientSocket client, CancellationToken token)
@@ -804,9 +807,12 @@ public sealed class SnapshotRuntime
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
         var depthPath = Path.Combine(outputDir, $"depth_data_{_options.Symbol}_{timestamp}.json");
+        var sanitizationPath = Path.Combine(outputDir, $"depth_data_sanitization_{_options.Symbol}_{timestamp}.json");
 
         WriteJson(depthPath, _wrapper.DepthRows.ToArray());
+        WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
         Console.WriteLine($"[OK] Depth data export: {depthPath} (rows={_wrapper.DepthRows.Count})");
+        Console.WriteLine($"[OK] Depth data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
     private async Task RunRealtimeBarsMode(EClientSocket client, CancellationToken token)
@@ -855,12 +861,14 @@ public sealed class SnapshotRuntime
         var typePath = Path.Combine(outputDir, $"top_data_type_{_options.Symbol}_{timestamp}.json");
         var depthPath = Path.Combine(outputDir, $"depth_data_{_options.Symbol}_{timestamp}.json");
         var barsPath = Path.Combine(outputDir, $"realtime_bars_{_options.Symbol}_{timestamp}.json");
+        var sanitizationPath = Path.Combine(outputDir, $"market_data_sanitization_{_options.Symbol}_{timestamp}.json");
         var reportPath = Path.Combine(outputDir, $"market_data_report_{_options.Symbol}_{timestamp}.md");
 
         WriteJson(topPath, _wrapper.TopTicks.ToArray());
         WriteJson(typePath, _wrapper.MarketDataTypes.ToArray());
         WriteJson(depthPath, _wrapper.DepthRows.ToArray());
         WriteJson(barsPath, _wrapper.RealtimeBars.ToArray());
+        WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
 
         var report =
             "# Harvester Market Data Report\n\n"
@@ -871,12 +879,14 @@ public sealed class SnapshotRuntime
             + $"- Top ticks: {_wrapper.TopTicks.Count}\n"
             + $"- Depth rows: {_wrapper.DepthRows.Count}\n"
             + $"- Realtime bars: {_wrapper.RealtimeBars.Count}\n"
+            + $"- Sanitization events: {_wrapper.MarketDataSanitizationRows.Count}\n"
             + "\n"
             + "## Files\n"
             + $"- top: {topPath}\n"
             + $"- marketDataType: {typePath}\n"
             + $"- depth: {depthPath}\n"
-            + $"- realtime bars: {barsPath}\n";
+            + $"- realtime bars: {barsPath}\n"
+            + $"- sanitization: {sanitizationPath}\n";
 
         File.WriteAllText(reportPath, report);
 
@@ -884,6 +894,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Market data type export: {typePath} (rows={_wrapper.MarketDataTypes.Count})");
         Console.WriteLine($"[OK] Depth data export: {depthPath} (rows={_wrapper.DepthRows.Count})");
         Console.WriteLine($"[OK] Realtime bars export: {barsPath} (rows={_wrapper.RealtimeBars.Count})");
+        Console.WriteLine($"[OK] Market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
         Console.WriteLine($"[OK] Market data report: {reportPath}");
     }
 
@@ -1631,12 +1642,15 @@ public sealed class SnapshotRuntime
         var outputDir = EnsureOutputDir();
         var ticksPath = Path.Combine(outputDir, $"crypto_top_data_{_options.CryptoSymbol}_{timestamp}.json");
         var typesPath = Path.Combine(outputDir, $"crypto_top_data_type_{_options.CryptoSymbol}_{timestamp}.json");
+        var sanitizationPath = Path.Combine(outputDir, $"crypto_top_data_sanitization_{_options.CryptoSymbol}_{timestamp}.json");
 
         WriteJson(ticksPath, _wrapper.TopTicks.ToArray());
         WriteJson(typesPath, _wrapper.MarketDataTypes.ToArray());
+        WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
 
         Console.WriteLine($"[OK] Crypto streaming top data export: {ticksPath} (rows={_wrapper.TopTicks.Count})");
         Console.WriteLine($"[OK] Crypto market data type export: {typesPath} (rows={_wrapper.MarketDataTypes.Count})");
+        Console.WriteLine($"[OK] Crypto market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
     private async Task RunCryptoHistoricalMode(EClientSocket client, CancellationToken token)

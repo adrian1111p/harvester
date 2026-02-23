@@ -35,6 +35,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _fundamentalDataTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _scannerDataEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _scannerParametersTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ConcurrentDictionary<string, DateTime> _latestTopPriceByTickerField = new();
 
     public ConcurrentQueue<AccountSummaryRow> AccountSummaryRows { get; } = new();
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
@@ -70,6 +71,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<FundamentalDataRow> FundamentalDataRows { get; } = new();
     public ConcurrentQueue<ScannerDataRow> ScannerDataRows { get; } = new();
     public ConcurrentQueue<ScannerParametersRow> ScannerParametersRows { get; } = new();
+    public ConcurrentQueue<MarketDataSanitizationRow> MarketDataSanitizationRows { get; } = new();
 
     public Task<bool> CurrentTimeTask => _currentTimeTcs.Task;
     public Task<bool> AccountSummaryEndTask => _accountSummaryEndTcs.Task;
@@ -246,28 +248,57 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
     public override void tickPrice(int tickerId, int field, double price, TickAttrib attribs)
     {
+        if (!IsFiniteNonNegative(price))
+        {
+            EnqueueSanitization("tickPrice", tickerId, field, "invalid-price", price, null, null);
+            return;
+        }
+
+        var normalizedField = NormalizeTickField(field);
+        var metadata = normalizedField != field ? "source=delayed" : string.Empty;
+        _latestTopPriceByTickerField[BuildTopFieldKey(tickerId, normalizedField)] = DateTime.UtcNow;
+
         TopTicks.Enqueue(new TopTickRow(
             DateTime.UtcNow,
             tickerId,
             "tickPrice",
-            field,
+            normalizedField,
             price,
             0,
-            string.Empty
+            metadata
         ));
         _topDataFirstTickTcs.TrySetResult(true);
     }
 
     public override void tickSize(int tickerId, int field, int size)
     {
+        if (size < 0)
+        {
+            EnqueueSanitization("tickSize", tickerId, field, "negative-size", null, size, null);
+            return;
+        }
+
+        var normalizedField = NormalizeTickField(field);
+        var metadata = normalizedField != field ? "source=delayed" : string.Empty;
+        var pairedPriceField = GetPairedPriceField(normalizedField);
+        if (pairedPriceField.HasValue)
+        {
+            var hasRecentPrice = HasRecentPrice(tickerId, pairedPriceField.Value, DateTime.UtcNow, TimeSpan.FromSeconds(15));
+            if (!hasRecentPrice)
+            {
+                EnqueueSanitization("tickSize", tickerId, normalizedField, "orphan-size", null, size, null);
+                metadata = string.IsNullOrEmpty(metadata) ? "orphan-size" : $"{metadata};orphan-size";
+            }
+        }
+
         TopTicks.Enqueue(new TopTickRow(
             DateTime.UtcNow,
             tickerId,
             "tickSize",
-            field,
+            normalizedField,
             0,
             size,
-            string.Empty
+            metadata
         ));
         _topDataFirstTickTcs.TrySetResult(true);
     }
@@ -288,14 +319,23 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
     public override void tickGeneric(int tickerId, int field, double value)
     {
+        if (!IsFinite(value))
+        {
+            EnqueueSanitization("tickGeneric", tickerId, field, "invalid-generic-value", value, null, null);
+            return;
+        }
+
+        var normalizedField = NormalizeTickField(field);
+        var metadata = normalizedField != field ? "source=delayed" : string.Empty;
+
         TopTicks.Enqueue(new TopTickRow(
             DateTime.UtcNow,
             tickerId,
             "tickGeneric",
-            field,
+            normalizedField,
             value,
             0,
-            string.Empty
+            metadata
         ));
         _topDataFirstTickTcs.TrySetResult(true);
     }
@@ -307,6 +347,12 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
     public override void updateMktDepth(int tickerId, int position, int operation, int side, double price, int size)
     {
+        if (!IsValidDepthUpdate(operation, side, price, size))
+        {
+            EnqueueSanitization("updateMktDepth", tickerId, position, "invalid-depth-update", price, size, $"op={operation};side={side}");
+            return;
+        }
+
         DepthRows.Enqueue(new DepthRow(
             DateTime.UtcNow,
             tickerId,
@@ -323,6 +369,12 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
     public override void updateMktDepthL2(int tickerId, int position, string marketMaker, int operation, int side, double price, int size, bool isSmartDepth)
     {
+        if (!IsValidDepthUpdate(operation, side, price, size))
+        {
+            EnqueueSanitization("updateMktDepthL2", tickerId, position, "invalid-depth-update", price, size, $"op={operation};side={side}");
+            return;
+        }
+
         DepthRows.Enqueue(new DepthRow(
             DateTime.UtcNow,
             tickerId,
@@ -711,6 +763,95 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
         _scannerParametersTcs.TrySetResult(true);
     }
+
+    private static bool IsFinite(double value)
+    {
+        return !double.IsNaN(value) && !double.IsInfinity(value);
+    }
+
+    private static bool IsFiniteNonNegative(double value)
+    {
+        return IsFinite(value) && value >= 0;
+    }
+
+    private static int NormalizeTickField(int field)
+    {
+        return field switch
+        {
+            66 => 1,
+            67 => 2,
+            68 => 4,
+            69 => 0,
+            70 => 3,
+            71 => 5,
+            72 => 6,
+            73 => 7,
+            74 => 8,
+            75 => 9,
+            76 => 14,
+            _ => field
+        };
+    }
+
+    private static int? GetPairedPriceField(int normalizedSizeField)
+    {
+        return normalizedSizeField switch
+        {
+            0 => 1,
+            3 => 2,
+            5 => 4,
+            _ => null
+        };
+    }
+
+    private static string BuildTopFieldKey(int tickerId, int field)
+    {
+        return $"{tickerId}:{field}";
+    }
+
+    private bool HasRecentPrice(int tickerId, int field, DateTime nowUtc, TimeSpan maxAge)
+    {
+        if (!_latestTopPriceByTickerField.TryGetValue(BuildTopFieldKey(tickerId, field), out var lastSeenUtc))
+        {
+            return false;
+        }
+
+        return nowUtc - lastSeenUtc <= maxAge;
+    }
+
+    private static bool IsValidDepthUpdate(int operation, int side, double price, int size)
+    {
+        if (operation is < 0 or > 2)
+        {
+            return false;
+        }
+
+        if (side is < 0 or > 1)
+        {
+            return false;
+        }
+
+        if (!IsFiniteNonNegative(price))
+        {
+            return false;
+        }
+
+        return size >= 0;
+    }
+
+    private void EnqueueSanitization(string source, int tickerId, int field, string reason, double? rawPrice, int? rawSize, string? rawValue)
+    {
+        MarketDataSanitizationRows.Enqueue(new MarketDataSanitizationRow(
+            DateTime.UtcNow,
+            source,
+            tickerId,
+            field,
+            reason,
+            rawPrice,
+            rawSize,
+            rawValue ?? string.Empty
+        ));
+    }
 }
 
 public sealed record AccountSummaryRow(string Account, string Tag, string Value, string Currency);
@@ -1059,4 +1200,15 @@ public sealed record ScannerDataRow(
 public sealed record ScannerParametersRow(
     DateTime TimestampUtc,
     string Xml
+);
+
+public sealed record MarketDataSanitizationRow(
+    DateTime TimestampUtc,
+    string Source,
+    int TickerId,
+    int Field,
+    string Reason,
+    double? RawPrice,
+    int? RawSize,
+    string RawValue
 );
