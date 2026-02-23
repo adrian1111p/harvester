@@ -288,6 +288,7 @@ public sealed class SnapshotRuntime
         var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
+        var reconciliationSummaryPath = Path.Combine(outputDir, $"orders_reconciliation_summary_{timestamp}.json");
 
         var reconciliation = OrderReconciliation.Reconcile(
             _wrapper.OpenOrders.ToArray(),
@@ -301,6 +302,7 @@ public sealed class SnapshotRuntime
         WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
+        WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
 
         Console.WriteLine($"[OK] Open orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
@@ -308,6 +310,8 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Commissions snapshot: {commissionsPath} (rows={_wrapper.Commissions.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
+        Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
+        Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
     }
 
     private async Task RunPositionsMode(EClientSocket client, CancellationToken token)
@@ -374,6 +378,7 @@ public sealed class SnapshotRuntime
         var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
+        var reconciliationSummaryPath = Path.Combine(outputDir, $"orders_reconciliation_summary_{timestamp}.json");
         var accountSummaryPath = Path.Combine(outputDir, $"account_summary_{timestamp}.json");
         var positionsPath = Path.Combine(outputDir, $"positions_{timestamp}.json");
         var reportPath = Path.Combine(outputDir, $"snapshot_report_{timestamp}.md");
@@ -390,6 +395,7 @@ public sealed class SnapshotRuntime
         WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
+        WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
         WriteJson(accountSummaryPath, _wrapper.AccountSummaryRows.ToArray());
         WriteJson(positionsPath, _wrapper.Positions.ToArray());
         File.WriteAllText(reportPath, BuildReport(timestamp));
@@ -400,6 +406,8 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Commissions: {commissionsPath} (rows={_wrapper.Commissions.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
+        Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
+        Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
         Console.WriteLine($"[OK] Account summary: {accountSummaryPath} (rows={_wrapper.AccountSummaryRows.Count})");
         Console.WriteLine($"[OK] Positions: {positionsPath} (rows={_wrapper.Positions.Count})");
         Console.WriteLine($"[OK] Snapshot report: {reportPath}");

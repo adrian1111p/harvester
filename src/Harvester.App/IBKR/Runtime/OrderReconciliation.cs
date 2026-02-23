@@ -152,7 +152,30 @@ public static class OrderReconciliation
             }
         }
 
-        return new ReconciliationResult(rows.Values.OrderBy(r => r.CanonicalOrderKey).ToArray(), diagnostics.ToArray());
+        var ledger = rows.Values.OrderBy(r => r.CanonicalOrderKey).ToArray();
+        var diagnosticsArray = diagnostics.ToArray();
+
+        var executionRows = ledger.Count(r => r.ExecutionCount > 0);
+        var executionRowsWithCommission = ledger.Count(r => r.ExecutionCount > 0 && r.Commission is not null);
+        var executionRowsWithOrderMetadata = ledger.Count(r => r.ExecutionCount > 0 && (r.Sources.Contains("open-order") || r.Sources.Contains("completed-order")));
+
+        var summary = new ReconciliationSummaryRow(
+            TotalOpenOrders: openOrders.Count,
+            TotalCompletedOrders: completedOrders.Count,
+            TotalExecutions: executions.Count,
+            TotalCommissions: commissions.Count,
+            TotalCanonicalOrders: ledger.Length,
+            CanonicalExecutionRows: executionRows,
+            CanonicalExecutionRowsWithCommission: executionRowsWithCommission,
+            CanonicalExecutionRowsWithOrderMetadata: executionRowsWithOrderMetadata,
+            ExecutionCommissionCoveragePct: executionRows == 0 ? 1.0 : (double)executionRowsWithCommission / executionRows,
+            ExecutionOrderMetadataCoveragePct: executionRows == 0 ? 1.0 : (double)executionRowsWithOrderMetadata / executionRows,
+            DiagnosticsByKind: diagnosticsArray
+                .GroupBy(d => d.Kind)
+                .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase)
+        );
+
+        return new ReconciliationResult(ledger, diagnosticsArray, summary);
     }
 
     private static string ResolveExecutionKey(ExecutionRow execution)
@@ -210,5 +233,20 @@ public sealed record ReconciliationDiagnosticRow(
 
 public sealed record ReconciliationResult(
     CanonicalOrderLedgerRow[] Ledger,
-    ReconciliationDiagnosticRow[] Diagnostics
+    ReconciliationDiagnosticRow[] Diagnostics,
+    ReconciliationSummaryRow Summary
+);
+
+public sealed record ReconciliationSummaryRow(
+    int TotalOpenOrders,
+    int TotalCompletedOrders,
+    int TotalExecutions,
+    int TotalCommissions,
+    int TotalCanonicalOrders,
+    int CanonicalExecutionRows,
+    int CanonicalExecutionRowsWithCommission,
+    int CanonicalExecutionRowsWithOrderMetadata,
+    double ExecutionCommissionCoveragePct,
+    double ExecutionOrderMetadataCoveragePct,
+    Dictionary<string, int> DiagnosticsByKind
 );
