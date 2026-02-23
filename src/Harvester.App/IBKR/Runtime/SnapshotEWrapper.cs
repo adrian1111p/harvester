@@ -16,6 +16,11 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _topDataFirstTickTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _depthFirstUpdateTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _realtimeBarFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _historicalDataEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _historicalDataUpdateTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _histogramDataTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _historicalTicksDoneTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _headTimestampTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ConcurrentQueue<AccountSummaryRow> AccountSummaryRows { get; } = new();
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
@@ -27,6 +32,13 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<DepthRow> DepthRows { get; } = new();
     public ConcurrentQueue<RealtimeBarRow> RealtimeBars { get; } = new();
     public ConcurrentQueue<MarketDataTypeRow> MarketDataTypes { get; } = new();
+    public ConcurrentQueue<HistoricalBarRow> HistoricalBars { get; } = new();
+    public ConcurrentQueue<HistoricalBarUpdateRow> HistoricalBarUpdates { get; } = new();
+    public ConcurrentQueue<HistogramRow> Histograms { get; } = new();
+    public ConcurrentQueue<HistoricalTickRow> HistoricalTicks { get; } = new();
+    public ConcurrentQueue<HistoricalTickBidAskRow> HistoricalTicksBidAsk { get; } = new();
+    public ConcurrentQueue<HistoricalTickLastRow> HistoricalTicksLast { get; } = new();
+    public ConcurrentQueue<HeadTimestampRow> HeadTimestamps { get; } = new();
 
     public Task<bool> CurrentTimeTask => _currentTimeTcs.Task;
     public Task<bool> AccountSummaryEndTask => _accountSummaryEndTcs.Task;
@@ -38,6 +50,11 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> TopDataFirstTickTask => _topDataFirstTickTcs.Task;
     public Task<bool> DepthFirstUpdateTask => _depthFirstUpdateTcs.Task;
     public Task<bool> RealtimeBarFirstTask => _realtimeBarFirstTcs.Task;
+    public Task<bool> HistoricalDataEndTask => _historicalDataEndTcs.Task;
+    public Task<bool> HistoricalDataUpdateTask => _historicalDataUpdateTcs.Task;
+    public Task<bool> HistogramDataTask => _histogramDataTcs.Task;
+    public Task<bool> HistoricalTicksDoneTask => _historicalTicksDoneTcs.Task;
+    public Task<bool> HeadTimestampTask => _headTimestampTcs.Task;
 
     public override void currentTime(long time)
     {
@@ -278,6 +295,125 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
         ));
         _realtimeBarFirstTcs.TrySetResult(true);
     }
+
+    public override void historicalData(int reqId, Bar bar)
+    {
+        HistoricalBars.Enqueue(new HistoricalBarRow(
+            DateTime.UtcNow,
+            reqId,
+            bar.Time,
+            bar.Open,
+            bar.High,
+            bar.Low,
+            bar.Close,
+            bar.Volume,
+            bar.WAP,
+            bar.Count
+        ));
+    }
+
+    public override void historicalDataEnd(int reqId, string startDateStr, string endDateStr)
+    {
+        _historicalDataEndTcs.TrySetResult(true);
+    }
+
+    public override void historicalDataUpdate(int reqId, Bar bar)
+    {
+        HistoricalBarUpdates.Enqueue(new HistoricalBarUpdateRow(
+            DateTime.UtcNow,
+            reqId,
+            bar.Time,
+            bar.Open,
+            bar.High,
+            bar.Low,
+            bar.Close,
+            bar.Volume,
+            bar.WAP,
+            bar.Count
+        ));
+        _historicalDataUpdateTcs.TrySetResult(true);
+    }
+
+    public override void histogramData(int reqId, HistogramEntry[] data)
+    {
+        foreach (var item in data)
+        {
+            Histograms.Enqueue(new HistogramRow(DateTime.UtcNow, reqId, item.Price, item.Size));
+        }
+
+        _histogramDataTcs.TrySetResult(true);
+    }
+
+    public override void historicalTicks(int reqId, HistoricalTick[] ticks, bool done)
+    {
+        foreach (var item in ticks)
+        {
+            HistoricalTicks.Enqueue(new HistoricalTickRow(
+                DateTime.UtcNow,
+                reqId,
+                item.Time,
+                item.Price,
+                item.Size
+            ));
+        }
+
+        if (done)
+        {
+            _historicalTicksDoneTcs.TrySetResult(true);
+        }
+    }
+
+    public override void historicalTicksBidAsk(int reqId, HistoricalTickBidAsk[] ticks, bool done)
+    {
+        foreach (var item in ticks)
+        {
+            HistoricalTicksBidAsk.Enqueue(new HistoricalTickBidAskRow(
+                DateTime.UtcNow,
+                reqId,
+                item.Time,
+                item.PriceBid,
+                item.PriceAsk,
+                item.SizeBid,
+                item.SizeAsk,
+                item.TickAttribBidAsk.BidPastLow,
+                item.TickAttribBidAsk.AskPastHigh
+            ));
+        }
+
+        if (done)
+        {
+            _historicalTicksDoneTcs.TrySetResult(true);
+        }
+    }
+
+    public override void historicalTicksLast(int reqId, HistoricalTickLast[] ticks, bool done)
+    {
+        foreach (var item in ticks)
+        {
+            HistoricalTicksLast.Enqueue(new HistoricalTickLastRow(
+                DateTime.UtcNow,
+                reqId,
+                item.Time,
+                item.Price,
+                item.Size,
+                item.Exchange,
+                item.SpecialConditions,
+                item.TickAttribLast.PastLimit,
+                item.TickAttribLast.Unreported
+            ));
+        }
+
+        if (done)
+        {
+            _historicalTicksDoneTcs.TrySetResult(true);
+        }
+    }
+
+    public override void headTimestamp(int reqId, string headTimestamp)
+    {
+        HeadTimestamps.Enqueue(new HeadTimestampRow(DateTime.UtcNow, reqId, headTimestamp));
+        _headTimestampTcs.TrySetResult(true);
+    }
 }
 
 public sealed record AccountSummaryRow(string Account, string Tag, string Value, string Currency);
@@ -397,4 +533,75 @@ public sealed record RealtimeBarRow(
     long Volume,
     double Wap,
     int Count
+);
+
+public sealed record HistoricalBarRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Time,
+    double Open,
+    double High,
+    double Low,
+    double Close,
+    decimal Volume,
+    double Wap,
+    int Count
+);
+
+public sealed record HistoricalBarUpdateRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Time,
+    double Open,
+    double High,
+    double Low,
+    double Close,
+    decimal Volume,
+    double Wap,
+    int Count
+);
+
+public sealed record HistogramRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    double Price,
+    decimal Size
+);
+
+public sealed record HistoricalTickRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    long EpochSeconds,
+    double Price,
+    decimal Size
+);
+
+public sealed record HistoricalTickBidAskRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    long EpochSeconds,
+    double PriceBid,
+    double PriceAsk,
+    decimal SizeBid,
+    decimal SizeAsk,
+    bool BidPastLow,
+    bool AskPastHigh
+);
+
+public sealed record HistoricalTickLastRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    long EpochSeconds,
+    double Price,
+    decimal Size,
+    string Exchange,
+    string SpecialConditions,
+    bool PastLimit,
+    bool Unreported
+);
+
+public sealed record HeadTimestampRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string HeadTimestamp
 );

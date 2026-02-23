@@ -73,6 +73,21 @@ public sealed class SnapshotRuntime
                 case RunMode.MarketDataAll:
                     await RunMarketDataAllMode(client, timeoutCts.Token);
                     break;
+                case RunMode.HistoricalBars:
+                    await RunHistoricalBarsMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.HistoricalBarsKeepUpToDate:
+                    await RunHistoricalBarsKeepUpToDateMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.Histogram:
+                    await RunHistogramMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.HistoricalTicks:
+                    await RunHistoricalTicksMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.HeadTimestamp:
+                    await RunHeadTimestampMode(client, timeoutCts.Token);
+                    break;
             }
 
             var hasBlockingErrors = _wrapper.Errors.Any(IsBlockingError);
@@ -539,6 +554,286 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Market data report: {reportPath}");
     }
 
+    private async Task RunHistoricalBarsMode(EClientSocket client, CancellationToken token)
+    {
+        ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
+
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9601;
+
+        client.reqHistoricalData(
+            reqId,
+            contract,
+            _options.HistoricalEndDateTime,
+            _options.HistoricalDuration,
+            _options.HistoricalBarSize,
+            _options.HistoricalWhatToShow,
+            _options.HistoricalUseRth,
+            _options.HistoricalFormatDate,
+            false,
+            new List<TagValue>()
+        );
+
+        await AwaitWithTimeout(_wrapper.HistoricalDataEndTask, token, "historicalDataEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var barsPath = Path.Combine(outputDir, $"historical_bars_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(barsPath, _wrapper.HistoricalBars.ToArray());
+        Console.WriteLine($"[OK] Historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
+    }
+
+    private async Task RunHistoricalBarsKeepUpToDateMode(EClientSocket client, CancellationToken token)
+    {
+        ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
+
+        if (!string.IsNullOrWhiteSpace(_options.HistoricalEndDateTime))
+        {
+            throw new InvalidOperationException("Historical keepUpToDate requires empty --hist-end.");
+        }
+
+        if (BarSizeToSeconds(_options.HistoricalBarSize) < 5)
+        {
+            throw new InvalidOperationException("Historical keepUpToDate requires bar size >= 5 secs.");
+        }
+
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9602;
+
+        client.reqHistoricalData(
+            reqId,
+            contract,
+            string.Empty,
+            _options.HistoricalDuration,
+            _options.HistoricalBarSize,
+            _options.HistoricalWhatToShow,
+            _options.HistoricalUseRth,
+            _options.HistoricalFormatDate,
+            true,
+            new List<TagValue>()
+        );
+
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.cancelHistoricalData(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var barsPath = Path.Combine(outputDir, $"historical_bars_keepup_{_options.Symbol}_{timestamp}.json");
+        var updatesPath = Path.Combine(outputDir, $"historical_bars_updates_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(barsPath, _wrapper.HistoricalBars.ToArray());
+        WriteJson(updatesPath, _wrapper.HistoricalBarUpdates.ToArray());
+
+        Console.WriteLine($"[OK] Historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
+        Console.WriteLine($"[OK] Historical bar updates export: {updatesPath} (rows={_wrapper.HistoricalBarUpdates.Count})");
+    }
+
+    private async Task RunHistogramMode(EClientSocket client, CancellationToken token)
+    {
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9603;
+
+        client.reqHistogramData(reqId, contract, _options.HistoricalUseRth == 1, _options.HistogramPeriod);
+        await AwaitWithTimeout(_wrapper.HistogramDataTask, token, "histogramData");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var histogramPath = Path.Combine(outputDir, $"histogram_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(histogramPath, _wrapper.Histograms.ToArray());
+        Console.WriteLine($"[OK] Histogram export: {histogramPath} (rows={_wrapper.Histograms.Count})");
+    }
+
+    private async Task RunHistoricalTicksMode(EClientSocket client, CancellationToken token)
+    {
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9604;
+
+        var startValue = NormalizeMaybeEmpty(_options.HistoricalTickStart);
+        var endValue = NormalizeMaybeEmpty(_options.HistoricalTickEnd);
+
+        var hasStart = !string.IsNullOrWhiteSpace(startValue);
+        var hasEnd = !string.IsNullOrWhiteSpace(endValue);
+        if (!hasStart && !hasEnd)
+        {
+            throw new InvalidOperationException("Historical ticks requires one of --hist-tick-start or --hist-tick-end.");
+        }
+
+        if (hasStart && hasEnd)
+        {
+            Console.WriteLine("[WARN] Both --hist-tick-start and --hist-tick-end provided. Using endDateTime and clearing startDateTime.");
+            startValue = string.Empty;
+        }
+
+        client.reqHistoricalTicks(
+            reqId,
+            contract,
+            startValue,
+            endValue,
+            _options.HistoricalTicksNumber,
+            _options.HistoricalTicksWhatToShow,
+            _options.HistoricalUseRth,
+            _options.HistoricalTickIgnoreSize,
+            new List<TagValue>()
+        );
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.HistoricalTicksDoneTask, token, "historicalTicksDone");
+        }
+        catch (TimeoutException) when (HasErrorCode("code=10187"))
+        {
+            Console.WriteLine("[WARN] Historical ticks timed out due to market data permissions for this route; exporting empty result set.");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var ticksPath = Path.Combine(outputDir, $"historical_ticks_{_options.Symbol}_{_options.HistoricalTicksWhatToShow}_{timestamp}.json");
+
+        if (string.Equals(_options.HistoricalTicksWhatToShow, "BID_ASK", StringComparison.OrdinalIgnoreCase))
+        {
+            WriteJson(ticksPath, _wrapper.HistoricalTicksBidAsk.ToArray());
+            Console.WriteLine($"[OK] Historical BID_ASK ticks export: {ticksPath} (rows={_wrapper.HistoricalTicksBidAsk.Count})");
+            return;
+        }
+
+        if (string.Equals(_options.HistoricalTicksWhatToShow, "TRADES", StringComparison.OrdinalIgnoreCase))
+        {
+            WriteJson(ticksPath, _wrapper.HistoricalTicksLast.ToArray());
+            Console.WriteLine($"[OK] Historical TRADES ticks export: {ticksPath} (rows={_wrapper.HistoricalTicksLast.Count})");
+            return;
+        }
+
+        WriteJson(ticksPath, _wrapper.HistoricalTicks.ToArray());
+        Console.WriteLine($"[OK] Historical MIDPOINT ticks export: {ticksPath} (rows={_wrapper.HistoricalTicks.Count})");
+    }
+
+    private async Task RunHeadTimestampMode(EClientSocket client, CancellationToken token)
+    {
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9605;
+
+        client.reqHeadTimestamp(reqId, contract, _options.HeadTimestampWhatToShow, _options.HistoricalUseRth, _options.HistoricalFormatDate);
+        await AwaitWithTimeout(_wrapper.HeadTimestampTask, token, "headTimestamp");
+        client.cancelHeadTimestamp(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var headPath = Path.Combine(outputDir, $"head_timestamp_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(headPath, _wrapper.HeadTimestamps.ToArray());
+        Console.WriteLine($"[OK] Head timestamp export: {headPath} (rows={_wrapper.HeadTimestamps.Count})");
+    }
+
+    private static void ValidateHistoricalBarRequestLimitations(string duration, string barSize)
+    {
+        if (!TryParseDurationToSeconds(duration, out var durationSeconds))
+        {
+            Console.WriteLine($"[WARN] Unable to parse duration '{duration}' for limitations precheck.");
+            return;
+        }
+
+        var barSeconds = BarSizeToSeconds(barSize);
+        if (barSeconds <= 0)
+        {
+            Console.WriteLine($"[WARN] Unable to parse bar size '{barSize}' for limitations precheck.");
+            return;
+        }
+
+        var maxBarSeconds = durationSeconds switch
+        {
+            <= 60 => 60,
+            <= 120 => 120,
+            <= 1800 => 1800,
+            <= 3600 => 3600,
+            <= 14400 => 10800,
+            <= 28800 => 28800,
+            <= 86400 => 86400,
+            <= 172800 => 86400,
+            <= 604800 => 604800,
+            <= 2678400 => 2678400,
+            _ => 2678400
+        };
+
+        if (barSeconds > maxBarSeconds)
+        {
+            Console.WriteLine("[WARN] Request may violate IBKR duration/bar-size step guidance and may be throttled.");
+        }
+
+        if (barSeconds <= 30)
+        {
+            Console.WriteLine("[INFO] Small bars pacing rules apply (identical request<15s, 6+ similar requests/2s, >60 requests/10m).");
+        }
+    }
+
+    private static bool TryParseDurationToSeconds(string duration, out int seconds)
+    {
+        seconds = 0;
+        var parts = duration.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length != 2 || !int.TryParse(parts[0], out var value))
+        {
+            return false;
+        }
+
+        seconds = parts[1].ToUpperInvariant() switch
+        {
+            "S" => value,
+            "D" => value * 86400,
+            "W" => value * 7 * 86400,
+            "M" => value * 31 * 86400,
+            "Y" => value * 365 * 86400,
+            _ => 0
+        };
+
+        return seconds > 0;
+    }
+
+    private static string NormalizeMaybeEmpty(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed is "\"\"" or "''")
+        {
+            return string.Empty;
+        }
+
+        return trimmed;
+    }
+
+    private static int BarSizeToSeconds(string barSize)
+    {
+        return barSize.Trim().ToLowerInvariant() switch
+        {
+            "1 secs" => 1,
+            "5 secs" => 5,
+            "10 secs" => 10,
+            "15 secs" => 15,
+            "30 secs" => 30,
+            "1 min" => 60,
+            "2 mins" => 120,
+            "3 mins" => 180,
+            "5 mins" => 300,
+            "10 mins" => 600,
+            "15 mins" => 900,
+            "20 mins" => 1200,
+            "30 mins" => 1800,
+            "1 hour" => 3600,
+            "2 hours" => 7200,
+            "3 hours" => 10800,
+            "4 hours" => 14400,
+            "8 hours" => 28800,
+            "1 day" => 86400,
+            "1 week" => 604800,
+            "1 month" => 2678400,
+            _ => 0
+        };
+    }
+
     private void ValidateLiveSafetyInputs()
     {
         var normalizedAction = _options.LiveAction.ToUpperInvariant();
@@ -625,8 +920,19 @@ public sealed class SnapshotRuntime
 
     private static bool IsBlockingError(string error)
     {
-        var nonBlockingCodes = new[] { "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=354", "code=300", "code=310", "code=420" };
+        var nonBlockingCodes = new[] { "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=10187", "code=354", "code=300", "code=310", "code=420" };
+
+        if (error.Contains("code=162") && error.Contains("query cancelled", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         return !nonBlockingCodes.Any(error.Contains);
+    }
+
+    private bool HasErrorCode(string code)
+    {
+        return _wrapper.Errors.Any(e => e.Contains(code, StringComparison.OrdinalIgnoreCase));
     }
 
     private static OrderTemplateRow ToTemplate(string name, Order order)
@@ -671,7 +977,20 @@ public sealed record AppOptions(
     int CaptureSeconds,
     int DepthRows,
     string DepthExchange,
-    string RealTimeBarsWhatToShow
+    string RealTimeBarsWhatToShow,
+    string HistoricalEndDateTime,
+    string HistoricalDuration,
+    string HistoricalBarSize,
+    string HistoricalWhatToShow,
+    int HistoricalUseRth,
+    int HistoricalFormatDate,
+    string HistogramPeriod,
+    string HistoricalTickStart,
+    string HistoricalTickEnd,
+    int HistoricalTicksNumber,
+    string HistoricalTicksWhatToShow,
+    bool HistoricalTickIgnoreSize,
+    string HeadTimestampWhatToShow
 )
 {
     public static AppOptions Parse(string[] args)
@@ -700,6 +1019,19 @@ public sealed record AppOptions(
         var depthRows = 5;
         var depthExchange = "NASDAQ";
         var realTimeBarsWhatToShow = "TRADES";
+        var historicalEndDateTime = string.Empty;
+        var historicalDuration = "1 D";
+        var historicalBarSize = "5 mins";
+        var historicalWhatToShow = "TRADES";
+        var historicalUseRth = 1;
+        var historicalFormatDate = 1;
+        var histogramPeriod = "1 week";
+        var historicalTickStart = string.Empty;
+        var historicalTickEnd = DateTime.UtcNow.ToString("yyyyMMdd-HH:mm:ss");
+        var historicalTicksNumber = 200;
+        var historicalTicksWhatToShow = "TRADES";
+        var historicalTickIgnoreSize = true;
+        var headTimestampWhatToShow = "TRADES";
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -791,6 +1123,48 @@ public sealed record AppOptions(
                 case "--rtb-what" when i + 1 < args.Length:
                     realTimeBarsWhatToShow = args[++i].ToUpperInvariant();
                     break;
+                case "--hist-end" when i + 1 < args.Length:
+                    historicalEndDateTime = args[++i];
+                    break;
+                case "--hist-duration" when i + 1 < args.Length:
+                    historicalDuration = args[++i];
+                    break;
+                case "--hist-barsize" when i + 1 < args.Length:
+                    historicalBarSize = args[++i].ToLowerInvariant();
+                    break;
+                case "--hist-what" when i + 1 < args.Length:
+                    historicalWhatToShow = args[++i].ToUpperInvariant();
+                    break;
+                case "--hist-use-rth" when i + 1 < args.Length && int.TryParse(args[i + 1], out var hu):
+                    historicalUseRth = hu;
+                    i++;
+                    break;
+                case "--hist-format-date" when i + 1 < args.Length && int.TryParse(args[i + 1], out var hf):
+                    historicalFormatDate = hf;
+                    i++;
+                    break;
+                case "--histogram-period" when i + 1 < args.Length:
+                    histogramPeriod = args[++i];
+                    break;
+                case "--hist-tick-start" when i + 1 < args.Length:
+                    historicalTickStart = args[++i];
+                    break;
+                case "--hist-tick-end" when i + 1 < args.Length:
+                    historicalTickEnd = args[++i];
+                    break;
+                case "--hist-ticks-num" when i + 1 < args.Length && int.TryParse(args[i + 1], out var htn):
+                    historicalTicksNumber = htn;
+                    i++;
+                    break;
+                case "--hist-ticks-what" when i + 1 < args.Length:
+                    historicalTicksWhatToShow = args[++i].ToUpperInvariant();
+                    break;
+                case "--hist-ignore-size" when i + 1 < args.Length:
+                    historicalTickIgnoreSize = bool.TryParse(args[++i], out var his) && his;
+                    break;
+                case "--head-what" when i + 1 < args.Length:
+                    headTimestampWhatToShow = args[++i].ToUpperInvariant();
+                    break;
             }
         }
 
@@ -818,7 +1192,20 @@ public sealed record AppOptions(
             captureSeconds,
             depthRows,
             depthExchange,
-            realTimeBarsWhatToShow
+            realTimeBarsWhatToShow,
+            historicalEndDateTime,
+            historicalDuration,
+            historicalBarSize,
+            historicalWhatToShow,
+            historicalUseRth,
+            historicalFormatDate,
+            histogramPeriod,
+            historicalTickStart,
+            historicalTickEnd,
+            historicalTicksNumber,
+            historicalTicksWhatToShow,
+            historicalTickIgnoreSize,
+            headTimestampWhatToShow
         );
     }
 
@@ -838,7 +1225,12 @@ public sealed record AppOptions(
             "market-depth" => RunMode.MarketDepth,
             "realtime-bars" => RunMode.RealtimeBars,
             "market-data-all" => RunMode.MarketDataAll,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all.")
+            "historical-bars" => RunMode.HistoricalBars,
+            "historical-bars-live" => RunMode.HistoricalBarsKeepUpToDate,
+            "histogram" => RunMode.Histogram,
+            "historical-ticks" => RunMode.HistoricalTicks,
+            "head-timestamp" => RunMode.HeadTimestamp,
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp.")
         };
     }
 }
@@ -856,7 +1248,12 @@ public enum RunMode
     TopData,
     MarketDepth,
     RealtimeBars,
-    MarketDataAll
+    MarketDataAll,
+    HistoricalBars,
+    HistoricalBarsKeepUpToDate,
+    Histogram,
+    HistoricalTicks,
+    HeadTimestamp
 }
 
 public sealed record ContractDetailsRow(

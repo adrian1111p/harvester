@@ -67,10 +67,13 @@ The low-level IBKR API classes themselves (`EClientSocket`, `EWrapper`, `Contrac
 
 ## Runtime integration status
 
-- Runtime modes (`connect`, `orders`, `positions`, `snapshot-all`) are now wired through this class layer:
- - Runtime modes (`connect`, `orders`, `positions`, `snapshot-all`, `contracts-validate`, `orders-dryrun`, `orders-place-sim`, `orders-whatif`) are now wired through this class layer:
- - Runtime modes (`connect`, `orders`, `positions`, `snapshot-all`, `contracts-validate`, `orders-dryrun`, `orders-place-sim`, `orders-whatif`, `top-data`, `market-depth`, `realtime-bars`, `market-data-all`) are now wired through this class layer:
-  - [src/Harvester.App/IBKR/Connection/IbkrSession.cs](src/Harvester.App/IBKR/Connection/IbkrSession.cs)
-  - [src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs](src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs)
-  - [src/Harvester.App/IBKR/Runtime/SnapshotRuntime.cs](src/Harvester.App/IBKR/Runtime/SnapshotRuntime.cs)
-  - [src/Harvester.App/Program.cs](src/Harvester.App/Program.cs)
+- Runtime modes are now wired through this class layer, including:
+  - account/portfolio: `connect`, `orders`, `positions`, `snapshot-all`
+  - contracts/orders: `contracts-validate`, `orders-dryrun`, `orders-place-sim`, `orders-whatif`
+  - streaming market data: `top-data`, `market-depth`, `realtime-bars`, `market-data-all`
+  - historical market data: `historical-bars`, `historical-bars-live`, `histogram`, `historical-ticks`, `head-timestamp`
+  - implementation files:
+    - [src/Harvester.App/IBKR/Connection/IbkrSession.cs](src/Harvester.App/IBKR/Connection/IbkrSession.cs)
+    - [src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs](src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs)
+    - [src/Harvester.App/IBKR/Runtime/SnapshotRuntime.cs](src/Harvester.App/IBKR/Runtime/SnapshotRuntime.cs)
+    - [src/Harvester.App/Program.cs](src/Harvester.App/Program.cs)
