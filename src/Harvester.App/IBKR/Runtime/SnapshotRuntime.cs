@@ -11,11 +11,13 @@ public sealed class SnapshotRuntime
 {
     private readonly AppOptions _options;
     private readonly SnapshotEWrapper _wrapper;
+    private readonly IbErrorPolicy _errorPolicy;
 
     public SnapshotRuntime(AppOptions options)
     {
         _options = options;
         _wrapper = new SnapshotEWrapper();
+        _errorPolicy = new IbErrorPolicy();
     }
 
     public async Task<int> RunAsync()
@@ -187,7 +189,8 @@ public sealed class SnapshotRuntime
                     break;
             }
 
-            var hasBlockingErrors = _wrapper.Errors.Any(IsBlockingErrorForCurrentMode);
+            var hasBlockingErrors = _wrapper.ApiErrors
+                .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
             if (hasBlockingErrors)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
@@ -2646,15 +2649,42 @@ public sealed class SnapshotRuntime
 
     private void PrintErrors()
     {
-        if (_wrapper.Errors.IsEmpty)
+        if (_wrapper.ApiErrors.IsEmpty)
         {
             return;
         }
 
+        var throttledCounts = new Dictionary<int, int>();
+        var emittedKeys = new HashSet<string>();
+
         Console.WriteLine("\n=== API Errors ===");
-        foreach (var line in _wrapper.Errors)
+        foreach (var error in _wrapper.ApiErrors)
         {
-            Console.WriteLine(line);
+            var decision = _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback);
+            if (decision.Action == IbErrorAction.Ignore)
+            {
+                continue;
+            }
+
+            if (decision.Action is IbErrorAction.Warn or IbErrorAction.Retry)
+            {
+                var key = $"{decision.Action}:{error.Code?.ToString() ?? "none"}";
+                if (!emittedKeys.Add(key))
+                {
+                    if (error.Code is int code)
+                    {
+                        throttledCounts[code] = throttledCounts.GetValueOrDefault(code) + 1;
+                    }
+                    continue;
+                }
+            }
+
+            Console.WriteLine($"[{decision.Action}] ts={error.UtcTimestamp:O} id={error.Id?.ToString() ?? "n/a"} code={error.Code?.ToString() ?? "n/a"} msg={error.Message} reason={decision.Reason}");
+        }
+
+        foreach (var item in throttledCounts.OrderBy(kvp => kvp.Key))
+        {
+            Console.WriteLine($"[THROTTLED] code={item.Key} suppressed={item.Value}");
         }
     }
 
@@ -2737,6 +2767,24 @@ public sealed class SnapshotRuntime
 
     private bool HasErrorCode(string code)
     {
+        if (code.StartsWith("code=", StringComparison.OrdinalIgnoreCase)
+            && int.TryParse(code[5..], out var parsedCode))
+        {
+            if (_wrapper.ApiErrors.Any(e => e.Code == parsedCode))
+            {
+                return true;
+            }
+        }
+
+        if (code.StartsWith("id=", StringComparison.OrdinalIgnoreCase)
+            && int.TryParse(code[3..], out var parsedId))
+        {
+            if (_wrapper.ApiErrors.Any(e => e.Id == parsedId))
+            {
+                return true;
+            }
+        }
+
         return _wrapper.Errors.Any(e => e.Contains(code, StringComparison.OrdinalIgnoreCase));
     }
 

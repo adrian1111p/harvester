@@ -10,6 +10,7 @@ public class HarvesterEWrapper : DefaultEWrapper
     private readonly TaskCompletionSource<bool> _contractDetailsEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ConcurrentQueue<string> Errors { get; } = new();
+    public ConcurrentQueue<IbApiError> ApiErrors { get; } = new();
     public ConcurrentQueue<ContractDetails> ContractDetailsRows { get; } = new();
     public ConcurrentQueue<string> OrderStatusRows { get; } = new();
 
@@ -64,16 +65,30 @@ public class HarvesterEWrapper : DefaultEWrapper
 
     public override void error(int id, int errorCode, string errorMsg)
     {
-        Errors.Enqueue($"[ERROR] id={id} code={errorCode} msg={errorMsg}");
+        var line = $"[ERROR] id={id} code={errorCode} msg={errorMsg}";
+        Errors.Enqueue(line);
+        ApiErrors.Enqueue(new IbApiError(DateTime.UtcNow, id, errorCode, errorMsg, line));
     }
 
     public override void error(Exception e)
     {
-        Errors.Enqueue($"[ERROR] exception={e.Message}");
+        var line = $"[ERROR] exception={e.Message}";
+        Errors.Enqueue(line);
+        ApiErrors.Enqueue(new IbApiError(DateTime.UtcNow, null, null, e.Message, line));
     }
 
     public override void error(string str)
     {
-        Errors.Enqueue($"[ERROR] raw={str}");
+        var line = $"[ERROR] raw={str}";
+        Errors.Enqueue(line);
+        ApiErrors.Enqueue(new IbApiError(DateTime.UtcNow, null, null, str, line));
     }
 }
+
+public sealed record IbApiError(
+    DateTime UtcTimestamp,
+    int? Id,
+    int? Code,
+    string Message,
+    string RawLine
+);
