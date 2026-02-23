@@ -4,6 +4,7 @@ using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
+using Harvester.App.IBKR.Risk;
 using Harvester.App.Historical;
 using IBApi;
 
@@ -17,7 +18,11 @@ public sealed class SnapshotRuntime
     private readonly RequestRegistry _requestRegistry;
     private bool _hasReconciliationQualityFailure;
     private bool _hasConnectivityFailure;
+    private bool _hasPreTradeHalt;
     private int _processedApiErrorCount;
+    private int _dailyTransmittedOrderCount;
+    private readonly FaRoutingValidator _faRoutingValidator = new();
+    private readonly PreTradeControlDsl _preTradeControlDsl = new();
     private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
     private readonly List<RuntimeLifecycleTransition> _lifecycleTransitions = [];
 
@@ -228,7 +233,7 @@ public sealed class SnapshotRuntime
 
             var hasBlockingErrors = _wrapper.ApiErrors
                 .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
-            if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure)
+            if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure || _hasPreTradeHalt)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
                 PrintErrors();
@@ -240,6 +245,10 @@ public sealed class SnapshotRuntime
                 if (_hasConnectivityFailure)
                 {
                     Console.WriteLine("[WARN] Completed with connectivity halt escalation.");
+                }
+                if (_hasPreTradeHalt)
+                {
+                    Console.WriteLine("[WARN] Completed with pre-trade control HALT action.");
                 }
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -767,6 +776,14 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Live order blocked: set --enable-live true to allow transmission.");
         }
 
+        EvaluatePreTradeControls(
+            route: nameof(RunOrdersPlaceSimMode),
+            symbol: _options.LiveSymbol,
+            action: _options.LiveAction,
+            quantity: _options.LiveQuantity,
+            limitPrice: _options.LiveLimitPrice,
+            notional: notional);
+
         var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
             BrokerAssetType.Stock,
             _options.LiveSymbol,
@@ -784,6 +801,7 @@ public sealed class SnapshotRuntime
         order.Transmit = true;
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
+        MarkOrderTransmitted();
         Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={_options.LiveSymbol} action={_options.LiveAction} qty={_options.LiveQuantity} lmt={_options.LiveLimitPrice}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
@@ -1406,6 +1424,14 @@ public sealed class SnapshotRuntime
             Right: _options.OptionRight,
             Multiplier: _options.OptionMultiplier));
 
+        EvaluatePreTradeControls(
+            route: nameof(RunOptionExerciseMode),
+            symbol: _options.OptionSymbol,
+            action: _options.OptionExerciseAction == 1 ? "EXERCISE" : "LAPSE",
+            quantity: _options.OptionExerciseQuantity,
+            limitPrice: 0,
+            notional: 0);
+
         client.exerciseOptions(
             9803,
             option,
@@ -1414,6 +1440,7 @@ public sealed class SnapshotRuntime
             _options.Account,
             _options.OptionExerciseOverride
         );
+        MarkOrderTransmitted();
 
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         brokerAdapter.RequestOpenOrders(client);
@@ -1910,6 +1937,14 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException($"Crypto order blocked: notional {notional:F2} exceeds --crypto-max-notional {_options.CryptoMaxNotional:F2}.");
         }
 
+        EvaluatePreTradeControls(
+            route: nameof(RunCryptoOrderPlacementMode),
+            symbol: _options.CryptoSymbol,
+            action: action,
+            quantity: _options.CryptoOrderQuantity,
+            limitPrice: _options.CryptoOrderLimit,
+            notional: notional);
+
         var crypto = brokerAdapter.BuildContract(new BrokerContractSpec(
             BrokerAssetType.Crypto,
             _options.CryptoSymbol,
@@ -1927,6 +1962,7 @@ public sealed class SnapshotRuntime
         order.Transmit = true;
 
         brokerAdapter.PlaceOrder(client, order.OrderId, crypto, order);
+        MarkOrderTransmitted();
         Console.WriteLine($"[OK] Crypto order transmitted: orderId={order.OrderId} symbol={_options.CryptoSymbol} action={action} qty={_options.CryptoOrderQuantity} lmt={_options.CryptoOrderLimit}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
@@ -2175,11 +2211,21 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("FA order blocked: provide --fa-order-group or --fa-order-profile.");
         }
 
+        EnforceFaRoutingStrictness();
+
         var notional = _options.FaOrderQuantity * _options.FaOrderLimit;
         if (notional > _options.FaMaxNotional)
         {
             throw new InvalidOperationException($"FA order blocked: notional {notional:F2} exceeds --fa-max-notional {_options.FaMaxNotional:F2}.");
         }
+
+        EvaluatePreTradeControls(
+            route: nameof(RunFaOrderPlacementMode),
+            symbol: _options.FaOrderSymbol,
+            action: action,
+            quantity: _options.FaOrderQuantity,
+            limitPrice: _options.FaOrderLimit,
+            notional: notional);
 
         var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
             BrokerAssetType.Stock,
@@ -2204,6 +2250,7 @@ public sealed class SnapshotRuntime
         order.Transmit = true;
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
+        MarkOrderTransmitted();
         Console.WriteLine($"[OK] FA order transmitted: orderId={order.OrderId} symbol={_options.FaOrderSymbol} action={action} qty={_options.FaOrderQuantity} lmt={_options.FaOrderLimit}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
@@ -3038,6 +3085,83 @@ public sealed class SnapshotRuntime
         }
     }
 
+    private void EnforceFaRoutingStrictness()
+    {
+        if (_options.FaRoutingStrictness == FaRoutingStrictness.Off)
+        {
+            return;
+        }
+
+        var issues = _faRoutingValidator.Validate(
+            _options.Account,
+            _options.FaOrderAccount,
+            _options.FaOrderGroup,
+            _options.FaOrderProfile,
+            _options.FaOrderMethod,
+            _options.FaOrderPercentage);
+
+        if (issues.Count == 0)
+        {
+            return;
+        }
+
+        var message = string.Join("; ", issues);
+        if (_options.FaRoutingStrictness == FaRoutingStrictness.Warn)
+        {
+            Console.WriteLine($"[WARN] FA routing validation warnings: {message}");
+            return;
+        }
+
+        throw new InvalidOperationException($"FA routing validation rejected: {message}");
+    }
+
+    private void EvaluatePreTradeControls(string route, string symbol, string action, double quantity, double limitPrice, double notional)
+    {
+        var context = new PreTradeContext(
+            route,
+            symbol,
+            action,
+            quantity,
+            limitPrice,
+            notional,
+            _dailyTransmittedOrderCount + 1);
+
+        var sessionStart = PreTradeControlDsl.ParseTimeOrNull(_options.PreTradeSessionStartUtc);
+        var sessionEnd = PreTradeControlDsl.ParseTimeOrNull(_options.PreTradeSessionEndUtc);
+
+        var violations = _preTradeControlDsl.Evaluate(
+            context,
+            _options.PreTradeControlsDsl,
+            maxNotional: _options.MaxNotional,
+            maxQty: _options.MaxShares,
+            maxDailyOrders: Math.Max(1, _options.PreTradeMaxDailyOrders),
+            sessionStart,
+            sessionEnd,
+            nowUtc: DateTime.UtcNow);
+
+        foreach (var violation in violations)
+        {
+            var line = $"[PRETRADE] guard={violation.Guard} action={violation.Action} {violation.Message}";
+            if (violation.Action == PreTradeAction.Warn)
+            {
+                Console.WriteLine($"[WARN] {line}");
+                continue;
+            }
+
+            if (violation.Action == PreTradeAction.Halt)
+            {
+                _hasPreTradeHalt = true;
+            }
+
+            throw new InvalidOperationException(line);
+        }
+    }
+
+    private void MarkOrderTransmitted()
+    {
+        _dailyTransmittedOrderCount++;
+    }
+
     private string BuildReport(string timestamp)
     {
         var netLiq = _wrapper.AccountSummaryRows.FirstOrDefault(x => x.Account == _options.Account && x.Tag == "NetLiquidation")?.Value
@@ -3426,6 +3550,11 @@ public sealed record AppOptions(
     string FaOrderExchange,
     string FaOrderPrimaryExchange,
     string FaOrderCurrency,
+    FaRoutingStrictness FaRoutingStrictness,
+    string PreTradeControlsDsl,
+    int PreTradeMaxDailyOrders,
+    string PreTradeSessionStartUtc,
+    string PreTradeSessionEndUtc,
     string FundamentalReportType,
     string WshFilterJson,
     string ScannerInstrument,
@@ -3544,6 +3673,11 @@ public sealed record AppOptions(
         var faOrderExchange = "SMART";
         var faOrderPrimaryExchange = "NASDAQ";
         var faOrderCurrency = "USD";
+        var faRoutingStrictness = FaRoutingStrictness.Reject;
+        var preTradeControlsDsl = "max-notional=reject;max-qty=reject;max-daily-orders=reject;session-window=halt";
+        var preTradeMaxDailyOrders = 5;
+        var preTradeSessionStartUtc = "13:30";
+        var preTradeSessionEndUtc = "16:15";
         var fundamentalReportType = "ReportSnapshot";
         var wshFilterJson = "{}";
         var scannerInstrument = "STK";
@@ -3866,6 +4000,22 @@ public sealed record AppOptions(
                 case "--fa-order-currency" when i + 1 < args.Length:
                     faOrderCurrency = args[++i].ToUpperInvariant();
                     break;
+                case "--fa-routing-strictness" when i + 1 < args.Length:
+                    faRoutingStrictness = ParseFaRoutingStrictness(args[++i]);
+                    break;
+                case "--pretrade-controls" when i + 1 < args.Length:
+                    preTradeControlsDsl = args[++i];
+                    break;
+                case "--pretrade-max-daily-orders" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ptd):
+                    preTradeMaxDailyOrders = ptd;
+                    i++;
+                    break;
+                case "--pretrade-session-start" when i + 1 < args.Length:
+                    preTradeSessionStartUtc = args[++i];
+                    break;
+                case "--pretrade-session-end" when i + 1 < args.Length:
+                    preTradeSessionEndUtc = args[++i];
+                    break;
                 case "--fund-report-type" when i + 1 < args.Length:
                     fundamentalReportType = args[++i];
                     break;
@@ -4061,6 +4211,11 @@ public sealed record AppOptions(
             faOrderExchange,
             faOrderPrimaryExchange,
             faOrderCurrency,
+            faRoutingStrictness,
+            preTradeControlsDsl,
+            preTradeMaxDailyOrders,
+            preTradeSessionStartUtc,
+            preTradeSessionEndUtc,
             fundamentalReportType,
             wshFilterJson,
             scannerInstrument,
@@ -4102,6 +4257,17 @@ public sealed record AppOptions(
             "warn" => ReconciliationGateAction.Warn,
             "fail" => ReconciliationGateAction.Fail,
             _ => throw new ArgumentException($"Unknown reconciliation gate action '{value}'. Use off|warn|fail.")
+        };
+    }
+
+    private static FaRoutingStrictness ParseFaRoutingStrictness(string value)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "off" => FaRoutingStrictness.Off,
+            "warn" => FaRoutingStrictness.Warn,
+            "reject" => FaRoutingStrictness.Reject,
+            _ => throw new ArgumentException($"Unknown FA routing strictness '{value}'. Use off|warn|reject.")
         };
     }
 
