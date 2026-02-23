@@ -9,7 +9,10 @@ public sealed record StrategyRuntimeContext(
     string Symbol,
     string? ModelCode,
     DateTime RunStartedUtc,
-    string OutputDirectory
+    string OutputDirectory,
+    string SessionStartUtc,
+    string SessionEndUtc,
+    int ScheduledIntervalSeconds
 );
 
 public sealed record StrategyDataSlice(

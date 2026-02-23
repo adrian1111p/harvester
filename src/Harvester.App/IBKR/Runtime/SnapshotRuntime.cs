@@ -28,6 +28,7 @@ public sealed class SnapshotRuntime
     private readonly PreTradeCostRiskEstimator _preTradeCostEstimator = new();
     private readonly List<PreTradeCostTelemetryRow> _preTradeCostTelemetryRows = [];
     private readonly IStrategyRuntime _strategyRuntime;
+    private readonly IStrategyEventScheduler _strategyScheduler;
     private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
     private readonly List<RuntimeLifecycleTransition> _lifecycleTransitions = [];
 
@@ -38,6 +39,7 @@ public sealed class SnapshotRuntime
         _errorPolicy = new IbErrorPolicy();
         _requestRegistry = new RequestRegistry();
         _strategyRuntime = strategyRuntime ?? new NullStrategyRuntime();
+        _strategyScheduler = new DeterministicStrategyEventScheduler();
     }
 
     public async Task<int> RunAsync()
@@ -69,9 +71,10 @@ public sealed class SnapshotRuntime
             var client = session.Client;
             IBrokerAdapter brokerAdapter = new IbBrokerAdapter();
             brokerAdapter.SetTraceSink(RegisterBrokerAdapterTrace);
+            var strategyContext = BuildFallbackStrategyContext(runStartedUtc);
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
             using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
-            var monitorTask = MonitorConnectionHealthAsync(session, client, brokerAdapter, runtimeCts);
+            var monitorTask = MonitorConnectionHealthAsync(session, client, brokerAdapter, strategyContext, runtimeCts);
 
             brokerAdapter.RequestCurrentTime(client);
             await AwaitTrackedWithTimeout(
@@ -85,14 +88,8 @@ public sealed class SnapshotRuntime
             EvaluateBrokerClockSkew();
             EnterSteadyState(session);
 
-            var strategyContext = new StrategyRuntimeContext(
-                _options.Mode.ToString(),
-                _options.Account,
-                _options.Symbol,
-                _options.ModelCode,
-                runStartedUtc,
-                EnsureOutputDir());
             await NotifyStrategyInitializeAsync(strategyContext, runtimeCts.Token);
+            await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, runtimeCts.Token);
             await NotifyStrategyScheduledEventAsync("mode-start", strategyContext, runtimeCts.Token);
 
             switch (_options.Mode)
@@ -246,6 +243,7 @@ public sealed class SnapshotRuntime
                     break;
             }
 
+                    await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, runtimeCts.Token);
                     await NotifyStrategyDataAsync(strategyContext, runtimeCts.Token);
                     await NotifyStrategyScheduledEventAsync("mode-complete", strategyContext, runtimeCts.Token);
 
@@ -385,7 +383,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[LIFECYCLE] {previous} -> {next} reason={reason}");
     }
 
-    private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, IBrokerAdapter brokerAdapter, CancellationTokenSource runtimeCts)
+    private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, IBrokerAdapter brokerAdapter, StrategyRuntimeContext strategyContext, CancellationTokenSource runtimeCts)
     {
         if (!_options.HeartbeatMonitorEnabled)
         {
@@ -398,6 +396,7 @@ public sealed class SnapshotRuntime
 
         while (!token.IsCancellationRequested)
         {
+            await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, token);
             await ProcessConnectivityApiErrorsAsync(session, runtimeCts, token);
             if (token.IsCancellationRequested)
             {
@@ -3519,7 +3518,19 @@ public sealed class SnapshotRuntime
             _options.Symbol,
             _options.ModelCode,
             runStartedUtc,
-            EnsureOutputDir());
+            EnsureOutputDir(),
+            _options.PreTradeSessionStartUtc,
+            _options.PreTradeSessionEndUtc,
+            Math.Max(1, _options.HeartbeatIntervalSeconds));
+    }
+
+    private async Task NotifyScheduledEventsAsync(StrategyRuntimeContext context, DateTime nowUtc, CancellationToken cancellationToken)
+    {
+        var dueEvents = _strategyScheduler.GetDueEvents(context, nowUtc);
+        foreach (var eventName in dueEvents)
+        {
+            await NotifyStrategyScheduledEventAsync(eventName, context, cancellationToken);
+        }
     }
 
     private async Task NotifyStrategyInitializeAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
