@@ -16,6 +16,8 @@ public sealed class SnapshotRuntime
     private bool _hasReconciliationQualityFailure;
     private bool _hasConnectivityFailure;
     private int _processedApiErrorCount;
+    private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
+    private readonly List<RuntimeLifecycleTransition> _lifecycleTransitions = [];
 
     public SnapshotRuntime(AppOptions options)
     {
@@ -30,6 +32,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[INFO] Mode={_options.Mode} host={_options.Host}:{_options.Port} clientId={_options.ClientId}");
         var runStartedUtc = DateTime.UtcNow;
         var runtimeStateStore = new RuntimeStateStore(_options.ExportDir);
+        TransitionLifecycle(RuntimeLifecycleStage.Startup, "run started");
         if (runtimeStateStore.TryLoadLatest(out var restoredCheckpoint, out var restoreMessage))
         {
             Console.WriteLine($"[OK] Restored runtime checkpoint: mode={restoredCheckpoint!.Snapshot.Mode} exitCode={restoredCheckpoint.Snapshot.ExitCode} state={restoredCheckpoint.Snapshot.ConnectionState} checkpoint={restoredCheckpoint.CheckpointUtc:O}");
@@ -64,6 +67,7 @@ public sealed class SnapshotRuntime
                 requestType: "reqCurrentTime",
                 origin: _options.Mode.ToString());
             Console.WriteLine("[OK] currentTime callback received");
+            EnterSteadyState(session);
 
             switch (_options.Mode)
             {
@@ -234,16 +238,19 @@ public sealed class SnapshotRuntime
                 {
                     Console.WriteLine("[WARN] Completed with connectivity halt escalation.");
                 }
+                TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
                 return 1;
             }
 
+            TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
             PersistRuntimeState(runtimeStateStore, session, 0, runStartedUtc);
             return 0;
         }
         catch (OperationCanceledException) when (_hasConnectivityFailure)
         {
+            TransitionLifecycle(RuntimeLifecycleStage.Halted, "connectivity halt escalation");
             Console.WriteLine("[FAIL] Connectivity halt escalation triggered.");
             PrintErrors();
             PrintRequestDiagnostics();
@@ -252,6 +259,7 @@ public sealed class SnapshotRuntime
         }
         catch (TimeoutException ex)
         {
+            TransitionLifecycle(RuntimeLifecycleStage.Halted, $"timeout: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
             PrintRequestDiagnostics();
@@ -260,6 +268,7 @@ public sealed class SnapshotRuntime
         }
         catch (Exception ex)
         {
+            TransitionLifecycle(RuntimeLifecycleStage.Halted, $"exception: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
             PrintRequestDiagnostics();
@@ -278,9 +287,49 @@ public sealed class SnapshotRuntime
             _hasConnectivityFailure,
             _hasReconciliationQualityFailure,
             exitCode,
-            runStartedUtc);
+            runStartedUtc,
+            _lifecycleStage,
+            _lifecycleTransitions.ToArray());
 
         runtimeStateStore.Save(snapshot);
+    }
+
+    private void EnterSteadyState(IbkrSession session)
+    {
+        if (session.State != IbConnectionState.Connected)
+        {
+            TransitionLifecycle(RuntimeLifecycleStage.Halted, $"steady-state gate failed: session state={session.State}");
+            throw new InvalidOperationException($"Steady-state gate failed: session not connected ({session.State}).");
+        }
+
+        if (_hasConnectivityFailure)
+        {
+            TransitionLifecycle(RuntimeLifecycleStage.Halted, "steady-state gate failed: connectivity failure active");
+            throw new InvalidOperationException("Steady-state gate failed: connectivity failure active.");
+        }
+
+        TransitionLifecycle(RuntimeLifecycleStage.SteadyState, "startup gates passed");
+    }
+
+    private void EnsureSteadyStateForOrderRoute(string routeName)
+    {
+        if (_lifecycleStage != RuntimeLifecycleStage.SteadyState)
+        {
+            throw new InvalidOperationException($"Order route '{routeName}' blocked: lifecycle stage is {_lifecycleStage}.");
+        }
+    }
+
+    private void TransitionLifecycle(RuntimeLifecycleStage next, string reason)
+    {
+        if (_lifecycleStage == next)
+        {
+            return;
+        }
+
+        var previous = _lifecycleStage;
+        _lifecycleStage = next;
+        _lifecycleTransitions.Add(new RuntimeLifecycleTransition(DateTime.UtcNow, previous, next, reason));
+        Console.WriteLine($"[LIFECYCLE] {previous} -> {next} reason={reason}");
     }
 
     private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, CancellationTokenSource runtimeCts)
@@ -690,6 +739,7 @@ public sealed class SnapshotRuntime
 
     private async Task RunOrdersPlaceSimMode(EClientSocket client, CancellationToken token)
     {
+        EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
         ValidateLiveSafetyInputs();
 
         var notional = _options.LiveQuantity * _options.LiveLimitPrice;
@@ -743,6 +793,7 @@ public sealed class SnapshotRuntime
 
     private async Task RunOrdersWhatIfMode(EClientSocket client, CancellationToken token)
     {
+        EnsureSteadyStateForOrderRoute(nameof(RunOrdersWhatIfMode));
         var nextOrderId = await _wrapper.NextValidIdTask;
         var contract = ContractFactory.Stock(_options.LiveSymbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
         var order = BuildWhatIfOrderTemplate(_options.WhatIfTemplate, _options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice);
@@ -1283,6 +1334,7 @@ public sealed class SnapshotRuntime
 
     private async Task RunOptionExerciseMode(EClientSocket client, CancellationToken token)
     {
+        EnsureSteadyStateForOrderRoute(nameof(RunOptionExerciseMode));
         if (!_options.OptionExerciseAllow)
         {
             throw new InvalidOperationException("Option exercise blocked: set --option-exercise-allow true to proceed.");
@@ -1721,6 +1773,7 @@ public sealed class SnapshotRuntime
 
     private async Task RunCryptoOrderPlacementMode(EClientSocket client, CancellationToken token)
     {
+        EnsureSteadyStateForOrderRoute(nameof(RunCryptoOrderPlacementMode));
         if (!_options.CryptoOrderAllow)
         {
             throw new InvalidOperationException("Crypto order blocked: set --crypto-order-allow true to proceed.");
@@ -1978,6 +2031,7 @@ public sealed class SnapshotRuntime
 
     private async Task RunFaOrderPlacementMode(EClientSocket client, CancellationToken token)
     {
+        EnsureSteadyStateForOrderRoute(nameof(RunFaOrderPlacementMode));
         if (!_options.FaOrderAllow)
         {
             throw new InvalidOperationException("FA order blocked: set --fa-order-allow true to proceed.");

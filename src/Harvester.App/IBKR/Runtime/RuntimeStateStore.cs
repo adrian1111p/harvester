@@ -110,7 +110,9 @@ public sealed class RuntimeStateStore
         bool hasConnectivityFailure,
         bool hasReconciliationQualityFailure,
         int exitCode,
-        DateTime runStartedUtc)
+        DateTime runStartedUtc,
+        RuntimeLifecycleStage lifecycleStage,
+        IReadOnlyList<RuntimeLifecycleTransition> lifecycleTransitions)
     {
         var requestArray = requests.ToArray();
         var timedOutRequests = requestArray.Count(r => r.Status == RequestStatus.TimedOut);
@@ -132,7 +134,9 @@ public sealed class RuntimeStateStore
             failedRequests,
             apiErrorCount,
             hasConnectivityFailure,
-            hasReconciliationQualityFailure
+            hasReconciliationQualityFailure,
+            lifecycleStage.ToString(),
+            lifecycleTransitions
         );
     }
 
@@ -162,6 +166,21 @@ public sealed class RuntimeStateStore
     }
 }
 
+public enum RuntimeLifecycleStage
+{
+    Startup,
+    SteadyState,
+    Shutdown,
+    Halted
+}
+
+public sealed record RuntimeLifecycleTransition(
+    DateTime TimestampUtc,
+    RuntimeLifecycleStage From,
+    RuntimeLifecycleStage To,
+    string Reason
+);
+
 public sealed record RuntimeStateCheckpoint(
     int SchemaVersion,
     DateTime CheckpointUtc,
@@ -184,5 +203,7 @@ public sealed record RuntimeStateSnapshot(
     int FailedRequestCount,
     int ApiErrorCount,
     bool ConnectivityHaltTriggered,
-    bool ReconciliationGateFailed
+    bool ReconciliationGateFailed,
+    string LifecycleStage,
+    IReadOnlyList<RuntimeLifecycleTransition> LifecycleTransitions
 );
