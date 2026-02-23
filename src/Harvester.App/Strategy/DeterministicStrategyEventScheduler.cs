@@ -46,6 +46,15 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
             {
                 events.Add("after_close");
             }
+
+            if (sessionWindow.IsEarlyClose)
+            {
+                var earlyCloseKey = $"{runKey}|early_close";
+                if (utcNow >= sessionWindow.SessionCloseUtc && _emittedOneShot.TryAdd(earlyCloseKey, 1))
+                {
+                    events.Add("early_close");
+                }
+            }
         }
         else
         {
