@@ -5,6 +5,7 @@ namespace Harvester.App.IBKR.Broker;
 
 public interface IBrokerAdapter
 {
+    bool IsConnected(EClientSocket client);
     Contract BuildContract(BrokerContractSpec spec);
     Order BuildOrder(BrokerOrderIntent intent);
     CanonicalOrderEvent TranslateOrderStatus(

@@ -371,7 +371,7 @@ public sealed class SnapshotRuntime
                 return;
             }
 
-            if (!client.IsConnected())
+            if (!brokerAdapter.IsConnected(client))
             {
                 var recovered = await AttemptReconnectOrHaltAsync(session, runtimeCts, "socket disconnected");
                 if (!recovered)

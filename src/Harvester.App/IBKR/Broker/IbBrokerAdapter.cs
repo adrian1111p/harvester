@@ -7,6 +7,11 @@ public sealed class IbBrokerAdapter : IBrokerAdapter
     private readonly IbContractNormalizationService _contracts = new();
     private readonly IbOrderTranslationService _orders = new();
 
+    public bool IsConnected(EClientSocket client)
+    {
+        return client.IsConnected();
+    }
+
     public Contract BuildContract(BrokerContractSpec spec)
     {
         return _contracts.NormalizeAndBuild(spec);
