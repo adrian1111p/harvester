@@ -28,6 +28,16 @@ public sealed class SnapshotRuntime
     public async Task<int> RunAsync()
     {
         Console.WriteLine($"[INFO] Mode={_options.Mode} host={_options.Host}:{_options.Port} clientId={_options.ClientId}");
+        var runStartedUtc = DateTime.UtcNow;
+        var runtimeStateStore = new RuntimeStateStore(_options.ExportDir);
+        if (runtimeStateStore.TryLoadLatest(out var restoredCheckpoint, out var restoreMessage))
+        {
+            Console.WriteLine($"[OK] Restored runtime checkpoint: mode={restoredCheckpoint!.Snapshot.Mode} exitCode={restoredCheckpoint.Snapshot.ExitCode} state={restoredCheckpoint.Snapshot.ConnectionState} checkpoint={restoredCheckpoint.CheckpointUtc:O}");
+        }
+        else if (!string.IsNullOrWhiteSpace(restoreMessage))
+        {
+            Console.WriteLine($"[WARN] {restoreMessage}");
+        }
 
         using var session = new IbkrSession(_wrapper);
         try
@@ -224,10 +234,12 @@ public sealed class SnapshotRuntime
                 {
                     Console.WriteLine("[WARN] Completed with connectivity halt escalation.");
                 }
+                PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
                 return 1;
             }
 
             Console.WriteLine("[PASS] Completed successfully.");
+            PersistRuntimeState(runtimeStateStore, session, 0, runStartedUtc);
             return 0;
         }
         catch (OperationCanceledException) when (_hasConnectivityFailure)
@@ -235,6 +247,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[FAIL] Connectivity halt escalation triggered.");
             PrintErrors();
             PrintRequestDiagnostics();
+            PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
             return 1;
         }
         catch (TimeoutException ex)
@@ -242,6 +255,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
             PrintRequestDiagnostics();
+            PersistRuntimeState(runtimeStateStore, session, 2, runStartedUtc);
             return 2;
         }
         catch (Exception ex)
@@ -249,8 +263,24 @@ public sealed class SnapshotRuntime
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
             PrintRequestDiagnostics();
+            PersistRuntimeState(runtimeStateStore, session, 2, runStartedUtc);
             return 2;
         }
+    }
+
+    private void PersistRuntimeState(RuntimeStateStore runtimeStateStore, IbkrSession session, int exitCode, DateTime runStartedUtc)
+    {
+        var snapshot = RuntimeStateStore.BuildSnapshot(
+            _options,
+            session,
+            _requestRegistry.Snapshot(),
+            _wrapper.ApiErrors.Count,
+            _hasConnectivityFailure,
+            _hasReconciliationQualityFailure,
+            exitCode,
+            runStartedUtc);
+
+        runtimeStateStore.Save(snapshot);
     }
 
     private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, CancellationTokenSource runtimeCts)
