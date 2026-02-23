@@ -4,6 +4,7 @@ using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
+using Harvester.App.Historical;
 using IBApi;
 
 namespace Harvester.App.IBKR.Runtime;
@@ -1029,9 +1030,19 @@ public sealed class SnapshotRuntime
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
         var barsPath = Path.Combine(outputDir, $"historical_bars_{_options.Symbol}_{timestamp}.json");
+        var canonicalBarsPath = Path.Combine(outputDir, $"historical_bars_canonical_{_options.Symbol}_{timestamp}.json");
 
-        WriteJson(barsPath, _wrapper.HistoricalBars.ToArray());
+        var bars = _wrapper.HistoricalBars.ToArray();
+        WriteJson(barsPath, bars);
+        var canonicalBars = ExportCanonicalHistoricalBars(
+            bars,
+            symbol: _options.Symbol,
+            securityType: "STK",
+            exchange: "SMART",
+            currency: "USD",
+            outputPath: canonicalBarsPath);
         Console.WriteLine($"[OK] Historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
+        Console.WriteLine($"[OK] Historical bars canonical export: {canonicalBarsPath} (rows={canonicalBars.Count})");
     }
 
     private async Task RunHistoricalBarsKeepUpToDateMode(EClientSocket client, CancellationToken token)
@@ -1071,12 +1082,32 @@ public sealed class SnapshotRuntime
         var outputDir = EnsureOutputDir();
         var barsPath = Path.Combine(outputDir, $"historical_bars_keepup_{_options.Symbol}_{timestamp}.json");
         var updatesPath = Path.Combine(outputDir, $"historical_bars_updates_{_options.Symbol}_{timestamp}.json");
+        var canonicalPath = Path.Combine(outputDir, $"historical_bars_keepup_canonical_{_options.Symbol}_{timestamp}.json");
 
-        WriteJson(barsPath, _wrapper.HistoricalBars.ToArray());
-        WriteJson(updatesPath, _wrapper.HistoricalBarUpdates.ToArray());
+        var bars = _wrapper.HistoricalBars.ToArray();
+        var updates = _wrapper.HistoricalBarUpdates.ToArray();
+
+        WriteJson(barsPath, bars);
+        WriteJson(updatesPath, updates);
+        var canonicalBars = ExportCanonicalHistoricalBars(
+            bars,
+            symbol: _options.Symbol,
+            securityType: "STK",
+            exchange: "SMART",
+            currency: "USD",
+            outputPath: canonicalPath);
+        var canonicalUpdates = ExportCanonicalHistoricalBarUpdates(
+            updates,
+            symbol: _options.Symbol,
+            securityType: "STK",
+            exchange: "SMART",
+            currency: "USD",
+            outputPath: canonicalPath,
+            appendToExisting: true);
 
         Console.WriteLine($"[OK] Historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
         Console.WriteLine($"[OK] Historical bar updates export: {updatesPath} (rows={_wrapper.HistoricalBarUpdates.Count})");
+        Console.WriteLine($"[OK] Historical canonical export: {canonicalPath} (bars={canonicalBars.Count}, updates={canonicalUpdates.Count})");
     }
 
     private async Task RunHistogramMode(EClientSocket client, CancellationToken token)
@@ -1791,9 +1822,62 @@ public sealed class SnapshotRuntime
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
         var path = Path.Combine(outputDir, $"crypto_historical_bars_{_options.CryptoSymbol}_{timestamp}.json");
+        var canonicalPath = Path.Combine(outputDir, $"crypto_historical_bars_canonical_{_options.CryptoSymbol}_{timestamp}.json");
 
-        WriteJson(path, _wrapper.HistoricalBars.ToArray());
+        var bars = _wrapper.HistoricalBars.ToArray();
+        WriteJson(path, bars);
+        var canonicalBars = ExportCanonicalHistoricalBars(
+            bars,
+            symbol: _options.CryptoSymbol,
+            securityType: "CRYPTO",
+            exchange: _options.CryptoExchange,
+            currency: _options.CryptoCurrency,
+            outputPath: canonicalPath);
         Console.WriteLine($"[OK] Crypto historical bars export: {path} (rows={_wrapper.HistoricalBars.Count})");
+        Console.WriteLine($"[OK] Crypto historical canonical export: {canonicalPath} (rows={canonicalBars.Count})");
+    }
+
+    private static IReadOnlyList<CanonicalHistoricalBar> ExportCanonicalHistoricalBars(
+        IReadOnlyList<HistoricalBarRow> rows,
+        string symbol,
+        string securityType,
+        string exchange,
+        string currency,
+        string outputPath)
+    {
+        var pipeline = new HistoricalIngestionPipeline<HistoricalBarRow, CanonicalHistoricalBar>(
+            new InMemoryHistoricalExtractor<HistoricalBarRow>(rows),
+            new IbHistoricalBarNormalizer(symbol, securityType, exchange, currency),
+            new JsonHistoricalWriter<CanonicalHistoricalBar>());
+
+        return pipeline.Run(outputPath);
+    }
+
+    private static IReadOnlyList<CanonicalHistoricalBar> ExportCanonicalHistoricalBarUpdates(
+        IReadOnlyList<HistoricalBarUpdateRow> rows,
+        string symbol,
+        string securityType,
+        string exchange,
+        string currency,
+        string outputPath,
+        bool appendToExisting)
+    {
+        var normalizer = new IbHistoricalBarUpdateNormalizer(symbol, securityType, exchange, currency);
+        var normalized = normalizer.Normalize(rows);
+        var writer = new JsonHistoricalWriter<CanonicalHistoricalBar>();
+        if (!appendToExisting)
+        {
+            File.Delete(outputPath);
+            writer.Write(outputPath, normalized);
+            return normalized;
+        }
+
+        var existing = File.Exists(outputPath)
+            ? JsonSerializer.Deserialize<CanonicalHistoricalBar[]>(File.ReadAllText(outputPath)) ?? []
+            : [];
+        var merged = existing.Concat(normalized).ToArray();
+        writer.Write(outputPath, merged);
+        return normalized;
     }
 
     private async Task RunCryptoOrderPlacementMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
