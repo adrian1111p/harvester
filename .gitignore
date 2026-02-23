@@ -1,0 +1,6 @@
+# .NET build artifacts
+**/bin/
+**/obj/
+
+# Runtime outputs
+exports/
