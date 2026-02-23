@@ -65,6 +65,7 @@ public sealed class SnapshotRuntime
 
             var client = session.Client;
             IBrokerAdapter brokerAdapter = new IbBrokerAdapter();
+            brokerAdapter.SetTraceSink(RegisterBrokerAdapterTrace);
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
             using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
             var monitorTask = MonitorConnectionHealthAsync(session, client, brokerAdapter, runtimeCts);
@@ -3466,6 +3467,16 @@ public sealed class SnapshotRuntime
             _requestRegistry.Fail(correlationId, ex.Message);
             throw;
         }
+    }
+
+    private void RegisterBrokerAdapterTrace(BrokerAdapterTrace trace)
+    {
+        var correlationId = _requestRegistry.Register(
+            trace.RequestId,
+            $"adapter:{trace.Operation}",
+            trace.Adapter,
+            DateTime.UtcNow.AddSeconds(_options.TimeoutSeconds));
+        _requestRegistry.Complete(correlationId, trace.Metadata);
     }
 
     private void PrintErrors()

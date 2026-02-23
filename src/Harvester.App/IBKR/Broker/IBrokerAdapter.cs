@@ -5,6 +5,7 @@ namespace Harvester.App.IBKR.Broker;
 
 public interface IBrokerAdapter
 {
+    void SetTraceSink(Action<BrokerAdapterTrace>? traceSink);
     bool IsConnected(EClientSocket client);
     Contract BuildContract(BrokerContractSpec spec);
     Order BuildOrder(BrokerOrderIntent intent);
@@ -95,6 +96,14 @@ public interface IBrokerAdapter
     void UpdateDisplayGroup(EClientSocket client, int requestId, string contractInfo);
     void UnsubscribeFromDisplayGroupEvents(EClientSocket client, int requestId);
 }
+
+public sealed record BrokerAdapterTrace(
+    DateTime TimestampUtc,
+    string Adapter,
+    string Operation,
+    int? RequestId,
+    string? Metadata
+);
 
 public enum BrokerAssetType
 {
