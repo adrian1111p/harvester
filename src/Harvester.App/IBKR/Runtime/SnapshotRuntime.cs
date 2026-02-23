@@ -23,6 +23,8 @@ public sealed class SnapshotRuntime
     private int _dailyTransmittedOrderCount;
     private readonly FaRoutingValidator _faRoutingValidator = new();
     private readonly PreTradeControlDsl _preTradeControlDsl = new();
+    private readonly PreTradeCostRiskEstimator _preTradeCostEstimator = new();
+    private readonly List<PreTradeCostTelemetryRow> _preTradeCostTelemetryRows = [];
     private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
     private readonly List<RuntimeLifecycleTransition> _lifecycleTransitions = [];
 
@@ -537,6 +539,8 @@ public sealed class SnapshotRuntime
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
+        ApplyReconciliationTelemetry(reconciliation.Ledger);
+        ExportPreTradeTelemetry(outputDir, timestamp);
 
         Console.WriteLine($"[OK] Open orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
@@ -634,6 +638,8 @@ public sealed class SnapshotRuntime
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
+        ApplyReconciliationTelemetry(reconciliation.Ledger);
+        ExportPreTradeTelemetry(outputDir, timestamp);
         WriteJson(accountSummaryPath, _wrapper.AccountSummaryRows.ToArray());
         WriteJson(positionsPath, _wrapper.Positions.ToArray());
         File.WriteAllText(reportPath, BuildReport(timestamp));
@@ -799,6 +805,7 @@ public sealed class SnapshotRuntime
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_SIM_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
+        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunOrdersPlaceSimMode), _options.LiveSymbol, _options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice, order.OrderRef);
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         MarkOrderTransmitted();
@@ -827,6 +834,8 @@ public sealed class SnapshotRuntime
 
         WriteJson(placementPath, new[] { placement });
         WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+        UpdatePreTradeTelemetryFromCallbacks();
+        ExportPreTradeTelemetry(outputDir, timestamp);
 
         Console.WriteLine($"[OK] Sim placement export: {placementPath}");
         Console.WriteLine($"[OK] Sim status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
@@ -1960,6 +1969,7 @@ public sealed class SnapshotRuntime
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_CRYPTO_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
+        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunCryptoOrderPlacementMode), _options.CryptoSymbol, action, _options.CryptoOrderQuantity, _options.CryptoOrderLimit, order.OrderRef);
 
         brokerAdapter.PlaceOrder(client, order.OrderId, crypto, order);
         MarkOrderTransmitted();
@@ -1993,6 +2003,8 @@ public sealed class SnapshotRuntime
 
         WriteJson(requestPath, request);
         WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+        UpdatePreTradeTelemetryFromCallbacks();
+        ExportPreTradeTelemetry(outputDir, timestamp);
 
         Console.WriteLine($"[OK] Crypto order request export: {requestPath}");
         Console.WriteLine($"[OK] Crypto order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
@@ -2248,6 +2260,7 @@ public sealed class SnapshotRuntime
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_FA_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
+        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunFaOrderPlacementMode), _options.FaOrderSymbol, action, _options.FaOrderQuantity, _options.FaOrderLimit, order.OrderRef);
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         MarkOrderTransmitted();
@@ -2283,6 +2296,8 @@ public sealed class SnapshotRuntime
 
         WriteJson(requestPath, request);
         WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+        UpdatePreTradeTelemetryFromCallbacks();
+        ExportPreTradeTelemetry(outputDir, timestamp);
 
         Console.WriteLine($"[OK] FA order request export: {requestPath}");
         Console.WriteLine($"[OK] FA order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
@@ -3162,6 +3177,128 @@ public sealed class SnapshotRuntime
         _dailyTransmittedOrderCount++;
     }
 
+    private void RegisterPreTradeCostEstimate(int orderId, string route, string symbol, string action, double quantity, double limitPrice, string orderRef)
+    {
+        var estimate = _preTradeCostEstimator.Estimate(
+            route,
+            symbol,
+            action,
+            quantity,
+            limitPrice,
+            orderRef,
+            _options.PreTradeCostProfile,
+            _options.PreTradeCommissionPerUnit,
+            _options.PreTradeSlippageBps);
+
+        _preTradeCostTelemetryRows.Add(new PreTradeCostTelemetryRow(
+            DateTime.UtcNow,
+            route,
+            symbol,
+            action,
+            orderId,
+            quantity,
+            limitPrice,
+            estimate.Notional,
+            estimate.Profile,
+            orderRef,
+            estimate.EstimatedCommission,
+            null,
+            null,
+            estimate.EstimatedSlippage,
+            null,
+            null));
+    }
+
+    private void UpdatePreTradeTelemetryFromCallbacks()
+    {
+        if (_preTradeCostTelemetryRows.Count == 0)
+        {
+            return;
+        }
+
+        var eventsByOrderId = _wrapper.CanonicalOrderEvents
+            .Where(e => e.OrderId > 0)
+            .GroupBy(e => e.OrderId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(x => x.TimestampUtc).First());
+
+        for (var i = 0; i < _preTradeCostTelemetryRows.Count; i++)
+        {
+            var row = _preTradeCostTelemetryRows[i];
+            if (!eventsByOrderId.TryGetValue(row.OrderId, out var evt) || evt.AvgFillPrice <= 0)
+            {
+                continue;
+            }
+
+            var realizedSlippage = ComputeRealizedSlippage(row.Action, row.Quantity, row.LimitPrice, evt.AvgFillPrice);
+            _preTradeCostTelemetryRows[i] = row with
+            {
+                RealizedSlippage = realizedSlippage,
+                SlippageDelta = realizedSlippage - row.EstimatedSlippage
+            };
+        }
+    }
+
+    private void ApplyReconciliationTelemetry(CanonicalOrderLedgerRow[] ledger)
+    {
+        if (_preTradeCostTelemetryRows.Count == 0)
+        {
+            return;
+        }
+
+        var byOrderId = ledger
+            .Where(l => l.OrderId is not null)
+            .GroupBy(l => l.OrderId!.Value)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        for (var i = 0; i < _preTradeCostTelemetryRows.Count; i++)
+        {
+            var row = _preTradeCostTelemetryRows[i];
+            if (!byOrderId.TryGetValue(row.OrderId, out var realized))
+            {
+                continue;
+            }
+
+            var realizedCommission = realized.Commission;
+            var realizedSlippage = realized.AverageFillPrice is not null
+                ? ComputeRealizedSlippage(row.Action, row.Quantity, row.LimitPrice, realized.AverageFillPrice.Value)
+                : row.RealizedSlippage;
+
+            _preTradeCostTelemetryRows[i] = row with
+            {
+                RealizedCommission = realizedCommission,
+                CommissionDelta = realizedCommission is null ? null : realizedCommission.Value - row.EstimatedCommission,
+                RealizedSlippage = realizedSlippage,
+                SlippageDelta = realizedSlippage is null ? null : realizedSlippage.Value - row.EstimatedSlippage
+            };
+        }
+    }
+
+    private void ExportPreTradeTelemetry(string outputDir, string timestamp)
+    {
+        if (_preTradeCostTelemetryRows.Count == 0)
+        {
+            return;
+        }
+
+        var path = Path.Combine(outputDir, $"pretrade_cost_telemetry_{timestamp}.json");
+        WriteJson(path, _preTradeCostTelemetryRows.ToArray());
+        Console.WriteLine($"[OK] Pre-trade cost telemetry export: {path} (rows={_preTradeCostTelemetryRows.Count})");
+    }
+
+    private static double ComputeRealizedSlippage(string action, double quantity, double limitPrice, double fillPrice)
+    {
+        if (limitPrice <= 0 || fillPrice <= 0 || quantity <= 0)
+        {
+            return 0;
+        }
+
+        var normalizedAction = (action ?? string.Empty).ToUpperInvariant();
+        var slippagePerUnit = normalizedAction == "SELL"
+            ? Math.Max(0, limitPrice - fillPrice)
+            : Math.Max(0, fillPrice - limitPrice);
+        return slippagePerUnit * Math.Abs(quantity);
+    }
+
     private string BuildReport(string timestamp)
     {
         var netLiq = _wrapper.AccountSummaryRows.FirstOrDefault(x => x.Account == _options.Account && x.Tag == "NetLiquidation")?.Value
@@ -3555,6 +3692,9 @@ public sealed record AppOptions(
     int PreTradeMaxDailyOrders,
     string PreTradeSessionStartUtc,
     string PreTradeSessionEndUtc,
+    PreTradeCostProfile PreTradeCostProfile,
+    double PreTradeCommissionPerUnit,
+    double PreTradeSlippageBps,
     string FundamentalReportType,
     string WshFilterJson,
     string ScannerInstrument,
@@ -3678,6 +3818,9 @@ public sealed record AppOptions(
         var preTradeMaxDailyOrders = 5;
         var preTradeSessionStartUtc = "13:30";
         var preTradeSessionEndUtc = "16:15";
+        var preTradeCostProfile = PreTradeCostProfile.MicroEquity;
+        var preTradeCommissionPerUnit = 0.0035;
+        var preTradeSlippageBps = 4.0;
         var fundamentalReportType = "ReportSnapshot";
         var wshFilterJson = "{}";
         var scannerInstrument = "STK";
@@ -4016,6 +4159,17 @@ public sealed record AppOptions(
                 case "--pretrade-session-end" when i + 1 < args.Length:
                     preTradeSessionEndUtc = args[++i];
                     break;
+                case "--pretrade-cost-profile" when i + 1 < args.Length:
+                    preTradeCostProfile = ParsePreTradeCostProfile(args[++i]);
+                    break;
+                case "--pretrade-commission-per-unit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var ptcpu):
+                    preTradeCommissionPerUnit = ptcpu;
+                    i++;
+                    break;
+                case "--pretrade-slippage-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var ptsb):
+                    preTradeSlippageBps = ptsb;
+                    i++;
+                    break;
                 case "--fund-report-type" when i + 1 < args.Length:
                     fundamentalReportType = args[++i];
                     break;
@@ -4216,6 +4370,9 @@ public sealed record AppOptions(
             preTradeMaxDailyOrders,
             preTradeSessionStartUtc,
             preTradeSessionEndUtc,
+            preTradeCostProfile,
+            preTradeCommissionPerUnit,
+            preTradeSlippageBps,
             fundamentalReportType,
             wshFilterJson,
             scannerInstrument,
@@ -4268,6 +4425,17 @@ public sealed record AppOptions(
             "warn" => FaRoutingStrictness.Warn,
             "reject" => FaRoutingStrictness.Reject,
             _ => throw new ArgumentException($"Unknown FA routing strictness '{value}'. Use off|warn|reject.")
+        };
+    }
+
+    private static PreTradeCostProfile ParsePreTradeCostProfile(string value)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "micro" => PreTradeCostProfile.MicroEquity,
+            "microequity" => PreTradeCostProfile.MicroEquity,
+            "conservative" => PreTradeCostProfile.Conservative,
+            _ => throw new ArgumentException($"Unknown pretrade cost profile '{value}'. Use micro|conservative.")
         };
     }
 
