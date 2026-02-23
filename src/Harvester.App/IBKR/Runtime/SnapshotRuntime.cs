@@ -28,6 +28,10 @@ public sealed class SnapshotRuntime
         try
         {
             await session.ConnectAsync(_options.Host, _options.Port, _options.ClientId, _options.TimeoutSeconds);
+            if (session.State != IbConnectionState.Connected)
+            {
+                throw new InvalidOperationException($"Session not in Connected state. Current state={session.State}");
+            }
             Console.WriteLine($"[OK] nextValidId={await _wrapper.NextValidIdTask}");
             Console.WriteLine($"[OK] managedAccounts={await _wrapper.ManagedAccountsTask}");
 
