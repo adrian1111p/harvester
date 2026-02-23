@@ -29,9 +29,12 @@ public interface IBrokerAdapter
         OrderState orderState);
 
     void RequestOpenOrders(EClientSocket client);
+    void RequestCurrentTime(EClientSocket client);
     void RequestCompletedOrders(EClientSocket client, bool apiOnly);
     void RequestExecutions(EClientSocket client, int requestId, ExecutionFilter filter);
     void RequestContractDetails(EClientSocket client, int requestId, Contract contract);
+    void RequestOptionChainParameters(EClientSocket client, int requestId, string underlyingSymbol, string futFopExchange, string underlyingSecType, int underlyingConId);
+    void ExerciseOptions(EClientSocket client, int requestId, Contract contract, int exerciseAction, int exerciseQuantity, string account, int overrideOption);
     void PlaceOrder(EClientSocket client, int orderId, Contract contract, Order order);
     void RequestMarketDataType(EClientSocket client, int marketDataType);
     void RequestMarketData(EClientSocket client, int requestId, Contract contract, string genericTickList = "");
@@ -52,6 +55,44 @@ public interface IBrokerAdapter
         int formatDate,
         bool keepUpToDate);
     void CancelHistoricalData(EClientSocket client, int requestId);
+    void RequestHistoricalTicks(
+        EClientSocket client,
+        int requestId,
+        Contract contract,
+        string startDateTime,
+        string endDateTime,
+        int numberOfTicks,
+        string whatToShow,
+        int useRth,
+        bool ignoreSize);
+    void RequestHeadTimestamp(EClientSocket client, int requestId, Contract contract, string whatToShow, int useRth, int formatDate);
+    void CancelHeadTimestamp(EClientSocket client, int requestId);
+    void RequestManagedAccounts(EClientSocket client);
+    void RequestFamilyCodes(EClientSocket client);
+    void RequestAccountUpdates(EClientSocket client, bool subscribe, string accountCode);
+    void RequestAccountUpdatesMulti(EClientSocket client, int requestId, string accountCode, string modelCode, bool ledgerAndNlv);
+    void CancelAccountUpdatesMulti(EClientSocket client, int requestId);
+    void RequestAccountSummary(EClientSocket client, int requestId, string groupName, string tags);
+    void CancelAccountSummary(EClientSocket client, int requestId);
+    void RequestPositions(EClientSocket client);
+    void CancelPositions(EClientSocket client);
+    void RequestPositionsMulti(EClientSocket client, int requestId, string accountCode, string modelCode);
+    void CancelPositionsMulti(EClientSocket client, int requestId);
+    void RequestPnlAccount(EClientSocket client, int requestId, string accountCode, string modelCode);
+    void CancelPnlAccount(EClientSocket client, int requestId);
+    void RequestPnlSingle(EClientSocket client, int requestId, string accountCode, string modelCode, int contractId);
+    void CancelPnlSingle(EClientSocket client, int requestId);
+    void RequestFaData(EClientSocket client, int faDataType);
+    void RequestFundamentalData(EClientSocket client, int requestId, Contract contract, string reportType);
+    void CancelFundamentalData(EClientSocket client, int requestId);
+    void RequestScannerSubscription(EClientSocket client, int requestId, ScannerSubscription subscription, IReadOnlyList<TagValue> subscriptionOptions, IReadOnlyList<TagValue> filterOptions);
+    void CancelScannerSubscription(EClientSocket client, int requestId);
+    void RequestScannerParameters(EClientSocket client);
+    void RequestHistogramData(EClientSocket client, int requestId, Contract contract, bool useRth, string period);
+    void QueryDisplayGroups(EClientSocket client, int requestId);
+    void SubscribeToDisplayGroupEvents(EClientSocket client, int requestId, int groupId);
+    void UpdateDisplayGroup(EClientSocket client, int requestId, string contractInfo);
+    void UnsubscribeFromDisplayGroupEvents(EClientSocket client, int requestId);
 }
 
 public enum BrokerAssetType

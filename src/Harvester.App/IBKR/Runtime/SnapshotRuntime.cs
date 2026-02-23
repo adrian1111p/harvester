@@ -67,9 +67,9 @@ public sealed class SnapshotRuntime
             IBrokerAdapter brokerAdapter = new IbBrokerAdapter();
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
             using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
-            var monitorTask = MonitorConnectionHealthAsync(session, client, runtimeCts);
+            var monitorTask = MonitorConnectionHealthAsync(session, client, brokerAdapter, runtimeCts);
 
-            client.reqCurrentTime();
+            brokerAdapter.RequestCurrentTime(client);
             await AwaitTrackedWithTimeout(
                 _wrapper.CurrentTimeTask,
                 runtimeCts.Token,
@@ -84,13 +84,13 @@ public sealed class SnapshotRuntime
             switch (_options.Mode)
             {
                 case RunMode.Connect:
-                    await RunConnectMode(client, runtimeCts.Token);
+                    await RunConnectMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.Orders:
                     await RunOrdersMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.Positions:
-                    await RunPositionsMode(client, runtimeCts.Token);
+                    await RunPositionsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.SnapshotAll:
                     await RunSnapshotAllMode(client, brokerAdapter, runtimeCts.Token);
@@ -126,55 +126,55 @@ public sealed class SnapshotRuntime
                     await RunHistoricalBarsKeepUpToDateMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.Histogram:
-                    await RunHistogramMode(client, runtimeCts.Token);
+                    await RunHistogramMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalTicks:
-                    await RunHistoricalTicksMode(client, runtimeCts.Token);
+                    await RunHistoricalTicksMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.HeadTimestamp:
-                    await RunHeadTimestampMode(client, runtimeCts.Token);
+                    await RunHeadTimestampMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.ManagedAccounts:
-                    await RunManagedAccountsMode(client, runtimeCts.Token);
+                    await RunManagedAccountsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FamilyCodes:
-                    await RunFamilyCodesMode(client, runtimeCts.Token);
+                    await RunFamilyCodesMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.AccountUpdates:
-                    await RunAccountUpdatesMode(client, runtimeCts.Token);
+                    await RunAccountUpdatesMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.AccountUpdatesMulti:
-                    await RunAccountUpdatesMultiMode(client, runtimeCts.Token);
+                    await RunAccountUpdatesMultiMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.AccountSummaryOnly:
-                    await RunAccountSummaryOnlyMode(client, runtimeCts.Token);
+                    await RunAccountSummaryOnlyMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.PositionsMulti:
-                    await RunPositionsMultiMode(client, runtimeCts.Token);
+                    await RunPositionsMultiMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.PnlAccount:
-                    await RunPnlAccountMode(client, runtimeCts.Token);
+                    await RunPnlAccountMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.PnlSingle:
-                    await RunPnlSingleMode(client, runtimeCts.Token);
+                    await RunPnlSingleMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OptionChains:
-                    await RunOptionChainsMode(client, runtimeCts.Token);
+                    await RunOptionChainsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OptionExercise:
                     await RunOptionExerciseMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OptionGreeks:
-                    await RunOptionGreeksMode(client, runtimeCts.Token);
+                    await RunOptionGreeksMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.CryptoPermissions:
-                    await RunCryptoPermissionsMode(client, runtimeCts.Token);
+                    await RunCryptoPermissionsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.CryptoContract:
-                    await RunCryptoContractDefinitionMode(client, runtimeCts.Token);
+                    await RunCryptoContractDefinitionMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.CryptoStreaming:
-                    await RunCryptoStreamingMode(client, runtimeCts.Token);
+                    await RunCryptoStreamingMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.CryptoHistorical:
                     await RunCryptoHistoricalMode(client, brokerAdapter, runtimeCts.Token);
@@ -183,22 +183,22 @@ public sealed class SnapshotRuntime
                     await RunCryptoOrderPlacementMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaAllocationGroups:
-                    await RunFaAllocationMethodsAndGroupsMode(client, runtimeCts.Token);
+                    await RunFaAllocationMethodsAndGroupsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaGroupsProfiles:
-                    await RunFaGroupsAndProfilesMode(client, runtimeCts.Token);
+                    await RunFaGroupsAndProfilesMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaUnification:
-                    await RunFaUnificationMode(client, runtimeCts.Token);
+                    await RunFaUnificationMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaModelPortfolios:
-                    await RunFaModelPortfoliosMode(client, runtimeCts.Token);
+                    await RunFaModelPortfoliosMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaOrder:
                     await RunFaOrderPlacementMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FundamentalData:
-                    await RunFundamentalDataMode(client, runtimeCts.Token);
+                    await RunFundamentalDataMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.WshFilters:
                     await RunWshFiltersMode(client, runtimeCts.Token);
@@ -207,28 +207,28 @@ public sealed class SnapshotRuntime
                     await RunErrorCodesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ScannerExamples:
-                    await RunScannerExamplesMode(client, runtimeCts.Token);
+                    await RunScannerExamplesMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.ScannerComplex:
-                    await RunScannerComplexMode(client, runtimeCts.Token);
+                    await RunScannerComplexMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.ScannerParameters:
-                    await RunScannerParametersMode(client, runtimeCts.Token);
+                    await RunScannerParametersMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.ScannerWorkbench:
-                    await RunScannerWorkbenchMode(client, runtimeCts.Token);
+                    await RunScannerWorkbenchMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsQuery:
-                    await RunDisplayGroupsQueryMode(client, runtimeCts.Token);
+                    await RunDisplayGroupsQueryMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsSubscribe:
-                    await RunDisplayGroupsSubscribeMode(client, runtimeCts.Token);
+                    await RunDisplayGroupsSubscribeMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsUpdate:
-                    await RunDisplayGroupsUpdateMode(client, runtimeCts.Token);
+                    await RunDisplayGroupsUpdateMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsUnsubscribe:
-                    await RunDisplayGroupsUnsubscribeMode(client, runtimeCts.Token);
+                    await RunDisplayGroupsUnsubscribeMode(client, brokerAdapter, runtimeCts.Token);
                     break;
             }
 
@@ -352,7 +352,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[LIFECYCLE] {previous} -> {next} reason={reason}");
     }
 
-    private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, CancellationTokenSource runtimeCts)
+    private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, IBrokerAdapter brokerAdapter, CancellationTokenSource runtimeCts)
     {
         if (!_options.HeartbeatMonitorEnabled)
         {
@@ -381,7 +381,7 @@ public sealed class SnapshotRuntime
             }
 
             var probeStartedUtc = DateTime.UtcNow;
-            client.reqCurrentTime();
+            brokerAdapter.RequestCurrentTime(client);
 
             try
             {
@@ -470,10 +470,10 @@ public sealed class SnapshotRuntime
         return code is 1100 or 1300 or 2110;
     }
 
-    private async Task RunConnectMode(EClientSocket client, CancellationToken token)
+    private async Task RunConnectMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int summaryReqId = 9001;
-        client.reqAccountSummary(summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower");
+        brokerAdapter.RequestAccountSummary(client, summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower");
         await AwaitTrackedWithTimeout(
             _wrapper.AccountSummaryEndTask,
             token,
@@ -481,7 +481,7 @@ public sealed class SnapshotRuntime
             requestId: summaryReqId,
             requestType: "reqAccountSummary",
             origin: nameof(RunConnectMode));
-        client.cancelAccountSummary(summaryReqId);
+        brokerAdapter.CancelAccountSummary(client, summaryReqId);
 
         Console.WriteLine("\n=== Account Summary Rows ===");
         foreach (var row in _wrapper.AccountSummaryRows)
@@ -560,11 +560,11 @@ public sealed class SnapshotRuntime
         EvaluateReconciliationQualityGate(reconciliation.Summary, nameof(RunOrdersMode));
     }
 
-    private async Task RunPositionsMode(EClientSocket client, CancellationToken token)
+    private async Task RunPositionsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int summaryReqId = 9001;
-        client.reqAccountSummary(summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds");
-        client.reqPositions();
+        brokerAdapter.RequestAccountSummary(client, summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds");
+        brokerAdapter.RequestPositions(client);
 
         await AwaitTrackedWithTimeout(
             _wrapper.AccountSummaryEndTask,
@@ -581,8 +581,8 @@ public sealed class SnapshotRuntime
             requestType: "reqPositions",
             origin: nameof(RunPositionsMode));
 
-        client.cancelAccountSummary(summaryReqId);
-        client.cancelPositions();
+        brokerAdapter.CancelAccountSummary(client, summaryReqId);
+        brokerAdapter.CancelPositions(client);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -611,12 +611,12 @@ public sealed class SnapshotRuntime
         await AwaitWithTimeout(_wrapper.ExecDetailsEndTask, token, "execDetailsEnd");
 
         const int summaryReqId = 9001;
-        client.reqAccountSummary(summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds");
-        client.reqPositions();
+        brokerAdapter.RequestAccountSummary(client, summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds");
+        brokerAdapter.RequestPositions(client);
         await AwaitWithTimeout(_wrapper.AccountSummaryEndTask, token, "accountSummaryEnd");
         await AwaitWithTimeout(_wrapper.PositionEndTask, token, "positionEnd");
-        client.cancelAccountSummary(summaryReqId);
-        client.cancelPositions();
+        brokerAdapter.CancelAccountSummary(client, summaryReqId);
+        brokerAdapter.CancelPositions(client);
 
         var openOrdersPath = Path.Combine(outputDir, $"open_orders_{timestamp}.json");
         var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
@@ -1178,12 +1178,12 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Historical canonical export: {canonicalPath} (bars={canonicalBars.Count}, updates={canonicalUpdates.Count})");
     }
 
-    private async Task RunHistogramMode(EClientSocket client, CancellationToken token)
+    private async Task RunHistogramMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
         const int reqId = 9603;
 
-        client.reqHistogramData(reqId, contract, _options.HistoricalUseRth == 1, _options.HistogramPeriod);
+        brokerAdapter.RequestHistogramData(client, reqId, contract, _options.HistoricalUseRth == 1, _options.HistogramPeriod);
         await AwaitWithTimeout(_wrapper.HistogramDataTask, token, "histogramData");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -1194,7 +1194,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Histogram export: {histogramPath} (rows={_wrapper.Histograms.Count})");
     }
 
-    private async Task RunHistoricalTicksMode(EClientSocket client, CancellationToken token)
+    private async Task RunHistoricalTicksMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
         const int reqId = 9604;
@@ -1215,7 +1215,8 @@ public sealed class SnapshotRuntime
             startValue = string.Empty;
         }
 
-        client.reqHistoricalTicks(
+        brokerAdapter.RequestHistoricalTicks(
+            client,
             reqId,
             contract,
             startValue,
@@ -1223,9 +1224,7 @@ public sealed class SnapshotRuntime
             _options.HistoricalTicksNumber,
             _options.HistoricalTicksWhatToShow,
             _options.HistoricalUseRth,
-            _options.HistoricalTickIgnoreSize,
-            new List<TagValue>()
-        );
+            _options.HistoricalTickIgnoreSize);
 
         try
         {
@@ -1258,14 +1257,14 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Historical MIDPOINT ticks export: {ticksPath} (rows={_wrapper.HistoricalTicks.Count})");
     }
 
-    private async Task RunHeadTimestampMode(EClientSocket client, CancellationToken token)
+    private async Task RunHeadTimestampMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
         const int reqId = 9605;
 
-        client.reqHeadTimestamp(reqId, contract, _options.HeadTimestampWhatToShow, _options.HistoricalUseRth, _options.HistoricalFormatDate);
+        brokerAdapter.RequestHeadTimestamp(client, reqId, contract, _options.HeadTimestampWhatToShow, _options.HistoricalUseRth, _options.HistoricalFormatDate);
         await AwaitWithTimeout(_wrapper.HeadTimestampTask, token, "headTimestamp");
-        client.cancelHeadTimestamp(reqId);
+        brokerAdapter.CancelHeadTimestamp(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1275,9 +1274,9 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Head timestamp export: {headPath} (rows={_wrapper.HeadTimestamps.Count})");
     }
 
-    private async Task RunManagedAccountsMode(EClientSocket client, CancellationToken token)
+    private async Task RunManagedAccountsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        client.reqManagedAccts();
+        brokerAdapter.RequestManagedAccounts(client);
         var accountsList = await AwaitWithTimeout(_wrapper.ManagedAccountsTask, token, "managedAccounts");
 
         var accounts = accountsList
@@ -1293,9 +1292,9 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Managed accounts export: {path} (rows={accounts.Length})");
     }
 
-    private async Task RunFamilyCodesMode(EClientSocket client, CancellationToken token)
+    private async Task RunFamilyCodesMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        client.reqFamilyCodes();
+        brokerAdapter.RequestFamilyCodes(client);
         await AwaitWithTimeout(_wrapper.FamilyCodesTask, token, "familyCodes");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -1306,14 +1305,14 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Family codes export: {path} (rows={_wrapper.FamilyCodesRows.Count})");
     }
 
-    private async Task RunAccountUpdatesMode(EClientSocket client, CancellationToken token)
+    private async Task RunAccountUpdatesMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var subscriptionAccount = string.IsNullOrWhiteSpace(_options.UpdateAccount) ? _options.Account : _options.UpdateAccount;
 
-        client.reqAccountUpdates(true, subscriptionAccount);
+        brokerAdapter.RequestAccountUpdates(client, true, subscriptionAccount);
         await AwaitWithTimeout(_wrapper.AccountDownloadEndTask, token, "accountDownloadEnd");
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.reqAccountUpdates(false, subscriptionAccount);
+        brokerAdapter.RequestAccountUpdates(client, false, subscriptionAccount);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1330,13 +1329,13 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Account update times export: {timesPath} (rows={_wrapper.AccountUpdateTimes.Count})");
     }
 
-    private async Task RunAccountUpdatesMultiMode(EClientSocket client, CancellationToken token)
+    private async Task RunAccountUpdatesMultiMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int reqId = 9701;
-        client.reqAccountUpdatesMulti(reqId, _options.AccountUpdatesMultiAccount, _options.ModelCode, true);
+        brokerAdapter.RequestAccountUpdatesMulti(client, reqId, _options.AccountUpdatesMultiAccount, _options.ModelCode, true);
         await AwaitWithTimeout(_wrapper.AccountUpdateMultiEndTask, token, "accountUpdateMultiEnd");
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelAccountUpdatesMulti(reqId);
+        brokerAdapter.CancelAccountUpdatesMulti(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1346,12 +1345,12 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Account updates multi export: {path} (rows={_wrapper.AccountUpdateMultiRows.Count})");
     }
 
-    private async Task RunAccountSummaryOnlyMode(EClientSocket client, CancellationToken token)
+    private async Task RunAccountSummaryOnlyMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int reqId = 9702;
-        client.reqAccountSummary(reqId, _options.AccountSummaryGroup, _options.AccountSummaryTags);
+        brokerAdapter.RequestAccountSummary(client, reqId, _options.AccountSummaryGroup, _options.AccountSummaryTags);
         await AwaitWithTimeout(_wrapper.AccountSummaryEndTask, token, "accountSummaryEnd");
-        client.cancelAccountSummary(reqId);
+        brokerAdapter.CancelAccountSummary(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1361,13 +1360,13 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Account summary export: {path} (rows={_wrapper.AccountSummaryRows.Count})");
     }
 
-    private async Task RunPositionsMultiMode(EClientSocket client, CancellationToken token)
+    private async Task RunPositionsMultiMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int reqId = 9703;
-        client.reqPositionsMulti(reqId, _options.PositionsMultiAccount, _options.ModelCode);
+        brokerAdapter.RequestPositionsMulti(client, reqId, _options.PositionsMultiAccount, _options.ModelCode);
         await AwaitWithTimeout(_wrapper.PositionMultiEndTask, token, "positionMultiEnd");
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelPositionsMulti(reqId);
+        brokerAdapter.CancelPositionsMulti(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1377,15 +1376,15 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Positions multi export: {path} (rows={_wrapper.PositionMultiRows.Count})");
     }
 
-    private async Task RunPnlAccountMode(EClientSocket client, CancellationToken token)
+    private async Task RunPnlAccountMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int reqId = 9704;
         var pnlAccount = string.IsNullOrWhiteSpace(_options.PnlAccount) ? _options.Account : _options.PnlAccount;
 
-        client.reqPnL(reqId, pnlAccount, _options.ModelCode);
+        brokerAdapter.RequestPnlAccount(client, reqId, pnlAccount, _options.ModelCode);
         await AwaitWithTimeout(_wrapper.PnlFirstTask, token, "pnl");
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelPnL(reqId);
+        brokerAdapter.CancelPnlAccount(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1395,7 +1394,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] PnL account export: {path} (rows={_wrapper.PnlRows.Count})");
     }
 
-    private async Task RunPnlSingleMode(EClientSocket client, CancellationToken token)
+    private async Task RunPnlSingleMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         if (_options.PnlConId <= 0)
         {
@@ -1405,7 +1404,7 @@ public sealed class SnapshotRuntime
         const int reqId = 9705;
         var pnlAccount = string.IsNullOrWhiteSpace(_options.PnlAccount) ? _options.Account : _options.PnlAccount;
 
-        client.reqPnLSingle(reqId, pnlAccount, _options.ModelCode, _options.PnlConId);
+        brokerAdapter.RequestPnlSingle(client, reqId, pnlAccount, _options.ModelCode, _options.PnlConId);
         var receivedFirstUpdate = true;
         try
         {
@@ -1422,7 +1421,7 @@ public sealed class SnapshotRuntime
             await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
         }
 
-        client.cancelPnLSingle(reqId);
+        brokerAdapter.CancelPnlSingle(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1432,10 +1431,10 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] PnL single export: {path} (rows={_wrapper.PnlSingleRows.Count})");
     }
 
-    private async Task RunOptionChainsMode(EClientSocket client, CancellationToken token)
+    private async Task RunOptionChainsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var underlying = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        client.reqContractDetails(9801, underlying);
+        brokerAdapter.RequestContractDetails(client, 9801, underlying);
         await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, token, "contractDetailsEnd");
 
         var underlyingDetails = _wrapper.ContractDetailsRows.FirstOrDefault();
@@ -1445,7 +1444,7 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Unable to resolve underlying conId for option chain request.");
         }
 
-        client.reqSecDefOptParams(9802, _options.Symbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
+        brokerAdapter.RequestOptionChainParameters(client, 9802, _options.Symbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
         await AwaitWithTimeout(_wrapper.OptionChainEndTask, token, "securityDefinitionOptionParameterEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -1482,14 +1481,14 @@ public sealed class SnapshotRuntime
             limitPrice: 0,
             notional: 0);
 
-        client.exerciseOptions(
+        brokerAdapter.ExerciseOptions(
+            client,
             9803,
             option,
             _options.OptionExerciseAction,
             _options.OptionExerciseQuantity,
             _options.Account,
-            _options.OptionExerciseOverride
-        );
+            _options.OptionExerciseOverride);
         MarkOrderTransmitted();
 
         await Task.Delay(TimeSpan.FromSeconds(2), token);
@@ -1521,7 +1520,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Option exercise order-status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
-    private async Task RunOptionGreeksMode(EClientSocket client, CancellationToken token)
+    private async Task RunOptionGreeksMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var option = ContractFactory.Option(
             _options.OptionSymbol,
@@ -1537,7 +1536,7 @@ public sealed class SnapshotRuntime
         {
         }
 
-        client.reqContractDetails(98040, option);
+        brokerAdapter.RequestContractDetails(client, 98040, option);
         using (var resolveCts = CancellationTokenSource.CreateLinkedTokenSource(token))
         {
             resolveCts.CancelAfter(TimeSpan.FromSeconds(8));
@@ -1585,7 +1584,7 @@ public sealed class SnapshotRuntime
                 );
             }
 
-            var fallbackOption = await TryBuildOptionGreeksFallbackContractAsync(client, token);
+            var fallbackOption = await TryBuildOptionGreeksFallbackContractAsync(client, brokerAdapter, token);
             if (fallbackOption is null)
             {
                 throw new InvalidOperationException(
@@ -1611,8 +1610,8 @@ public sealed class SnapshotRuntime
         }
 
         const int reqId = 9804;
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMktData(reqId, marketDataOption, string.Empty, false, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, reqId, marketDataOption);
 
         var receivedFirstGreek = true;
         try
@@ -1630,7 +1629,7 @@ public sealed class SnapshotRuntime
             await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
         }
 
-        client.cancelMktData(reqId);
+        brokerAdapter.CancelMarketData(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1640,7 +1639,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Option greeks export: {path} (rows={_wrapper.OptionGreeks.Count})");
     }
 
-    private async Task<Contract?> TryBuildOptionGreeksFallbackContractAsync(EClientSocket client, CancellationToken token)
+    private async Task<Contract?> TryBuildOptionGreeksFallbackContractAsync(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.ContractDetailsRows.TryDequeue(out _))
         {
@@ -1651,7 +1650,7 @@ public sealed class SnapshotRuntime
         }
 
         var underlying = ContractFactory.Stock(_options.OptionSymbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        client.reqContractDetails(98041, underlying);
+        brokerAdapter.RequestContractDetails(client, 98041, underlying);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
         var underlyingConId = _wrapper.ContractDetailsRows
@@ -1666,7 +1665,7 @@ public sealed class SnapshotRuntime
             return null;
         }
 
-        client.reqSecDefOptParams(98042, _options.OptionSymbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
+        brokerAdapter.RequestOptionChainParameters(client, 98042, _options.OptionSymbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
         try
         {
             await AwaitWithTimeout(_wrapper.OptionChainEndTask, token, "securityDefinitionOptionParameterEnd");
@@ -1748,7 +1747,7 @@ public sealed class SnapshotRuntime
         );
     }
 
-    private async Task RunCryptoPermissionsMode(EClientSocket client, CancellationToken token)
+    private async Task RunCryptoPermissionsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
 
@@ -1756,7 +1755,7 @@ public sealed class SnapshotRuntime
         {
         }
 
-        client.reqContractDetails(9901, crypto);
+        brokerAdapter.RequestContractDetails(client, 9901, crypto);
         var detailsResolved = true;
         using (var detailsCts = CancellationTokenSource.CreateLinkedTokenSource(token))
         {
@@ -1771,10 +1770,10 @@ public sealed class SnapshotRuntime
             }
         }
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMktData(9902, crypto, string.Empty, false, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, 9902, crypto);
         await Task.Delay(TimeSpan.FromSeconds(Math.Max(2, Math.Min(_options.CaptureSeconds, 8))), token);
-        client.cancelMktData(9902);
+        brokerAdapter.CancelMarketData(client, 9902);
 
         var detailsCount = _wrapper.ContractDetailsRows.Count;
         var ticksCaptured = _wrapper.TopTicks.Count;
@@ -1804,7 +1803,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Crypto permissions export: {path} (details={detailsCount}, topTicks={ticksCaptured}, errors={relatedErrors.Length})");
     }
 
-    private async Task RunCryptoContractDefinitionMode(EClientSocket client, CancellationToken token)
+    private async Task RunCryptoContractDefinitionMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
 
@@ -1812,7 +1811,7 @@ public sealed class SnapshotRuntime
         {
         }
 
-        client.reqContractDetails(9903, crypto);
+        brokerAdapter.RequestContractDetails(client, 9903, crypto);
         using (var detailsCts = CancellationTokenSource.CreateLinkedTokenSource(token))
         {
             detailsCts.CancelAfter(TimeSpan.FromSeconds(10));
@@ -1844,14 +1843,14 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Crypto contract definition export: {path} (rows={details.Length})");
     }
 
-    private async Task RunCryptoStreamingMode(EClientSocket client, CancellationToken token)
+    private async Task RunCryptoStreamingMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMktData(9904, crypto, string.Empty, false, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, 9904, crypto);
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelMktData(9904);
+        brokerAdapter.CancelMarketData(client, 9904);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2055,7 +2054,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Crypto order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
-    private async Task RunFaAllocationMethodsAndGroupsMode(EClientSocket client, CancellationToken token)
+    private async Task RunFaAllocationMethodsAndGroupsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.FaDataRows.TryDequeue(out _))
         {
@@ -2065,10 +2064,10 @@ public sealed class SnapshotRuntime
         {
         }
 
-        client.requestFA(Constants.FaGroups);
+        brokerAdapter.RequestFaData(client, Constants.FaGroups);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
-        client.queryDisplayGroups(9951);
+        brokerAdapter.QueryDisplayGroups(client, 9951);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
         var methods = new[]
@@ -2098,19 +2097,19 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] FA display groups export: {displayPath} (rows={_wrapper.DisplayGroupListRows.Count})");
     }
 
-    private async Task RunFaGroupsAndProfilesMode(EClientSocket client, CancellationToken token)
+    private async Task RunFaGroupsAndProfilesMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.FaDataRows.TryDequeue(out _))
         {
         }
 
-        client.requestFA(Constants.FaAliases);
+        brokerAdapter.RequestFaData(client, Constants.FaAliases);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
-        client.requestFA(Constants.FaGroups);
+        brokerAdapter.RequestFaData(client, Constants.FaGroups);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
-        client.requestFA(Constants.FaProfiles);
+        brokerAdapter.RequestFaData(client, Constants.FaProfiles);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
         var all = _wrapper.FaDataRows.ToArray();
@@ -2136,7 +2135,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] FA profiles export: {profilesPath} (rows={profiles.Length})");
     }
 
-    private async Task RunFaUnificationMode(EClientSocket client, CancellationToken token)
+    private async Task RunFaUnificationMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.FaDataRows.TryDequeue(out _))
         {
@@ -2144,10 +2143,10 @@ public sealed class SnapshotRuntime
 
         var errorCountBefore = _wrapper.Errors.Count;
 
-        client.requestFA(Constants.FaGroups);
+        brokerAdapter.RequestFaData(client, Constants.FaGroups);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
-        client.requestFA(Constants.FaProfiles);
+        brokerAdapter.RequestFaData(client, Constants.FaProfiles);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
 
         var all = _wrapper.FaDataRows.ToArray();
@@ -2183,7 +2182,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] FA unification raw data export: {dataPath} (rows={all.Length})");
     }
 
-    private async Task RunFaModelPortfoliosMode(EClientSocket client, CancellationToken token)
+    private async Task RunFaModelPortfoliosMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var modelCode = string.IsNullOrWhiteSpace(_options.FaModelCode) ? _options.ModelCode : _options.FaModelCode;
         if (string.IsNullOrWhiteSpace(modelCode))
@@ -2195,7 +2194,7 @@ public sealed class SnapshotRuntime
         const int updatesReqId = 9953;
         var account = string.IsNullOrWhiteSpace(_options.FaAccount) ? _options.Account : _options.FaAccount;
 
-        client.reqPositionsMulti(positionsReqId, account, modelCode);
+        brokerAdapter.RequestPositionsMulti(client, positionsReqId, account, modelCode);
         try
         {
             await AwaitWithTimeout(_wrapper.PositionMultiEndTask, token, "positionMultiEnd");
@@ -2205,9 +2204,9 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] FA model positions request did not complete due model/account validation (code=321). Exporting current rows.");
         }
 
-        client.cancelPositionsMulti(positionsReqId);
+        brokerAdapter.CancelPositionsMulti(client, positionsReqId);
 
-        client.reqAccountUpdatesMulti(updatesReqId, account, modelCode, true);
+        brokerAdapter.RequestAccountUpdatesMulti(client, updatesReqId, account, modelCode, true);
         try
         {
             await AwaitWithTimeout(_wrapper.AccountUpdateMultiEndTask, token, "accountUpdateMultiEnd");
@@ -2222,7 +2221,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] FA model account-updates request timed out after positions-model validation failure; exporting current rows.");
         }
 
-        client.cancelAccountUpdatesMulti(updatesReqId);
+        brokerAdapter.CancelAccountUpdatesMulti(client, updatesReqId);
 
         var positions = _wrapper.PositionMultiRows.Where(x => x.RequestId == positionsReqId).ToArray();
         var updates = _wrapper.AccountUpdateMultiRows.Where(x => x.RequestId == updatesReqId).ToArray();
@@ -2348,7 +2347,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] FA order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
-    private async Task RunFundamentalDataMode(EClientSocket client, CancellationToken token)
+    private async Task RunFundamentalDataMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.FundamentalDataRows.TryDequeue(out _))
         {
@@ -2356,7 +2355,7 @@ public sealed class SnapshotRuntime
 
         var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
         const int reqId = 9961;
-        client.reqFundamentalData(reqId, contract, _options.FundamentalReportType, new List<TagValue>());
+        brokerAdapter.RequestFundamentalData(client, reqId, contract, _options.FundamentalReportType);
 
         try
         {
@@ -2367,7 +2366,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] Fundamental data callback not received before timeout; request returned API errors. Exporting current rows.");
         }
 
-        client.cancelFundamentalData(reqId);
+        brokerAdapter.CancelFundamentalData(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2476,7 +2475,7 @@ public sealed class SnapshotRuntime
         return Task.CompletedTask;
     }
 
-    private async Task RunScannerExamplesMode(EClientSocket client, CancellationToken token)
+    private async Task RunScannerExamplesMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.ScannerDataRows.TryDequeue(out _))
         {
@@ -2484,7 +2483,7 @@ public sealed class SnapshotRuntime
 
         const int reqId = 9971;
         var subscription = BuildScannerSubscriptionFromOptions();
-        client.reqScannerSubscription(reqId, subscription, new List<TagValue>(), new List<TagValue>());
+        brokerAdapter.RequestScannerSubscription(client, reqId, subscription, Array.Empty<TagValue>(), Array.Empty<TagValue>());
 
         try
         {
@@ -2495,7 +2494,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] Scanner examples timed out waiting for scannerDataEnd; exporting current rows.");
         }
 
-        client.cancelScannerSubscription(reqId);
+        brokerAdapter.CancelScannerSubscription(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2523,7 +2522,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Scanner examples request export: {requestPath}");
     }
 
-    private async Task RunScannerComplexMode(EClientSocket client, CancellationToken token)
+    private async Task RunScannerComplexMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.ScannerDataRows.TryDequeue(out _))
         {
@@ -2539,7 +2538,7 @@ public sealed class SnapshotRuntime
         var filterOptions = ParseTagValuePairs(_options.ScannerFilterTagValues);
         var scannerOptions = ParseTagValuePairs(_options.ScannerOptionsTagValues);
 
-        client.reqScannerSubscription(reqId, subscription, filterOptions, scannerOptions);
+        brokerAdapter.RequestScannerSubscription(client, reqId, subscription, scannerOptions, filterOptions);
 
         try
         {
@@ -2550,7 +2549,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] Scanner complex run timed out waiting for scannerDataEnd; exporting current rows.");
         }
 
-        client.cancelScannerSubscription(reqId);
+        brokerAdapter.CancelScannerSubscription(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2578,13 +2577,13 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Scanner complex request export: {requestPath}");
     }
 
-    private async Task RunScannerParametersMode(EClientSocket client, CancellationToken token)
+    private async Task RunScannerParametersMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.ScannerParametersRows.TryDequeue(out _))
         {
         }
 
-        client.reqScannerParameters();
+        brokerAdapter.RequestScannerParameters(client);
         try
         {
             await AwaitWithTimeout(_wrapper.ScannerParametersTask, token, "scannerParameters");
@@ -2609,7 +2608,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Scanner parameters XML export: {xmlPath} (chars={xml.Length})");
     }
 
-    private async Task RunScannerWorkbenchMode(EClientSocket client, CancellationToken token)
+    private async Task RunScannerWorkbenchMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var scanCodes = _options.ScannerWorkbenchCodes
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -2646,9 +2645,9 @@ public sealed class SnapshotRuntime
                 var startedUtc = DateTime.UtcNow;
                 var stopwatch = Stopwatch.StartNew();
 
-                client.reqScannerSubscription(reqId, subscription, filterOptions, scannerOptions);
+                brokerAdapter.RequestScannerSubscription(client, reqId, subscription, scannerOptions, filterOptions);
                 await Task.Delay(TimeSpan.FromSeconds(captureSeconds), token);
-                client.cancelScannerSubscription(reqId);
+                brokerAdapter.CancelScannerSubscription(client, reqId);
                 await Task.Delay(TimeSpan.FromMilliseconds(400), token);
 
                 stopwatch.Stop();
@@ -2745,14 +2744,14 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Scanner workbench ranking export: {rankingPath} (rows={ranked.Length})");
     }
 
-    private async Task RunDisplayGroupsQueryMode(EClientSocket client, CancellationToken token)
+    private async Task RunDisplayGroupsQueryMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.DisplayGroupListRows.TryDequeue(out _))
         {
         }
 
         const int reqId = 9961;
-        client.queryDisplayGroups(reqId);
+        brokerAdapter.QueryDisplayGroups(client, reqId);
 
         try
         {
@@ -2771,14 +2770,14 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Display groups query export: {path} (rows={_wrapper.DisplayGroupListRows.Count(x => x.RequestId == reqId)})");
     }
 
-    private async Task RunDisplayGroupsSubscribeMode(EClientSocket client, CancellationToken token)
+    private async Task RunDisplayGroupsSubscribeMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.DisplayGroupUpdatedRows.TryDequeue(out _))
         {
         }
 
         var reqId = _options.DisplayGroupId;
-        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+        brokerAdapter.SubscribeToDisplayGroupEvents(client, reqId, _options.DisplayGroupId);
 
         try
         {
@@ -2790,7 +2789,7 @@ public sealed class SnapshotRuntime
         }
 
         await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _options.DisplayGroupCaptureSeconds)), token);
-        client.unsubscribeFromGroupEvents(reqId);
+        brokerAdapter.UnsubscribeFromDisplayGroupEvents(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2809,17 +2808,17 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Display groups subscribe request export: {requestPath}");
     }
 
-    private async Task RunDisplayGroupsUpdateMode(EClientSocket client, CancellationToken token)
+    private async Task RunDisplayGroupsUpdateMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         while (_wrapper.DisplayGroupUpdatedRows.TryDequeue(out _))
         {
         }
 
         var reqId = _options.DisplayGroupId;
-        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+        brokerAdapter.SubscribeToDisplayGroupEvents(client, reqId, _options.DisplayGroupId);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
 
-        client.updateDisplayGroup(reqId, _options.DisplayGroupContractInfo);
+        brokerAdapter.UpdateDisplayGroup(client, reqId, _options.DisplayGroupContractInfo);
         try
         {
             await AwaitWithTimeout(_wrapper.DisplayGroupUpdatedTask, token, "displayGroupUpdated");
@@ -2829,7 +2828,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[WARN] displayGroupUpdated callback not received before timeout after update; exporting current rows.");
         }
 
-        client.unsubscribeFromGroupEvents(reqId);
+        brokerAdapter.UnsubscribeFromDisplayGroupEvents(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -2848,12 +2847,12 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Display groups update request export: {requestPath}");
     }
 
-    private async Task RunDisplayGroupsUnsubscribeMode(EClientSocket client, CancellationToken token)
+    private async Task RunDisplayGroupsUnsubscribeMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var reqId = _options.DisplayGroupId;
-        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+        brokerAdapter.SubscribeToDisplayGroupEvents(client, reqId, _options.DisplayGroupId);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
-        client.unsubscribeFromGroupEvents(reqId);
+        brokerAdapter.UnsubscribeFromDisplayGroupEvents(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
