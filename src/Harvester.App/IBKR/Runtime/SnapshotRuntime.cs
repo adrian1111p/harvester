@@ -6,6 +6,7 @@ using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
 using Harvester.App.IBKR.Risk;
 using Harvester.App.Historical;
+using Harvester.App.Strategy;
 using IBApi;
 
 namespace Harvester.App.IBKR.Runtime;
@@ -26,15 +27,17 @@ public sealed class SnapshotRuntime
     private readonly PreTradeControlDsl _preTradeControlDsl = new();
     private readonly PreTradeCostRiskEstimator _preTradeCostEstimator = new();
     private readonly List<PreTradeCostTelemetryRow> _preTradeCostTelemetryRows = [];
+    private readonly IStrategyRuntime _strategyRuntime;
     private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
     private readonly List<RuntimeLifecycleTransition> _lifecycleTransitions = [];
 
-    public SnapshotRuntime(AppOptions options)
+    public SnapshotRuntime(AppOptions options, IStrategyRuntime? strategyRuntime = null)
     {
         _options = options;
         _wrapper = new SnapshotEWrapper();
         _errorPolicy = new IbErrorPolicy();
         _requestRegistry = new RequestRegistry();
+        _strategyRuntime = strategyRuntime ?? new NullStrategyRuntime();
     }
 
     public async Task<int> RunAsync()
@@ -81,6 +84,16 @@ public sealed class SnapshotRuntime
             Console.WriteLine("[OK] currentTime callback received");
             EvaluateBrokerClockSkew();
             EnterSteadyState(session);
+
+            var strategyContext = new StrategyRuntimeContext(
+                _options.Mode.ToString(),
+                _options.Account,
+                _options.Symbol,
+                _options.ModelCode,
+                runStartedUtc,
+                EnsureOutputDir());
+            await NotifyStrategyInitializeAsync(strategyContext, runtimeCts.Token);
+            await NotifyStrategyScheduledEventAsync("mode-start", strategyContext, runtimeCts.Token);
 
             switch (_options.Mode)
             {
@@ -233,6 +246,9 @@ public sealed class SnapshotRuntime
                     break;
             }
 
+                    await NotifyStrategyDataAsync(strategyContext, runtimeCts.Token);
+                    await NotifyStrategyScheduledEventAsync("mode-complete", strategyContext, runtimeCts.Token);
+
             runtimeCts.Cancel();
             await monitorTask;
 
@@ -260,12 +276,14 @@ public sealed class SnapshotRuntime
                     Console.WriteLine("[WARN] Completed with broker clock-skew gate failure.");
                 }
                 ExportAdapterTraceArtifact();
+                await NotifyStrategyShutdownAsync(strategyContext, 1);
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
                 return 1;
             }
 
             ExportAdapterTraceArtifact();
+            await NotifyStrategyShutdownAsync(strategyContext, 0);
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
             PersistRuntimeState(runtimeStateStore, session, 0, runStartedUtc);
@@ -274,6 +292,9 @@ public sealed class SnapshotRuntime
         catch (OperationCanceledException) when (_hasConnectivityFailure)
         {
             ExportAdapterTraceArtifact();
+            var cancelledContext = BuildFallbackStrategyContext(runStartedUtc);
+            await NotifyStrategyScheduledEventAsync("mode-failed", cancelledContext, CancellationToken.None);
+            await NotifyStrategyShutdownAsync(cancelledContext, 1);
             TransitionLifecycle(RuntimeLifecycleStage.Halted, "connectivity halt escalation");
             Console.WriteLine("[FAIL] Connectivity halt escalation triggered.");
             PrintErrors();
@@ -284,6 +305,9 @@ public sealed class SnapshotRuntime
         catch (TimeoutException ex)
         {
             ExportAdapterTraceArtifact();
+            var timeoutContext = BuildFallbackStrategyContext(runStartedUtc);
+            await NotifyStrategyScheduledEventAsync("mode-failed", timeoutContext, CancellationToken.None);
+            await NotifyStrategyShutdownAsync(timeoutContext, 2);
             TransitionLifecycle(RuntimeLifecycleStage.Halted, $"timeout: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
@@ -294,6 +318,9 @@ public sealed class SnapshotRuntime
         catch (Exception ex)
         {
             ExportAdapterTraceArtifact();
+            var exceptionContext = BuildFallbackStrategyContext(runStartedUtc);
+            await NotifyStrategyScheduledEventAsync("mode-failed", exceptionContext, CancellationToken.None);
+            await NotifyStrategyShutdownAsync(exceptionContext, 2);
             TransitionLifecycle(RuntimeLifecycleStage.Halted, $"exception: {ex.Message}");
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
@@ -3482,6 +3509,77 @@ public sealed class SnapshotRuntime
             trace.Adapter,
             DateTime.UtcNow.AddSeconds(_options.TimeoutSeconds));
         _requestRegistry.Complete(correlationId, trace.Metadata);
+    }
+
+    private StrategyRuntimeContext BuildFallbackStrategyContext(DateTime runStartedUtc)
+    {
+        return new StrategyRuntimeContext(
+            _options.Mode.ToString(),
+            _options.Account,
+            _options.Symbol,
+            _options.ModelCode,
+            runStartedUtc,
+            EnsureOutputDir());
+    }
+
+    private async Task NotifyStrategyInitializeAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _strategyRuntime.InitializeAsync(context, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] strategy initialize hook failed: {ex.Message}");
+        }
+    }
+
+    private async Task NotifyStrategyScheduledEventAsync(string eventName, StrategyRuntimeContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _strategyRuntime.OnScheduledEventAsync(eventName, context, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] strategy scheduled-event hook failed ({eventName}): {ex.Message}");
+        }
+    }
+
+    private async Task NotifyStrategyDataAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _strategyRuntime.OnDataAsync(BuildStrategyDataSlice(context.Mode), cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] strategy on-data hook failed: {ex.Message}");
+        }
+    }
+
+    private async Task NotifyStrategyShutdownAsync(StrategyRuntimeContext context, int exitCode)
+    {
+        try
+        {
+            await _strategyRuntime.OnShutdownAsync(context, exitCode, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] strategy shutdown hook failed: {ex.Message}");
+        }
+    }
+
+    private StrategyDataSlice BuildStrategyDataSlice(string mode)
+    {
+        return new StrategyDataSlice(
+            DateTime.UtcNow,
+            mode,
+            _wrapper.TopTicks.ToArray(),
+            _wrapper.HistoricalBars.ToArray(),
+            _wrapper.Positions.ToArray(),
+            _wrapper.AccountSummaryRows.ToArray(),
+            _wrapper.CanonicalOrderEvents.ToArray());
     }
 
     private void PrintErrors()
