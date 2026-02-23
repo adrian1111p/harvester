@@ -100,9 +100,11 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> FundamentalDataTask => _fundamentalDataTcs.Task;
     public Task<bool> ScannerDataEndTask => _scannerDataEndTcs.Task;
     public Task<bool> ScannerParametersTask => _scannerParametersTcs.Task;
+    public DateTime LastCurrentTimeCallbackUtc { get; private set; } = DateTime.MinValue;
 
     public override void currentTime(long time)
     {
+        LastCurrentTimeCallbackUtc = DateTime.UtcNow;
         _currentTimeTcs.TrySetResult(true);
     }
 

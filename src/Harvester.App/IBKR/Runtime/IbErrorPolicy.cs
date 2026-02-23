@@ -23,7 +23,7 @@ public sealed class IbErrorPolicy
 
     private static readonly HashSet<int> RetryableCodes =
     [
-        1100, 1101, 1102
+        1100, 1101, 1102, 1300, 2110
     ];
 
     private static readonly HashSet<int> ScannerExpectedCodes =

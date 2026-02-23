@@ -85,14 +85,53 @@ public sealed class IbkrSession : IDisposable
 
     public void Disconnect()
     {
-        TransitionTo(IbConnectionState.Halting, "disconnect requested");
+        DisconnectCore("disconnect requested", transitionToHalting: true);
+    }
 
-        if (_client.IsConnected())
+    public async Task<bool> TryReconnectAsync(
+        string host,
+        int port,
+        int clientId,
+        int timeoutSeconds,
+        int maxAttempts,
+        int baseBackoffSeconds,
+        CancellationToken cancellationToken = default)
+    {
+        var attempts = Math.Max(1, maxAttempts);
+        var baseBackoff = Math.Max(1, baseBackoffSeconds);
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
         {
-            _client.eDisconnect();
+            cancellationToken.ThrowIfCancellationRequested();
+            TransitionTo(IbConnectionState.Reconnecting, $"reconnect attempt {attempt}/{attempts}");
+            DisconnectCore($"reconnect attempt {attempt} reset", transitionToHalting: false);
+
+            var delaySeconds = baseBackoff * attempt;
+            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+
+            try
+            {
+                await ConnectAsync(host, port, clientId, timeoutSeconds, cancellationToken);
+                return State == IbConnectionState.Connected;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Reconnect attempt {attempt}/{attempts} failed: {ex.Message}");
+            }
         }
 
-        TransitionTo(IbConnectionState.Disconnected, "socket disconnected");
+        TransitionTo(IbConnectionState.Halting, "reconnect ladder exhausted");
+        return false;
+    }
+
+    public void MarkDegraded(string reason)
+    {
+        TransitionTo(IbConnectionState.Degraded, reason);
+    }
+
+    public void MarkHalting(string reason)
+    {
+        TransitionTo(IbConnectionState.Halting, reason);
     }
 
     private void TransitionTo(IbConnectionState next, string reason)
@@ -109,6 +148,21 @@ public sealed class IbkrSession : IDisposable
             StateTransitions.Add(new IbConnectionTransition(DateTime.UtcNow, previous, next, reason));
             Console.WriteLine($"[STATE] {previous} -> {next} reason={reason}");
         }
+    }
+
+    private void DisconnectCore(string reason, bool transitionToHalting)
+    {
+        if (transitionToHalting)
+        {
+            TransitionTo(IbConnectionState.Halting, reason);
+        }
+
+        if (_client.IsConnected())
+        {
+            _client.eDisconnect();
+        }
+
+        TransitionTo(IbConnectionState.Disconnected, "socket disconnected");
     }
 
     public void Dispose()

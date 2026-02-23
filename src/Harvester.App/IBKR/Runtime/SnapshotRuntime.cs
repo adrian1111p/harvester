@@ -14,6 +14,8 @@ public sealed class SnapshotRuntime
     private readonly IbErrorPolicy _errorPolicy;
     private readonly RequestRegistry _requestRegistry;
     private bool _hasReconciliationQualityFailure;
+    private bool _hasConnectivityFailure;
+    private int _processedApiErrorCount;
 
     public SnapshotRuntime(AppOptions options)
     {
@@ -40,11 +42,13 @@ public sealed class SnapshotRuntime
 
             var client = session.Client;
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
+            using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
+            var monitorTask = MonitorConnectionHealthAsync(session, client, runtimeCts);
 
             client.reqCurrentTime();
             await AwaitTrackedWithTimeout(
                 _wrapper.CurrentTimeTask,
-                timeoutCts.Token,
+                runtimeCts.Token,
                 stage: "currentTime",
                 requestId: null,
                 requestType: "reqCurrentTime",
@@ -54,157 +58,160 @@ public sealed class SnapshotRuntime
             switch (_options.Mode)
             {
                 case RunMode.Connect:
-                    await RunConnectMode(client, timeoutCts.Token);
+                    await RunConnectMode(client, runtimeCts.Token);
                     break;
                 case RunMode.Orders:
-                    await RunOrdersMode(client, timeoutCts.Token);
+                    await RunOrdersMode(client, runtimeCts.Token);
                     break;
                 case RunMode.Positions:
-                    await RunPositionsMode(client, timeoutCts.Token);
+                    await RunPositionsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.SnapshotAll:
-                    await RunSnapshotAllMode(client, timeoutCts.Token);
+                    await RunSnapshotAllMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ContractsValidate:
-                    await RunContractsValidateMode(client, timeoutCts.Token);
+                    await RunContractsValidateMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OrdersDryRun:
                     await RunOrdersDryRunMode();
                     break;
                 case RunMode.OrdersPlaceSim:
-                    await RunOrdersPlaceSimMode(client, timeoutCts.Token);
+                    await RunOrdersPlaceSimMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OrdersWhatIf:
-                    await RunOrdersWhatIfMode(client, timeoutCts.Token);
+                    await RunOrdersWhatIfMode(client, runtimeCts.Token);
                     break;
                 case RunMode.TopData:
-                    await RunTopDataMode(client, timeoutCts.Token);
+                    await RunTopDataMode(client, runtimeCts.Token);
                     break;
                 case RunMode.MarketDepth:
-                    await RunMarketDepthMode(client, timeoutCts.Token);
+                    await RunMarketDepthMode(client, runtimeCts.Token);
                     break;
                 case RunMode.RealtimeBars:
-                    await RunRealtimeBarsMode(client, timeoutCts.Token);
+                    await RunRealtimeBarsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.MarketDataAll:
-                    await RunMarketDataAllMode(client, timeoutCts.Token);
+                    await RunMarketDataAllMode(client, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalBars:
-                    await RunHistoricalBarsMode(client, timeoutCts.Token);
+                    await RunHistoricalBarsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalBarsKeepUpToDate:
-                    await RunHistoricalBarsKeepUpToDateMode(client, timeoutCts.Token);
+                    await RunHistoricalBarsKeepUpToDateMode(client, runtimeCts.Token);
                     break;
                 case RunMode.Histogram:
-                    await RunHistogramMode(client, timeoutCts.Token);
+                    await RunHistogramMode(client, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalTicks:
-                    await RunHistoricalTicksMode(client, timeoutCts.Token);
+                    await RunHistoricalTicksMode(client, runtimeCts.Token);
                     break;
                 case RunMode.HeadTimestamp:
-                    await RunHeadTimestampMode(client, timeoutCts.Token);
+                    await RunHeadTimestampMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ManagedAccounts:
-                    await RunManagedAccountsMode(client, timeoutCts.Token);
+                    await RunManagedAccountsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FamilyCodes:
-                    await RunFamilyCodesMode(client, timeoutCts.Token);
+                    await RunFamilyCodesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.AccountUpdates:
-                    await RunAccountUpdatesMode(client, timeoutCts.Token);
+                    await RunAccountUpdatesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.AccountUpdatesMulti:
-                    await RunAccountUpdatesMultiMode(client, timeoutCts.Token);
+                    await RunAccountUpdatesMultiMode(client, runtimeCts.Token);
                     break;
                 case RunMode.AccountSummaryOnly:
-                    await RunAccountSummaryOnlyMode(client, timeoutCts.Token);
+                    await RunAccountSummaryOnlyMode(client, runtimeCts.Token);
                     break;
                 case RunMode.PositionsMulti:
-                    await RunPositionsMultiMode(client, timeoutCts.Token);
+                    await RunPositionsMultiMode(client, runtimeCts.Token);
                     break;
                 case RunMode.PnlAccount:
-                    await RunPnlAccountMode(client, timeoutCts.Token);
+                    await RunPnlAccountMode(client, runtimeCts.Token);
                     break;
                 case RunMode.PnlSingle:
-                    await RunPnlSingleMode(client, timeoutCts.Token);
+                    await RunPnlSingleMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OptionChains:
-                    await RunOptionChainsMode(client, timeoutCts.Token);
+                    await RunOptionChainsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OptionExercise:
-                    await RunOptionExerciseMode(client, timeoutCts.Token);
+                    await RunOptionExerciseMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OptionGreeks:
-                    await RunOptionGreeksMode(client, timeoutCts.Token);
+                    await RunOptionGreeksMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoPermissions:
-                    await RunCryptoPermissionsMode(client, timeoutCts.Token);
+                    await RunCryptoPermissionsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoContract:
-                    await RunCryptoContractDefinitionMode(client, timeoutCts.Token);
+                    await RunCryptoContractDefinitionMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoStreaming:
-                    await RunCryptoStreamingMode(client, timeoutCts.Token);
+                    await RunCryptoStreamingMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoHistorical:
-                    await RunCryptoHistoricalMode(client, timeoutCts.Token);
+                    await RunCryptoHistoricalMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoOrder:
-                    await RunCryptoOrderPlacementMode(client, timeoutCts.Token);
+                    await RunCryptoOrderPlacementMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaAllocationGroups:
-                    await RunFaAllocationMethodsAndGroupsMode(client, timeoutCts.Token);
+                    await RunFaAllocationMethodsAndGroupsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaGroupsProfiles:
-                    await RunFaGroupsAndProfilesMode(client, timeoutCts.Token);
+                    await RunFaGroupsAndProfilesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaUnification:
-                    await RunFaUnificationMode(client, timeoutCts.Token);
+                    await RunFaUnificationMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaModelPortfolios:
-                    await RunFaModelPortfoliosMode(client, timeoutCts.Token);
+                    await RunFaModelPortfoliosMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaOrder:
-                    await RunFaOrderPlacementMode(client, timeoutCts.Token);
+                    await RunFaOrderPlacementMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FundamentalData:
-                    await RunFundamentalDataMode(client, timeoutCts.Token);
+                    await RunFundamentalDataMode(client, runtimeCts.Token);
                     break;
                 case RunMode.WshFilters:
-                    await RunWshFiltersMode(client, timeoutCts.Token);
+                    await RunWshFiltersMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ErrorCodes:
-                    await RunErrorCodesMode(client, timeoutCts.Token);
+                    await RunErrorCodesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ScannerExamples:
-                    await RunScannerExamplesMode(client, timeoutCts.Token);
+                    await RunScannerExamplesMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ScannerComplex:
-                    await RunScannerComplexMode(client, timeoutCts.Token);
+                    await RunScannerComplexMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ScannerParameters:
-                    await RunScannerParametersMode(client, timeoutCts.Token);
+                    await RunScannerParametersMode(client, runtimeCts.Token);
                     break;
                 case RunMode.ScannerWorkbench:
-                    await RunScannerWorkbenchMode(client, timeoutCts.Token);
+                    await RunScannerWorkbenchMode(client, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsQuery:
-                    await RunDisplayGroupsQueryMode(client, timeoutCts.Token);
+                    await RunDisplayGroupsQueryMode(client, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsSubscribe:
-                    await RunDisplayGroupsSubscribeMode(client, timeoutCts.Token);
+                    await RunDisplayGroupsSubscribeMode(client, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsUpdate:
-                    await RunDisplayGroupsUpdateMode(client, timeoutCts.Token);
+                    await RunDisplayGroupsUpdateMode(client, runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsUnsubscribe:
-                    await RunDisplayGroupsUnsubscribeMode(client, timeoutCts.Token);
+                    await RunDisplayGroupsUnsubscribeMode(client, runtimeCts.Token);
                     break;
             }
 
+            runtimeCts.Cancel();
+            await monitorTask;
+
             var hasBlockingErrors = _wrapper.ApiErrors
                 .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
-            if (hasBlockingErrors || _hasReconciliationQualityFailure)
+            if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
                 PrintErrors();
@@ -213,11 +220,22 @@ public sealed class SnapshotRuntime
                 {
                     Console.WriteLine("[WARN] Completed with reconciliation quality gate failure.");
                 }
+                if (_hasConnectivityFailure)
+                {
+                    Console.WriteLine("[WARN] Completed with connectivity halt escalation.");
+                }
                 return 1;
             }
 
             Console.WriteLine("[PASS] Completed successfully.");
             return 0;
+        }
+        catch (OperationCanceledException) when (_hasConnectivityFailure)
+        {
+            Console.WriteLine("[FAIL] Connectivity halt escalation triggered.");
+            PrintErrors();
+            PrintRequestDiagnostics();
+            return 1;
         }
         catch (TimeoutException ex)
         {
@@ -233,6 +251,124 @@ public sealed class SnapshotRuntime
             PrintRequestDiagnostics();
             return 2;
         }
+    }
+
+    private async Task MonitorConnectionHealthAsync(IbkrSession session, EClientSocket client, CancellationTokenSource runtimeCts)
+    {
+        if (!_options.HeartbeatMonitorEnabled)
+        {
+            return;
+        }
+
+        var token = runtimeCts.Token;
+        var heartbeatInterval = TimeSpan.FromSeconds(Math.Max(2, _options.HeartbeatIntervalSeconds));
+        var probeTimeout = TimeSpan.FromSeconds(Math.Max(2, _options.HeartbeatProbeTimeoutSeconds));
+
+        while (!token.IsCancellationRequested)
+        {
+            await ProcessConnectivityApiErrorsAsync(session, runtimeCts, token);
+            if (token.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!client.IsConnected())
+            {
+                var recovered = await AttemptReconnectOrHaltAsync(session, runtimeCts, "socket disconnected");
+                if (!recovered)
+                {
+                    return;
+                }
+            }
+
+            var probeStartedUtc = DateTime.UtcNow;
+            client.reqCurrentTime();
+
+            try
+            {
+                await Task.Delay(probeTimeout, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (_wrapper.LastCurrentTimeCallbackUtc < probeStartedUtc)
+            {
+                session.MarkDegraded($"heartbeat probe stale for {probeTimeout.TotalSeconds:0}s");
+                var recovered = await AttemptReconnectOrHaltAsync(session, runtimeCts, "heartbeat probe timeout");
+                if (!recovered)
+                {
+                    return;
+                }
+            }
+
+            try
+            {
+                await Task.Delay(heartbeatInterval, token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task ProcessConnectivityApiErrorsAsync(IbkrSession session, CancellationTokenSource runtimeCts, CancellationToken token)
+    {
+        var errors = _wrapper.ApiErrors.ToArray();
+        if (_processedApiErrorCount >= errors.Length)
+        {
+            return;
+        }
+
+        for (var i = _processedApiErrorCount; i < errors.Length; i++)
+        {
+            var error = errors[i];
+            var decision = _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback);
+            if (decision.Action != IbErrorAction.Retry || !IsReconnectTriggerCode(error.Code))
+            {
+                continue;
+            }
+
+            session.MarkDegraded($"connectivity code={error.Code} msg={error.Message}");
+            var recovered = await AttemptReconnectOrHaltAsync(session, runtimeCts, $"connectivity code {error.Code}");
+            if (!recovered || token.IsCancellationRequested)
+            {
+                _processedApiErrorCount = errors.Length;
+                return;
+            }
+        }
+
+        _processedApiErrorCount = errors.Length;
+    }
+
+    private async Task<bool> AttemptReconnectOrHaltAsync(IbkrSession session, CancellationTokenSource runtimeCts, string reason)
+    {
+        var restored = await session.TryReconnectAsync(
+            _options.Host,
+            _options.Port,
+            _options.ClientId,
+            _options.TimeoutSeconds,
+            _options.ReconnectMaxAttempts,
+            _options.ReconnectBackoffSeconds,
+            runtimeCts.Token);
+
+        if (restored)
+        {
+            Console.WriteLine($"[OK] Connectivity restored after {reason}.");
+            return true;
+        }
+
+        _hasConnectivityFailure = true;
+        session.MarkHalting($"connectivity halt escalation ({reason})");
+        runtimeCts.Cancel();
+        return false;
+    }
+
+    private static bool IsReconnectTriggerCode(int? code)
+    {
+        return code is 1100 or 1300 or 2110;
     }
 
     private async Task RunConnectMode(EClientSocket client, CancellationToken token)
@@ -3109,6 +3245,11 @@ public sealed record AppOptions(
     int DisplayGroupId,
     string DisplayGroupContractInfo,
     int DisplayGroupCaptureSeconds,
+    bool HeartbeatMonitorEnabled,
+    int HeartbeatIntervalSeconds,
+    int HeartbeatProbeTimeoutSeconds,
+    int ReconnectMaxAttempts,
+    int ReconnectBackoffSeconds,
     ReconciliationGateAction ReconciliationGateAction,
     double ReconciliationMinCommissionCoverage,
     double ReconciliationMinOrderCoverage
@@ -3222,6 +3363,11 @@ public sealed record AppOptions(
         var displayGroupId = 1;
         var displayGroupContractInfo = "265598@SMART";
         var displayGroupCaptureSeconds = 4;
+        var heartbeatMonitorEnabled = true;
+        var heartbeatIntervalSeconds = 6;
+        var heartbeatProbeTimeoutSeconds = 4;
+        var reconnectMaxAttempts = 3;
+        var reconnectBackoffSeconds = 2;
         var reconciliationGateAction = ReconciliationGateAction.Warn;
         var reconciliationMinCommissionCoverage = 0.80;
         var reconciliationMinOrderCoverage = 0.95;
@@ -3594,6 +3740,25 @@ public sealed record AppOptions(
                     displayGroupCaptureSeconds = dgcs;
                     i++;
                     break;
+                case "--heartbeat-monitor" when i + 1 < args.Length:
+                    heartbeatMonitorEnabled = bool.TryParse(args[++i], out var hm) && hm;
+                    break;
+                case "--heartbeat-interval" when i + 1 < args.Length && int.TryParse(args[i + 1], out var hi):
+                    heartbeatIntervalSeconds = hi;
+                    i++;
+                    break;
+                case "--heartbeat-probe-timeout" when i + 1 < args.Length && int.TryParse(args[i + 1], out var hpt):
+                    heartbeatProbeTimeoutSeconds = hpt;
+                    i++;
+                    break;
+                case "--reconnect-max-attempts" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rma):
+                    reconnectMaxAttempts = rma;
+                    i++;
+                    break;
+                case "--reconnect-backoff" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rbs):
+                    reconnectBackoffSeconds = rbs;
+                    i++;
+                    break;
                 case "--recon-gate-action" when i + 1 < args.Length:
                     reconciliationGateAction = ParseReconciliationGateAction(args[++i]);
                     break;
@@ -3715,6 +3880,11 @@ public sealed record AppOptions(
             displayGroupId,
             displayGroupContractInfo,
             displayGroupCaptureSeconds,
+            heartbeatMonitorEnabled,
+            heartbeatIntervalSeconds,
+            heartbeatProbeTimeoutSeconds,
+            reconnectMaxAttempts,
+            reconnectBackoffSeconds,
             reconciliationGateAction,
             reconciliationMinCommissionCoverage,
             reconciliationMinOrderCoverage
