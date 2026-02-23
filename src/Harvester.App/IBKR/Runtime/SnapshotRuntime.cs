@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Diagnostics;
 using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
@@ -112,9 +113,81 @@ public sealed class SnapshotRuntime
                 case RunMode.PnlSingle:
                     await RunPnlSingleMode(client, timeoutCts.Token);
                     break;
+                case RunMode.OptionChains:
+                    await RunOptionChainsMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.OptionExercise:
+                    await RunOptionExerciseMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.OptionGreeks:
+                    await RunOptionGreeksMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.CryptoPermissions:
+                    await RunCryptoPermissionsMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.CryptoContract:
+                    await RunCryptoContractDefinitionMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.CryptoStreaming:
+                    await RunCryptoStreamingMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.CryptoHistorical:
+                    await RunCryptoHistoricalMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.CryptoOrder:
+                    await RunCryptoOrderPlacementMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FaAllocationGroups:
+                    await RunFaAllocationMethodsAndGroupsMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FaGroupsProfiles:
+                    await RunFaGroupsAndProfilesMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FaUnification:
+                    await RunFaUnificationMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FaModelPortfolios:
+                    await RunFaModelPortfoliosMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FaOrder:
+                    await RunFaOrderPlacementMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FundamentalData:
+                    await RunFundamentalDataMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.WshFilters:
+                    await RunWshFiltersMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.ErrorCodes:
+                    await RunErrorCodesMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.ScannerExamples:
+                    await RunScannerExamplesMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.ScannerComplex:
+                    await RunScannerComplexMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.ScannerParameters:
+                    await RunScannerParametersMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.ScannerWorkbench:
+                    await RunScannerWorkbenchMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.DisplayGroupsQuery:
+                    await RunDisplayGroupsQueryMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.DisplayGroupsSubscribe:
+                    await RunDisplayGroupsSubscribeMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.DisplayGroupsUpdate:
+                    await RunDisplayGroupsUpdateMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.DisplayGroupsUnsubscribe:
+                    await RunDisplayGroupsUnsubscribeMode(client, timeoutCts.Token);
+                    break;
             }
 
-            var hasBlockingErrors = _wrapper.Errors.Any(IsBlockingError);
+            var hasBlockingErrors = _wrapper.Errors.Any(IsBlockingErrorForCurrentMode);
             if (hasBlockingErrors)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
@@ -907,6 +980,1492 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] PnL single export: {path} (rows={_wrapper.PnlSingleRows.Count})");
     }
 
+    private async Task RunOptionChainsMode(EClientSocket client, CancellationToken token)
+    {
+        var underlying = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        client.reqContractDetails(9801, underlying);
+        await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, token, "contractDetailsEnd");
+
+        var underlyingDetails = _wrapper.ContractDetailsRows.FirstOrDefault();
+        var underlyingConId = underlyingDetails?.Contract?.ConId ?? 0;
+        if (underlyingConId <= 0)
+        {
+            throw new InvalidOperationException("Unable to resolve underlying conId for option chain request.");
+        }
+
+        client.reqSecDefOptParams(9802, _options.Symbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
+        await AwaitWithTimeout(_wrapper.OptionChainEndTask, token, "securityDefinitionOptionParameterEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var chainPath = Path.Combine(outputDir, $"option_chains_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(chainPath, _wrapper.OptionChains.ToArray());
+        Console.WriteLine($"[OK] Option chain export: {chainPath} (rows={_wrapper.OptionChains.Count})");
+    }
+
+    private async Task RunOptionExerciseMode(EClientSocket client, CancellationToken token)
+    {
+        if (!_options.OptionExerciseAllow)
+        {
+            throw new InvalidOperationException("Option exercise blocked: set --option-exercise-allow true to proceed.");
+        }
+
+        var option = ContractFactory.Option(
+            _options.OptionSymbol,
+            _options.OptionExpiry,
+            _options.OptionStrike,
+            _options.OptionRight,
+            exchange: _options.OptionExchange,
+            currency: _options.OptionCurrency,
+            multiplier: _options.OptionMultiplier
+        );
+
+        client.exerciseOptions(
+            9803,
+            option,
+            _options.OptionExerciseAction,
+            _options.OptionExerciseQuantity,
+            _options.Account,
+            _options.OptionExerciseOverride
+        );
+
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        client.reqOpenOrders();
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var requestPath = Path.Combine(outputDir, $"option_exercise_request_{timestamp}.json");
+        var statusPath = Path.Combine(outputDir, $"option_exercise_status_{timestamp}.json");
+
+        var request = new OptionExerciseRequestRow(
+            DateTime.UtcNow,
+            _options.OptionSymbol,
+            _options.OptionExpiry,
+            _options.OptionStrike,
+            _options.OptionRight,
+            _options.OptionExerciseAction,
+            _options.OptionExerciseQuantity,
+            _options.Account,
+            _options.OptionExerciseOverride,
+            _options.OptionExerciseManualTime
+        );
+
+        WriteJson(requestPath, new[] { request });
+        WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+
+        Console.WriteLine($"[OK] Option exercise request export: {requestPath}");
+        Console.WriteLine($"[OK] Option exercise order-status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+    }
+
+    private async Task RunOptionGreeksMode(EClientSocket client, CancellationToken token)
+    {
+        var option = ContractFactory.Option(
+            _options.OptionSymbol,
+            _options.OptionExpiry,
+            _options.OptionStrike,
+            _options.OptionRight,
+            exchange: _options.OptionExchange,
+            currency: _options.OptionCurrency,
+            multiplier: _options.OptionMultiplier
+        );
+
+        while (_wrapper.ContractDetailsRows.TryDequeue(out _))
+        {
+        }
+
+        client.reqContractDetails(98040, option);
+        using (var resolveCts = CancellationTokenSource.CreateLinkedTokenSource(token))
+        {
+            resolveCts.CancelAfter(TimeSpan.FromSeconds(8));
+            try
+            {
+                await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, resolveCts.Token, "contractDetailsEnd");
+            }
+            catch (TimeoutException) when (HasErrorCode("id=98040 code=200"))
+            {
+                if (_options.OptionGreeksAutoFallback)
+                {
+                    Console.WriteLine("[WARN] Exact option contract resolution failed with code=200; attempting option-chain fallback.");
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        $"Unable to resolve option contract for {_options.OptionSymbol} {_options.OptionExpiry} {_options.OptionRight} {_options.OptionStrike}. "
+                        + "IBKR returned code=200 (no security definition). Verify expiry/strike/right against option-chains output."
+                    );
+                }
+            }
+            catch (TimeoutException)
+            {
+                throw new InvalidOperationException("Timed out resolving option contract details (conId) for option-greeks request.");
+            }
+        }
+
+        var candidates = _wrapper.ContractDetailsRows
+            .Select(x => x.Contract)
+            .Where(c => string.Equals(c.Symbol, _options.OptionSymbol, StringComparison.OrdinalIgnoreCase))
+            .Where(c => string.Equals(c.Right, _options.OptionRight, StringComparison.OrdinalIgnoreCase))
+            .Where(c => string.Equals(c.Currency, _options.OptionCurrency, StringComparison.OrdinalIgnoreCase))
+            .Where(c => Math.Abs(c.Strike - _options.OptionStrike) < 0.0001)
+            .Where(c => c.LastTradeDateOrContractMonth.StartsWith(_options.OptionExpiry, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        Contract marketDataOption;
+        if (candidates.Length == 0)
+        {
+            if (!_options.OptionGreeksAutoFallback)
+            {
+                throw new InvalidOperationException(
+                    $"Unable to resolve option conId for {_options.OptionSymbol} {_options.OptionExpiry} {_options.OptionRight} {_options.OptionStrike}. "
+                    + "Verify expiry/strike/right tuple and exchange/trading class from option-chains output, or set --option-greeks-auto-fallback true."
+                );
+            }
+
+            var fallbackOption = await TryBuildOptionGreeksFallbackContractAsync(client, token);
+            if (fallbackOption is null)
+            {
+                throw new InvalidOperationException(
+                    $"Unable to resolve option conId for {_options.OptionSymbol} {_options.OptionExpiry} {_options.OptionRight} {_options.OptionStrike}, and no fallback contract was found from option-chains."
+                );
+            }
+
+            marketDataOption = fallbackOption;
+            Console.WriteLine(
+                $"[WARN] Exact option tuple unavailable; fallback selected expiry={fallbackOption.LastTradeDateOrContractMonth} strike={fallbackOption.Strike} right={fallbackOption.Right} exchange={fallbackOption.Exchange}"
+            );
+        }
+        else
+        {
+            var resolvedOption = candidates
+                .OrderByDescending(c => c.ConId > 0)
+                .ThenByDescending(c => string.Equals(c.Exchange, _options.OptionExchange, StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(c => string.Equals(c.Exchange, "SMART", StringComparison.OrdinalIgnoreCase))
+                .First();
+
+            Console.WriteLine($"[OK] Resolved option conId={resolvedOption.ConId} localSymbol={resolvedOption.LocalSymbol} exchange={resolvedOption.Exchange}");
+            marketDataOption = resolvedOption;
+        }
+
+        const int reqId = 9804;
+        client.reqMarketDataType(_options.MarketDataType);
+        client.reqMktData(reqId, marketDataOption, string.Empty, false, false, new List<TagValue>());
+
+        var receivedFirstGreek = true;
+        try
+        {
+            await AwaitWithTimeout(_wrapper.OptionGreeksFirstTask, token, "tickOptionComputation");
+        }
+        catch (TimeoutException)
+        {
+            receivedFirstGreek = false;
+            Console.WriteLine("[WARN] Option greeks not received during capture window; exporting current rows.");
+        }
+
+        if (receivedFirstGreek)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        }
+
+        client.cancelMktData(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"option_greeks_{_options.OptionSymbol}_{timestamp}.json");
+        WriteJson(path, _wrapper.OptionGreeks.ToArray());
+
+        Console.WriteLine($"[OK] Option greeks export: {path} (rows={_wrapper.OptionGreeks.Count})");
+    }
+
+    private async Task<Contract?> TryBuildOptionGreeksFallbackContractAsync(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.ContractDetailsRows.TryDequeue(out _))
+        {
+        }
+
+        while (_wrapper.OptionChains.TryDequeue(out _))
+        {
+        }
+
+        var underlying = ContractFactory.Stock(_options.OptionSymbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        client.reqContractDetails(98041, underlying);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        var underlyingConId = _wrapper.ContractDetailsRows
+            .Select(x => x.Contract)
+            .Where(c => string.Equals(c.Symbol, _options.OptionSymbol, StringComparison.OrdinalIgnoreCase))
+            .Where(c => string.Equals(c.SecType, _options.OptionUnderlyingSecType, StringComparison.OrdinalIgnoreCase))
+            .Select(c => c.ConId)
+            .FirstOrDefault();
+
+        if (underlyingConId <= 0)
+        {
+            return null;
+        }
+
+        client.reqSecDefOptParams(98042, _options.OptionSymbol, _options.OptionFutFopExchange, _options.OptionUnderlyingSecType, underlyingConId);
+        try
+        {
+            await AwaitWithTimeout(_wrapper.OptionChainEndTask, token, "securityDefinitionOptionParameterEnd");
+        }
+        catch (TimeoutException)
+        {
+            return null;
+        }
+
+        var rows = _wrapper.OptionChains.ToArray();
+        if (rows.Length == 0)
+        {
+            return null;
+        }
+
+        var expiryStrings = rows
+            .SelectMany(r => r.Expirations)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (expiryStrings.Length == 0)
+        {
+            return null;
+        }
+
+        var requestedExpiry = DateOnly.TryParseExact(_options.OptionExpiry, "yyyyMMdd", out var parsedRequested)
+            ? parsedRequested
+            : DateOnly.FromDateTime(DateTime.UtcNow);
+
+        var parsedExpiries = expiryStrings
+            .Select(exp => new { Value = exp, Parsed = DateOnly.TryParseExact(exp, "yyyyMMdd", out var d) ? d : (DateOnly?)null })
+            .Where(x => x.Parsed.HasValue)
+            .Select(x => new { x.Value, Parsed = x.Parsed!.Value })
+            .ToArray();
+
+        if (parsedExpiries.Length == 0)
+        {
+            return null;
+        }
+
+        var nearestExpiry = parsedExpiries
+            .OrderBy(x => Math.Abs(x.Parsed.DayNumber - requestedExpiry.DayNumber))
+            .First()
+            .Value;
+
+        var strikeCandidates = rows
+            .Where(r => r.Expirations.Contains(nearestExpiry, StringComparer.OrdinalIgnoreCase))
+            .SelectMany(r => r.Strikes)
+            .Distinct()
+            .ToArray();
+
+        if (strikeCandidates.Length == 0)
+        {
+            strikeCandidates = rows.SelectMany(r => r.Strikes).Distinct().ToArray();
+        }
+
+        if (strikeCandidates.Length == 0)
+        {
+            return null;
+        }
+
+        var nearestStrike = strikeCandidates
+            .OrderBy(strike => Math.Abs(strike - _options.OptionStrike))
+            .First();
+
+        var preferredExchange = rows
+            .OrderByDescending(r => string.Equals(r.Exchange, _options.OptionExchange, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(r => string.Equals(r.Exchange, "SMART", StringComparison.OrdinalIgnoreCase))
+            .Select(r => r.Exchange)
+            .FirstOrDefault() ?? _options.OptionExchange;
+
+        return ContractFactory.Option(
+            _options.OptionSymbol,
+            nearestExpiry,
+            nearestStrike,
+            _options.OptionRight,
+            exchange: preferredExchange,
+            currency: _options.OptionCurrency,
+            multiplier: _options.OptionMultiplier
+        );
+    }
+
+    private async Task RunCryptoPermissionsMode(EClientSocket client, CancellationToken token)
+    {
+        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+
+        while (_wrapper.ContractDetailsRows.TryDequeue(out _))
+        {
+        }
+
+        client.reqContractDetails(9901, crypto);
+        var detailsResolved = true;
+        using (var detailsCts = CancellationTokenSource.CreateLinkedTokenSource(token))
+        {
+            detailsCts.CancelAfter(TimeSpan.FromSeconds(8));
+            try
+            {
+                await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, detailsCts.Token, "contractDetailsEnd");
+            }
+            catch (TimeoutException)
+            {
+                detailsResolved = false;
+            }
+        }
+
+        client.reqMarketDataType(_options.MarketDataType);
+        client.reqMktData(9902, crypto, string.Empty, false, false, new List<TagValue>());
+        await Task.Delay(TimeSpan.FromSeconds(Math.Max(2, Math.Min(_options.CaptureSeconds, 8))), token);
+        client.cancelMktData(9902);
+
+        var detailsCount = _wrapper.ContractDetailsRows.Count;
+        var ticksCaptured = _wrapper.TopTicks.Count;
+        var relatedErrors = _wrapper.Errors
+            .Where(e => e.Contains("id=9901", StringComparison.OrdinalIgnoreCase) || e.Contains("id=9902", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"crypto_permissions_{_options.CryptoSymbol}_{timestamp}.json");
+
+        var rows = new[]
+        {
+            new CryptoPermissionRow(
+                DateTime.UtcNow,
+                _options.CryptoSymbol,
+                _options.CryptoExchange,
+                _options.CryptoCurrency,
+                detailsResolved,
+                detailsCount,
+                ticksCaptured,
+                relatedErrors
+            )
+        };
+
+        WriteJson(path, rows);
+        Console.WriteLine($"[OK] Crypto permissions export: {path} (details={detailsCount}, topTicks={ticksCaptured}, errors={relatedErrors.Length})");
+    }
+
+    private async Task RunCryptoContractDefinitionMode(EClientSocket client, CancellationToken token)
+    {
+        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+
+        while (_wrapper.ContractDetailsRows.TryDequeue(out _))
+        {
+        }
+
+        client.reqContractDetails(9903, crypto);
+        using (var detailsCts = CancellationTokenSource.CreateLinkedTokenSource(token))
+        {
+            detailsCts.CancelAfter(TimeSpan.FromSeconds(10));
+            await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, detailsCts.Token, "contractDetailsEnd");
+        }
+
+        var details = _wrapper.ContractDetailsRows
+            .Where(d => string.Equals(d.Contract.SecType, "CRYPTO", StringComparison.OrdinalIgnoreCase))
+            .Select(d => new ContractDetailsRow(
+                d.Contract.ConId,
+                d.Contract.Symbol,
+                d.Contract.SecType,
+                d.Contract.Exchange,
+                d.Contract.PrimaryExch,
+                d.Contract.Currency,
+                d.Contract.LocalSymbol,
+                d.Contract.TradingClass,
+                d.MarketName,
+                d.LongName,
+                d.MinTick
+            ))
+            .ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"crypto_contract_details_{_options.CryptoSymbol}_{timestamp}.json");
+
+        WriteJson(path, details);
+        Console.WriteLine($"[OK] Crypto contract definition export: {path} (rows={details.Length})");
+    }
+
+    private async Task RunCryptoStreamingMode(EClientSocket client, CancellationToken token)
+    {
+        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+
+        client.reqMarketDataType(_options.MarketDataType);
+        client.reqMktData(9904, crypto, string.Empty, false, false, new List<TagValue>());
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.cancelMktData(9904);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var ticksPath = Path.Combine(outputDir, $"crypto_top_data_{_options.CryptoSymbol}_{timestamp}.json");
+        var typesPath = Path.Combine(outputDir, $"crypto_top_data_type_{_options.CryptoSymbol}_{timestamp}.json");
+
+        WriteJson(ticksPath, _wrapper.TopTicks.ToArray());
+        WriteJson(typesPath, _wrapper.MarketDataTypes.ToArray());
+
+        Console.WriteLine($"[OK] Crypto streaming top data export: {ticksPath} (rows={_wrapper.TopTicks.Count})");
+        Console.WriteLine($"[OK] Crypto market data type export: {typesPath} (rows={_wrapper.MarketDataTypes.Count})");
+    }
+
+    private async Task RunCryptoHistoricalMode(EClientSocket client, CancellationToken token)
+    {
+        ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
+
+        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+
+        client.reqHistoricalData(
+            9905,
+            crypto,
+            _options.HistoricalEndDateTime,
+            _options.HistoricalDuration,
+            _options.HistoricalBarSize,
+            _options.HistoricalWhatToShow,
+            _options.HistoricalUseRth,
+            _options.HistoricalFormatDate,
+            false,
+            new List<TagValue>()
+        );
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.HistoricalDataEndTask, token, "historicalDataEnd");
+        }
+        catch (TimeoutException) when (HasErrorCode("id=9905 code=10285"))
+        {
+            Console.WriteLine("[WARN] Crypto historical request could not complete due API compatibility (code=10285). Exporting current rows.");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"crypto_historical_bars_{_options.CryptoSymbol}_{timestamp}.json");
+
+        WriteJson(path, _wrapper.HistoricalBars.ToArray());
+        Console.WriteLine($"[OK] Crypto historical bars export: {path} (rows={_wrapper.HistoricalBars.Count})");
+    }
+
+    private async Task RunCryptoOrderPlacementMode(EClientSocket client, CancellationToken token)
+    {
+        if (!_options.CryptoOrderAllow)
+        {
+            throw new InvalidOperationException("Crypto order blocked: set --crypto-order-allow true to proceed.");
+        }
+
+        if (_options.CryptoOrderQuantity <= 0)
+        {
+            throw new InvalidOperationException("Crypto order blocked: --crypto-order-qty must be > 0.");
+        }
+
+        if (_options.CryptoOrderLimit <= 0)
+        {
+            throw new InvalidOperationException("Crypto order blocked: --crypto-order-limit must be > 0.");
+        }
+
+        var action = _options.CryptoOrderAction.ToUpperInvariant();
+        if (action is not ("BUY" or "SELL"))
+        {
+            throw new InvalidOperationException("Crypto order blocked: --crypto-order-action must be BUY or SELL.");
+        }
+
+        var notional = _options.CryptoOrderQuantity * _options.CryptoOrderLimit;
+        if (notional > _options.CryptoMaxNotional)
+        {
+            throw new InvalidOperationException($"Crypto order blocked: notional {notional:F2} exceeds --crypto-max-notional {_options.CryptoMaxNotional:F2}.");
+        }
+
+        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+        var order = OrderFactory.Limit(action, _options.CryptoOrderQuantity, _options.CryptoOrderLimit);
+        var nextOrderId = await _wrapper.NextValidIdTask;
+
+        order.OrderId = nextOrderId;
+        order.OrderRef = $"HARVESTER_CRYPTO_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+        order.Transmit = true;
+
+        client.placeOrder(order.OrderId, crypto, order);
+        Console.WriteLine($"[OK] Crypto order transmitted: orderId={order.OrderId} symbol={_options.CryptoSymbol} action={action} qty={_options.CryptoOrderQuantity} lmt={_options.CryptoOrderLimit}");
+
+        await Task.Delay(TimeSpan.FromSeconds(4), token);
+        client.reqOpenOrders();
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var requestPath = Path.Combine(outputDir, $"crypto_order_request_{timestamp}.json");
+        var statusPath = Path.Combine(outputDir, $"crypto_order_status_{timestamp}.json");
+
+        var request = new[]
+        {
+            new CryptoOrderRequestRow(
+                DateTime.UtcNow,
+                order.OrderId,
+                _options.CryptoSymbol,
+                _options.CryptoExchange,
+                _options.CryptoCurrency,
+                action,
+                _options.CryptoOrderQuantity,
+                _options.CryptoOrderLimit,
+                notional,
+                _options.Account,
+                order.OrderRef
+            )
+        };
+
+        WriteJson(requestPath, request);
+        WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+
+        Console.WriteLine($"[OK] Crypto order request export: {requestPath}");
+        Console.WriteLine($"[OK] Crypto order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+    }
+
+    private async Task RunFaAllocationMethodsAndGroupsMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.FaDataRows.TryDequeue(out _))
+        {
+        }
+
+        while (_wrapper.DisplayGroupListRows.TryDequeue(out _))
+        {
+        }
+
+        client.requestFA(Constants.FaGroups);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        client.queryDisplayGroups(9951);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        var methods = new[]
+        {
+            new FaAllocationMethodRow("Group", "EqualQuantity", 0, "Requires order quantity; splits equally across accounts in group."),
+            new FaAllocationMethodRow("Group", "NetLiq", 0, "Requires order quantity; allocates by net liquidation value."),
+            new FaAllocationMethodRow("Group", "AvailableEquity", 0, "Requires order quantity; allocates by available equity."),
+            new FaAllocationMethodRow("Group", "PctChange", 0, "No explicit total quantity; adjusts existing positions by percent."),
+            new FaAllocationMethodRow("Profile", "Percentages", 1, "Allocates using explicit percentages per account."),
+            new FaAllocationMethodRow("Profile", "Financial Ratios", 2, "Allocates using ratio values per account."),
+            new FaAllocationMethodRow("Profile", "Shares", 3, "Allocates explicit shares per account; total is sum of profile shares.")
+        };
+
+        var groups = _wrapper.FaDataRows.Where(x => x.FaDataType == Constants.FaGroups).ToArray();
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var methodsPath = Path.Combine(outputDir, $"fa_allocation_methods_{timestamp}.json");
+        var groupsPath = Path.Combine(outputDir, $"fa_groups_{timestamp}.json");
+        var displayPath = Path.Combine(outputDir, $"fa_display_groups_{timestamp}.json");
+
+        WriteJson(methodsPath, methods);
+        WriteJson(groupsPath, groups);
+        WriteJson(displayPath, _wrapper.DisplayGroupListRows.ToArray());
+
+        Console.WriteLine($"[OK] FA allocation methods export: {methodsPath} (rows={methods.Length})");
+        Console.WriteLine($"[OK] FA groups export: {groupsPath} (rows={groups.Length})");
+        Console.WriteLine($"[OK] FA display groups export: {displayPath} (rows={_wrapper.DisplayGroupListRows.Count})");
+    }
+
+    private async Task RunFaGroupsAndProfilesMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.FaDataRows.TryDequeue(out _))
+        {
+        }
+
+        client.requestFA(Constants.FaAliases);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        client.requestFA(Constants.FaGroups);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        client.requestFA(Constants.FaProfiles);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        var all = _wrapper.FaDataRows.ToArray();
+        var aliases = all.Where(x => x.FaDataType == Constants.FaAliases).ToArray();
+        var groups = all.Where(x => x.FaDataType == Constants.FaGroups).ToArray();
+        var profiles = all.Where(x => x.FaDataType == Constants.FaProfiles).ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var allPath = Path.Combine(outputDir, $"fa_data_all_{timestamp}.json");
+        var aliasesPath = Path.Combine(outputDir, $"fa_aliases_{timestamp}.json");
+        var groupsPath = Path.Combine(outputDir, $"fa_groups_api_{timestamp}.json");
+        var profilesPath = Path.Combine(outputDir, $"fa_profiles_api_{timestamp}.json");
+
+        WriteJson(allPath, all);
+        WriteJson(aliasesPath, aliases);
+        WriteJson(groupsPath, groups);
+        WriteJson(profilesPath, profiles);
+
+        Console.WriteLine($"[OK] FA data export: {allPath} (rows={all.Length})");
+        Console.WriteLine($"[OK] FA aliases export: {aliasesPath} (rows={aliases.Length})");
+        Console.WriteLine($"[OK] FA groups export: {groupsPath} (rows={groups.Length})");
+        Console.WriteLine($"[OK] FA profiles export: {profilesPath} (rows={profiles.Length})");
+    }
+
+    private async Task RunFaUnificationMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.FaDataRows.TryDequeue(out _))
+        {
+        }
+
+        var errorCountBefore = _wrapper.Errors.Count;
+
+        client.requestFA(Constants.FaGroups);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        client.requestFA(Constants.FaProfiles);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        var all = _wrapper.FaDataRows.ToArray();
+        var groups = all.Where(x => x.FaDataType == Constants.FaGroups).ToArray();
+        var profiles = all.Where(x => x.FaDataType == Constants.FaProfiles).ToArray();
+        var newErrors = _wrapper.Errors.Skip(errorCountBefore).ToArray();
+
+        var profileRequestErrored = newErrors.Any(e => e.Contains("profile", StringComparison.OrdinalIgnoreCase))
+            || (groups.Length > 0 && profiles.Length == 0 && newErrors.Length > 0);
+        var likelyUnified = groups.Length > 0 && (profiles.Length == 0 || profileRequestErrored);
+
+        var summary = new[]
+        {
+            new FaUnificationRow(
+                DateTime.UtcNow,
+                groups.Length,
+                profiles.Length,
+                profileRequestErrored,
+                likelyUnified,
+                "If likelyUnified=true, TWS/IBGW may be using merged groups/profiles mode (build 983+ setting)."
+            )
+        };
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var summaryPath = Path.Combine(outputDir, $"fa_unification_summary_{timestamp}.json");
+        var dataPath = Path.Combine(outputDir, $"fa_unification_data_{timestamp}.json");
+
+        WriteJson(summaryPath, summary);
+        WriteJson(dataPath, all);
+
+        Console.WriteLine($"[OK] FA unification summary export: {summaryPath}");
+        Console.WriteLine($"[OK] FA unification raw data export: {dataPath} (rows={all.Length})");
+    }
+
+    private async Task RunFaModelPortfoliosMode(EClientSocket client, CancellationToken token)
+    {
+        var modelCode = string.IsNullOrWhiteSpace(_options.FaModelCode) ? _options.ModelCode : _options.FaModelCode;
+        if (string.IsNullOrWhiteSpace(modelCode))
+        {
+            throw new InvalidOperationException("fa-model-portfolios mode requires --fa-model-code (or --model-code). ");
+        }
+
+        const int positionsReqId = 9952;
+        const int updatesReqId = 9953;
+        var account = string.IsNullOrWhiteSpace(_options.FaAccount) ? _options.Account : _options.FaAccount;
+
+        client.reqPositionsMulti(positionsReqId, account, modelCode);
+        try
+        {
+            await AwaitWithTimeout(_wrapper.PositionMultiEndTask, token, "positionMultiEnd");
+        }
+        catch (TimeoutException) when (HasErrorCode($"id={positionsReqId} code=321"))
+        {
+            Console.WriteLine("[WARN] FA model positions request did not complete due model/account validation (code=321). Exporting current rows.");
+        }
+
+        client.cancelPositionsMulti(positionsReqId);
+
+        client.reqAccountUpdatesMulti(updatesReqId, account, modelCode, true);
+        try
+        {
+            await AwaitWithTimeout(_wrapper.AccountUpdateMultiEndTask, token, "accountUpdateMultiEnd");
+            await Task.Delay(TimeSpan.FromSeconds(Math.Min(6, Math.Max(2, _options.CaptureSeconds))), token);
+        }
+        catch (TimeoutException) when (HasErrorCode($"id={updatesReqId} code=321"))
+        {
+            Console.WriteLine("[WARN] FA model account-updates request did not complete due model/account validation (code=321). Exporting current rows.");
+        }
+        catch (TimeoutException) when (HasErrorCode($"id={positionsReqId} code=321"))
+        {
+            Console.WriteLine("[WARN] FA model account-updates request timed out after positions-model validation failure; exporting current rows.");
+        }
+
+        client.cancelAccountUpdatesMulti(updatesReqId);
+
+        var positions = _wrapper.PositionMultiRows.Where(x => x.RequestId == positionsReqId).ToArray();
+        var updates = _wrapper.AccountUpdateMultiRows.Where(x => x.RequestId == updatesReqId).ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var positionsPath = Path.Combine(outputDir, $"fa_model_positions_{modelCode}_{timestamp}.json");
+        var updatesPath = Path.Combine(outputDir, $"fa_model_account_updates_{modelCode}_{timestamp}.json");
+
+        WriteJson(positionsPath, positions);
+        WriteJson(updatesPath, updates);
+
+        Console.WriteLine($"[OK] FA model positions export: {positionsPath} (rows={positions.Length})");
+        Console.WriteLine($"[OK] FA model account-updates export: {updatesPath} (rows={updates.Length})");
+    }
+
+    private async Task RunFaOrderPlacementMode(EClientSocket client, CancellationToken token)
+    {
+        if (!_options.FaOrderAllow)
+        {
+            throw new InvalidOperationException("FA order blocked: set --fa-order-allow true to proceed.");
+        }
+
+        var action = _options.FaOrderAction.ToUpperInvariant();
+        if (action is not ("BUY" or "SELL"))
+        {
+            throw new InvalidOperationException("FA order blocked: --fa-order-action must be BUY or SELL.");
+        }
+
+        if (_options.FaOrderQuantity <= 0)
+        {
+            throw new InvalidOperationException("FA order blocked: --fa-order-qty must be > 0.");
+        }
+
+        if (_options.FaOrderLimit <= 0)
+        {
+            throw new InvalidOperationException("FA order blocked: --fa-order-limit must be > 0.");
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.FaOrderGroup) && string.IsNullOrWhiteSpace(_options.FaOrderProfile))
+        {
+            throw new InvalidOperationException("FA order blocked: provide --fa-order-group or --fa-order-profile.");
+        }
+
+        var notional = _options.FaOrderQuantity * _options.FaOrderLimit;
+        if (notional > _options.FaMaxNotional)
+        {
+            throw new InvalidOperationException($"FA order blocked: notional {notional:F2} exceeds --fa-max-notional {_options.FaMaxNotional:F2}.");
+        }
+
+        var contract = ContractFactory.Stock(
+            _options.FaOrderSymbol,
+            exchange: _options.FaOrderExchange,
+            currency: _options.FaOrderCurrency,
+            primaryExchange: _options.FaOrderPrimaryExchange
+        );
+
+        var order = OrderFactory.Limit(action, _options.FaOrderQuantity, _options.FaOrderLimit);
+        var nextOrderId = await _wrapper.NextValidIdTask;
+        order.OrderId = nextOrderId;
+        order.OrderRef = $"HARVESTER_FA_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+        order.Transmit = true;
+        order.Account = string.IsNullOrWhiteSpace(_options.FaOrderAccount) ? _options.Account : _options.FaOrderAccount;
+
+        if (!string.IsNullOrWhiteSpace(_options.FaOrderGroup))
+        {
+            order.FaGroup = _options.FaOrderGroup;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.FaOrderMethod))
+        {
+            order.FaMethod = _options.FaOrderMethod;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.FaOrderPercentage))
+        {
+            order.FaPercentage = _options.FaOrderPercentage;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_options.FaOrderProfile))
+        {
+            order.FaProfile = _options.FaOrderProfile;
+        }
+
+        client.placeOrder(order.OrderId, contract, order);
+        Console.WriteLine($"[OK] FA order transmitted: orderId={order.OrderId} symbol={_options.FaOrderSymbol} action={action} qty={_options.FaOrderQuantity} lmt={_options.FaOrderLimit}");
+
+        await Task.Delay(TimeSpan.FromSeconds(4), token);
+        client.reqOpenOrders();
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var requestPath = Path.Combine(outputDir, $"fa_order_request_{timestamp}.json");
+        var statusPath = Path.Combine(outputDir, $"fa_order_status_{timestamp}.json");
+
+        var request = new[]
+        {
+            new FaOrderRequestRow(
+                DateTime.UtcNow,
+                order.OrderId,
+                _options.FaOrderSymbol,
+                action,
+                _options.FaOrderQuantity,
+                _options.FaOrderLimit,
+                notional,
+                order.Account,
+                order.FaGroup,
+                order.FaProfile,
+                order.FaMethod,
+                order.FaPercentage,
+                order.OrderRef
+            )
+        };
+
+        WriteJson(requestPath, request);
+        WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+
+        Console.WriteLine($"[OK] FA order request export: {requestPath}");
+        Console.WriteLine($"[OK] FA order status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+    }
+
+    private async Task RunFundamentalDataMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.FundamentalDataRows.TryDequeue(out _))
+        {
+        }
+
+        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        const int reqId = 9961;
+        client.reqFundamentalData(reqId, contract, _options.FundamentalReportType, new List<TagValue>());
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.FundamentalDataTask, token, "fundamentalData");
+        }
+        catch (TimeoutException) when (HasErrorCode($"id={reqId}"))
+        {
+            Console.WriteLine("[WARN] Fundamental data callback not received before timeout; request returned API errors. Exporting current rows.");
+        }
+
+        client.cancelFundamentalData(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var dataPath = Path.Combine(outputDir, $"fundamental_data_{_options.Symbol}_{_options.FundamentalReportType}_{timestamp}.json");
+
+        WriteJson(dataPath, _wrapper.FundamentalDataRows.ToArray());
+        Console.WriteLine($"[OK] Fundamental data export: {dataPath} (rows={_wrapper.FundamentalDataRows.Count})");
+    }
+
+    private Task RunWshFiltersMode(EClientSocket client, CancellationToken token)
+    {
+        var hasWshMetaRequest = typeof(EClientSocket).GetMethod("reqWshMetaData") is not null;
+        var hasWshEventRequest = typeof(EClientSocket).GetMethod("reqWshEventData") is not null;
+        var hasWshMetaCallback = typeof(EWrapper).GetMethod("wshMetaData") is not null;
+        var hasWshEventCallback = typeof(EWrapper).GetMethod("wshEventData") is not null;
+
+        var supported = hasWshMetaRequest && hasWshEventRequest && hasWshMetaCallback && hasWshEventCallback;
+        var rows = new[]
+        {
+            new WshFilterSupportRow(
+                DateTime.UtcNow,
+                supported,
+                hasWshMetaRequest,
+                hasWshEventRequest,
+                hasWshMetaCallback,
+                hasWshEventCallback,
+                _options.WshFilterJson,
+                supported
+                    ? "WSH APIs detected in current assembly; runtime scaffolding can be expanded to execute live WSH filter requests."
+                    : "Pinned IBApi assembly does not expose WSH APIs (reqWshMetaData/reqWshEventData callbacks). Upgrade IBApi to implement live WSH filter requests."
+            )
+        };
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"wsh_filters_support_{timestamp}.json");
+        WriteJson(path, rows);
+
+        Console.WriteLine($"[OK] WSH filters compatibility export: {path}");
+        if (!supported)
+        {
+            Console.WriteLine("[WARN] WSH filters are not callable with installed IBApi package; exported upgrade-readiness diagnostics.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private Task RunErrorCodesMode(EClientSocket client, CancellationToken token)
+    {
+        var observed = _wrapper.Errors
+            .Select(ParseObservedError)
+            .Where(x => x is not null)
+            .Select(x => x!)
+            .ToArray();
+
+        var observedCounts = observed
+            .GroupBy(x => x.Code)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var systemRows = BuildSystemMessageCodes()
+            .Select(x => new ErrorCodeRow(x.Code, x.Name, x.Description, observedCounts.TryGetValue(x.Code, out var count) ? count : 0))
+            .ToArray();
+
+        var warningRows = BuildWarningMessageCodes()
+            .Select(x => new ErrorCodeRow(x.Code, x.Name, x.Description, observedCounts.TryGetValue(x.Code, out var count) ? count : 0))
+            .ToArray();
+
+        var twsRows = BuildTwsErrorCodes()
+            .Select(x => new ErrorCodeRow(x.Code, x.Name, x.Description, observedCounts.TryGetValue(x.Code, out var count) ? count : 0))
+            .ToArray();
+
+        var clientRows = BuildClientErrorCodes()
+            .Select(x => new ErrorCodeRow(x.Code, x.Name, x.Description, 0))
+            .ToArray();
+
+        var uncataloguedObserved = observed
+            .Where(x => !systemRows.Any(r => r.Code == x.Code)
+                && !warningRows.Any(r => r.Code == x.Code)
+                && !twsRows.Any(r => r.Code == x.Code)
+                && !clientRows.Any(r => r.Code == x.Code))
+            .ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var systemPath = Path.Combine(outputDir, $"error_codes_system_{timestamp}.json");
+        var warningPath = Path.Combine(outputDir, $"error_codes_warning_{timestamp}.json");
+        var clientPath = Path.Combine(outputDir, $"error_codes_client_{timestamp}.json");
+        var twsPath = Path.Combine(outputDir, $"error_codes_tws_{timestamp}.json");
+        var observedPath = Path.Combine(outputDir, $"error_codes_observed_{timestamp}.json");
+        var uncataloguedPath = Path.Combine(outputDir, $"error_codes_uncatalogued_{timestamp}.json");
+
+        WriteJson(systemPath, systemRows);
+        WriteJson(warningPath, warningRows);
+        WriteJson(clientPath, clientRows);
+        WriteJson(twsPath, twsRows);
+        WriteJson(observedPath, observed);
+        WriteJson(uncataloguedPath, uncataloguedObserved);
+
+        Console.WriteLine($"[OK] System message codes export: {systemPath} (rows={systemRows.Length})");
+        Console.WriteLine($"[OK] Warning message codes export: {warningPath} (rows={warningRows.Length})");
+        Console.WriteLine($"[OK] Client error codes export: {clientPath} (rows={clientRows.Length})");
+        Console.WriteLine($"[OK] TWS error codes export: {twsPath} (rows={twsRows.Length})");
+        Console.WriteLine($"[OK] Observed error codes export: {observedPath} (rows={observed.Length})");
+        Console.WriteLine($"[OK] Uncatalogued observed export: {uncataloguedPath} (rows={uncataloguedObserved.Length})");
+
+        return Task.CompletedTask;
+    }
+
+    private async Task RunScannerExamplesMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.ScannerDataRows.TryDequeue(out _))
+        {
+        }
+
+        const int reqId = 9971;
+        var subscription = BuildScannerSubscriptionFromOptions();
+        client.reqScannerSubscription(reqId, subscription, new List<TagValue>(), new List<TagValue>());
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.ScannerDataEndTask, token, "scannerDataEnd");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] Scanner examples timed out waiting for scannerDataEnd; exporting current rows.");
+        }
+
+        client.cancelScannerSubscription(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var rowsPath = Path.Combine(outputDir, $"scanner_examples_{timestamp}.json");
+        var requestPath = Path.Combine(outputDir, $"scanner_examples_request_{timestamp}.json");
+
+        var requestRow = new[]
+        {
+            new ScannerRequestRow(
+                reqId,
+                subscription.Instrument,
+                subscription.LocationCode,
+                subscription.ScanCode,
+                subscription.NumberOfRows,
+                _options.ScannerScannerSettingPairs,
+                _options.ScannerFilterTagValues,
+                _options.ScannerOptionsTagValues
+            )
+        };
+
+        WriteJson(rowsPath, _wrapper.ScannerDataRows.Where(x => x.RequestId == reqId).ToArray());
+        WriteJson(requestPath, requestRow);
+
+        Console.WriteLine($"[OK] Scanner examples export: {rowsPath} (rows={_wrapper.ScannerDataRows.Count(x => x.RequestId == reqId)})");
+        Console.WriteLine($"[OK] Scanner examples request export: {requestPath}");
+    }
+
+    private async Task RunScannerComplexMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.ScannerDataRows.TryDequeue(out _))
+        {
+        }
+
+        const int reqId = 9972;
+        var subscription = BuildScannerSubscriptionFromOptions();
+        if (!string.IsNullOrWhiteSpace(_options.ScannerScannerSettingPairs))
+        {
+            subscription.ScannerSettingPairs = _options.ScannerScannerSettingPairs;
+        }
+
+        var filterOptions = ParseTagValuePairs(_options.ScannerFilterTagValues);
+        var scannerOptions = ParseTagValuePairs(_options.ScannerOptionsTagValues);
+
+        client.reqScannerSubscription(reqId, subscription, filterOptions, scannerOptions);
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.ScannerDataEndTask, token, "scannerDataEnd");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] Scanner complex run timed out waiting for scannerDataEnd; exporting current rows.");
+        }
+
+        client.cancelScannerSubscription(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var rowsPath = Path.Combine(outputDir, $"scanner_complex_{timestamp}.json");
+        var requestPath = Path.Combine(outputDir, $"scanner_complex_request_{timestamp}.json");
+
+        var requestRow = new[]
+        {
+            new ScannerRequestRow(
+                reqId,
+                subscription.Instrument,
+                subscription.LocationCode,
+                subscription.ScanCode,
+                subscription.NumberOfRows,
+                subscription.ScannerSettingPairs,
+                string.Join(';', filterOptions.Select(x => $"{x.Tag}={x.Value}")),
+                string.Join(';', scannerOptions.Select(x => $"{x.Tag}={x.Value}"))
+            )
+        };
+
+        WriteJson(rowsPath, _wrapper.ScannerDataRows.Where(x => x.RequestId == reqId).ToArray());
+        WriteJson(requestPath, requestRow);
+
+        Console.WriteLine($"[OK] Scanner complex export: {rowsPath} (rows={_wrapper.ScannerDataRows.Count(x => x.RequestId == reqId)})");
+        Console.WriteLine($"[OK] Scanner complex request export: {requestPath}");
+    }
+
+    private async Task RunScannerParametersMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.ScannerParametersRows.TryDequeue(out _))
+        {
+        }
+
+        client.reqScannerParameters();
+        try
+        {
+            await AwaitWithTimeout(_wrapper.ScannerParametersTask, token, "scannerParameters");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] Scanner parameters callback not received before timeout; exporting current rows.");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var jsonPath = Path.Combine(outputDir, $"scanner_parameters_{timestamp}.json");
+        var xmlPath = Path.Combine(outputDir, $"scanner_parameters_{timestamp}.xml");
+
+        var rows = _wrapper.ScannerParametersRows.ToArray();
+        WriteJson(jsonPath, rows);
+
+        var xml = rows.LastOrDefault()?.Xml ?? string.Empty;
+        File.WriteAllText(xmlPath, xml);
+
+        Console.WriteLine($"[OK] Scanner parameters JSON export: {jsonPath} (rows={rows.Length})");
+        Console.WriteLine($"[OK] Scanner parameters XML export: {xmlPath} (chars={xml.Length})");
+    }
+
+    private async Task RunScannerWorkbenchMode(EClientSocket client, CancellationToken token)
+    {
+        var scanCodes = _options.ScannerWorkbenchCodes
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => x.ToUpperInvariant())
+            .Distinct()
+            .ToArray();
+
+        if (scanCodes.Length == 0)
+        {
+            throw new InvalidOperationException("Scanner workbench requires at least one scan code in --scanner-workbench-codes.");
+        }
+
+        var runs = Math.Max(1, _options.ScannerWorkbenchRuns);
+        var captureSeconds = Math.Max(1, _options.ScannerWorkbenchCaptureSeconds);
+        var minRows = Math.Max(0, _options.ScannerWorkbenchMinRows);
+        var filterOptions = ParseTagValuePairs(_options.ScannerFilterTagValues);
+        var scannerOptions = ParseTagValuePairs(_options.ScannerOptionsTagValues);
+
+        var runRows = new List<ScannerWorkbenchRunRow>();
+        var scoreRows = new List<ScannerWorkbenchScoreRow>();
+        var baseReqId = 9980;
+
+        for (var codeIndex = 0; codeIndex < scanCodes.Length; codeIndex++)
+        {
+            var scanCode = scanCodes[codeIndex];
+
+            for (var runIndex = 1; runIndex <= runs; runIndex++)
+            {
+                var reqId = baseReqId + (codeIndex * 100) + runIndex;
+                var subscription = BuildScannerSubscriptionFromOptions();
+                subscription.ScanCode = scanCode;
+
+                var errorCountBefore = _wrapper.Errors.Count;
+                var startedUtc = DateTime.UtcNow;
+                var stopwatch = Stopwatch.StartNew();
+
+                client.reqScannerSubscription(reqId, subscription, filterOptions, scannerOptions);
+                await Task.Delay(TimeSpan.FromSeconds(captureSeconds), token);
+                client.cancelScannerSubscription(reqId);
+                await Task.Delay(TimeSpan.FromMilliseconds(400), token);
+
+                stopwatch.Stop();
+
+                var rowsForReq = _wrapper.ScannerDataRows
+                    .Where(x => x.RequestId == reqId)
+                    .OrderBy(x => x.TimestampUtc)
+                    .ToArray();
+
+                var newErrors = _wrapper.Errors.Skip(errorCountBefore).ToArray();
+                var reqErrors = newErrors.Where(x => x.Contains($"id={reqId}", StringComparison.OrdinalIgnoreCase)).ToArray();
+                var reqErrorCodes = reqErrors
+                    .Select(ParseObservedError)
+                    .Where(x => x is not null)
+                    .Select(x => x!.Code)
+                    .Distinct()
+                    .ToArray();
+
+                var firstRowSeconds = rowsForReq.Length == 0
+                    ? (double?)null
+                    : Math.Max(0, (rowsForReq[0].TimestampUtc - startedUtc).TotalSeconds);
+
+                runRows.Add(new ScannerWorkbenchRunRow(
+                    DateTime.UtcNow,
+                    reqId,
+                    scanCode,
+                    runIndex,
+                    rowsForReq.Length,
+                    Math.Round(stopwatch.Elapsed.TotalSeconds, 3),
+                    firstRowSeconds,
+                    reqErrors.Length,
+                    string.Join(',', reqErrorCodes)
+                ));
+            }
+
+            var grouped = runRows.Where(x => x.ScanCode == scanCode).ToArray();
+            var averageRows = grouped.Length == 0 ? 0 : grouped.Average(x => x.Rows);
+            var averageFirstRowSeconds = grouped
+                .Where(x => x.FirstRowSeconds is not null)
+                .Select(x => x.FirstRowSeconds!.Value)
+                .DefaultIfEmpty(captureSeconds)
+                .Average();
+            var averageErrors = grouped.Length == 0 ? 0 : grouped.Average(x => x.ErrorCount);
+
+            var nonBlockingCodes = new[] { 162, 365, 420 };
+            var successfulRuns = grouped.Count(x => x.Rows >= minRows
+                && (string.IsNullOrWhiteSpace(x.ErrorCodes) || x.ErrorCodes
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .All(c => int.TryParse(c, out var code) && nonBlockingCodes.Contains(code))));
+
+            var coverage = _options.ScannerRows <= 0
+                ? 0
+                : Math.Min(100, (averageRows / _options.ScannerRows) * 100);
+            var speed = Math.Clamp((1 - (averageFirstRowSeconds / captureSeconds)) * 100, 0, 100);
+            var stability = grouped.Length == 0 ? 0 : (successfulRuns * 100.0 / grouped.Length);
+            var cleanliness = Math.Clamp(100 - (averageErrors * 25), 0, 100);
+
+            var hardFail = averageRows < minRows
+                || grouped.Any(x => x.ErrorCodes.Contains("10337", StringComparison.OrdinalIgnoreCase)
+                    || x.ErrorCodes.Contains("321", StringComparison.OrdinalIgnoreCase));
+
+            var weighted = (coverage * 0.40) + (speed * 0.20) + (stability * 0.30) + (cleanliness * 0.10);
+
+            scoreRows.Add(new ScannerWorkbenchScoreRow(
+                scanCode,
+                runs,
+                Math.Round(averageRows, 3),
+                Math.Round(averageFirstRowSeconds, 3),
+                Math.Round(averageErrors, 3),
+                Math.Round(coverage, 3),
+                Math.Round(speed, 3),
+                Math.Round(stability, 3),
+                Math.Round(cleanliness, 3),
+                Math.Round(weighted, 3),
+                hardFail
+            ));
+        }
+
+        var ranked = scoreRows
+            .OrderBy(x => x.HardFail)
+            .ThenByDescending(x => x.WeightedScore)
+            .ThenByDescending(x => x.CoverageScore)
+            .ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var runsPath = Path.Combine(outputDir, $"scanner_workbench_runs_{timestamp}.json");
+        var rankingPath = Path.Combine(outputDir, $"scanner_workbench_ranking_{timestamp}.json");
+
+        WriteJson(runsPath, runRows);
+        WriteJson(rankingPath, ranked);
+
+        Console.WriteLine($"[OK] Scanner workbench runs export: {runsPath} (rows={runRows.Count})");
+        Console.WriteLine($"[OK] Scanner workbench ranking export: {rankingPath} (rows={ranked.Length})");
+    }
+
+    private async Task RunDisplayGroupsQueryMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.DisplayGroupListRows.TryDequeue(out _))
+        {
+        }
+
+        const int reqId = 9961;
+        client.queryDisplayGroups(reqId);
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.DisplayGroupListTask, token, "displayGroupList");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] displayGroupList callback not received before timeout; exporting current rows.");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"display_groups_query_{timestamp}.json");
+
+        WriteJson(path, _wrapper.DisplayGroupListRows.Where(x => x.RequestId == reqId).ToArray());
+        Console.WriteLine($"[OK] Display groups query export: {path} (rows={_wrapper.DisplayGroupListRows.Count(x => x.RequestId == reqId)})");
+    }
+
+    private async Task RunDisplayGroupsSubscribeMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.DisplayGroupUpdatedRows.TryDequeue(out _))
+        {
+        }
+
+        var reqId = _options.DisplayGroupId;
+        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+
+        try
+        {
+            await AwaitWithTimeout(_wrapper.DisplayGroupUpdatedTask, token, "displayGroupUpdated");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] displayGroupUpdated callback not received before timeout; exporting current rows.");
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _options.DisplayGroupCaptureSeconds)), token);
+        client.unsubscribeFromGroupEvents(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var updatesPath = Path.Combine(outputDir, $"display_groups_subscribe_updates_{timestamp}.json");
+        var requestPath = Path.Combine(outputDir, $"display_groups_subscribe_request_{timestamp}.json");
+
+        var request = new[]
+        {
+            new DisplayGroupActionRow(DateTime.UtcNow, reqId, _options.DisplayGroupId, _options.DisplayGroupContractInfo, "subscribe")
+        };
+
+        WriteJson(updatesPath, _wrapper.DisplayGroupUpdatedRows.Where(x => x.RequestId == reqId).ToArray());
+        WriteJson(requestPath, request);
+
+        Console.WriteLine($"[OK] Display groups subscribe updates export: {updatesPath} (rows={_wrapper.DisplayGroupUpdatedRows.Count(x => x.RequestId == reqId)})");
+        Console.WriteLine($"[OK] Display groups subscribe request export: {requestPath}");
+    }
+
+    private async Task RunDisplayGroupsUpdateMode(EClientSocket client, CancellationToken token)
+    {
+        while (_wrapper.DisplayGroupUpdatedRows.TryDequeue(out _))
+        {
+        }
+
+        var reqId = _options.DisplayGroupId;
+        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+        await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+
+        client.updateDisplayGroup(reqId, _options.DisplayGroupContractInfo);
+        try
+        {
+            await AwaitWithTimeout(_wrapper.DisplayGroupUpdatedTask, token, "displayGroupUpdated");
+        }
+        catch (TimeoutException)
+        {
+            Console.WriteLine("[WARN] displayGroupUpdated callback not received before timeout after update; exporting current rows.");
+        }
+
+        client.unsubscribeFromGroupEvents(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var updatesPath = Path.Combine(outputDir, $"display_groups_update_updates_{timestamp}.json");
+        var requestPath = Path.Combine(outputDir, $"display_groups_update_request_{timestamp}.json");
+
+        var request = new[]
+        {
+            new DisplayGroupActionRow(DateTime.UtcNow, reqId, _options.DisplayGroupId, _options.DisplayGroupContractInfo, "update")
+        };
+
+        WriteJson(updatesPath, _wrapper.DisplayGroupUpdatedRows.Where(x => x.RequestId == reqId).ToArray());
+        WriteJson(requestPath, request);
+
+        Console.WriteLine($"[OK] Display groups update export: {updatesPath} (rows={_wrapper.DisplayGroupUpdatedRows.Count(x => x.RequestId == reqId)})");
+        Console.WriteLine($"[OK] Display groups update request export: {requestPath}");
+    }
+
+    private async Task RunDisplayGroupsUnsubscribeMode(EClientSocket client, CancellationToken token)
+    {
+        var reqId = _options.DisplayGroupId;
+        client.subscribeToGroupEvents(reqId, _options.DisplayGroupId);
+        await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+        client.unsubscribeFromGroupEvents(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"display_groups_unsubscribe_{timestamp}.json");
+
+        var row = new[]
+        {
+            new DisplayGroupActionRow(DateTime.UtcNow, reqId, _options.DisplayGroupId, _options.DisplayGroupContractInfo, "unsubscribe")
+        };
+
+        WriteJson(path, row);
+        Console.WriteLine($"[OK] Display groups unsubscribe export: {path}");
+    }
+
+    private ScannerSubscription BuildScannerSubscriptionFromOptions()
+    {
+        return new ScannerSubscription
+        {
+            Instrument = _options.ScannerInstrument,
+            LocationCode = _options.ScannerLocationCode,
+            ScanCode = _options.ScannerScanCode,
+            NumberOfRows = _options.ScannerRows,
+            AbovePrice = _options.ScannerAbovePrice,
+            BelowPrice = _options.ScannerBelowPrice,
+            AboveVolume = _options.ScannerAboveVolume,
+            MarketCapAbove = _options.ScannerMarketCapAbove,
+            MarketCapBelow = _options.ScannerMarketCapBelow,
+            StockTypeFilter = _options.ScannerStockTypeFilter,
+            ScannerSettingPairs = _options.ScannerScannerSettingPairs
+        };
+    }
+
+    private static List<TagValue> ParseTagValuePairs(string input)
+    {
+        var list = new List<TagValue>();
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return list;
+        }
+
+        var pairs = input
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        foreach (var pair in pairs)
+        {
+            var split = pair.Split('=', 2, StringSplitOptions.TrimEntries);
+            if (split.Length != 2 || string.IsNullOrWhiteSpace(split[0]))
+            {
+                continue;
+            }
+
+            list.Add(new TagValue(split[0], split[1]));
+        }
+
+        return list;
+    }
+
+    private static ErrorCodeSeedRow[] BuildSystemMessageCodes()
+    {
+        return
+        [
+            new ErrorCodeSeedRow(1100, "ConnectivityLost", "Connectivity between IB and TWS has been lost."),
+            new ErrorCodeSeedRow(1101, "ConnectivityRestoredDataLost", "Connectivity restored; market data requests need re-submission."),
+            new ErrorCodeSeedRow(1102, "ConnectivityRestoredDataMaintained", "Connectivity restored; market data maintained."),
+            new ErrorCodeSeedRow(1300, "SocketPortReset", "Socket port changed; reconnect using the new port.")
+        ];
+    }
+
+    private static ErrorCodeSeedRow[] BuildWarningMessageCodes()
+    {
+        return
+        [
+            new ErrorCodeSeedRow(2100, "AccountDataOverride", "New account subscription overrides previous one."),
+            new ErrorCodeSeedRow(2101, "AccountDataSubscriptionRejected", "Different client has active account subscription."),
+            new ErrorCodeSeedRow(2102, "OrderStillProcessing", "Order cannot be modified while still processing."),
+            new ErrorCodeSeedRow(2103, "MarketDataFarmDisconnected", "Market data farm disconnected."),
+            new ErrorCodeSeedRow(2104, "MarketDataFarmOk", "Market data farm connection is OK."),
+            new ErrorCodeSeedRow(2105, "HistoricalFarmDisconnected", "Historical data farm disconnected."),
+            new ErrorCodeSeedRow(2106, "HistoricalFarmOk", "Historical data farm connection is OK."),
+            new ErrorCodeSeedRow(2107, "HistoricalFarmInactive", "Historical data farm is inactive on-demand."),
+            new ErrorCodeSeedRow(2108, "MarketDataFarmInactive", "Market data farm is inactive on-demand."),
+            new ErrorCodeSeedRow(2109, "OutsideRthIgnored", "Outside regular trading hours flag ignored for order."),
+            new ErrorCodeSeedRow(2110, "TwsServerConnectivityBroken", "Connectivity between TWS and server is temporarily broken."),
+            new ErrorCodeSeedRow(2158, "SecDefFarmOk", "Security definition farm connection is OK.")
+        ];
+    }
+
+    private static ErrorCodeSeedRow[] BuildTwsErrorCodes()
+    {
+        return
+        [
+            new ErrorCodeSeedRow(100, "MaxRateExceeded", "Max rate of messages per second exceeded."),
+            new ErrorCodeSeedRow(101, "MaxTickersReached", "Max number of active tickers reached."),
+            new ErrorCodeSeedRow(102, "DuplicateTickerId", "Duplicate ticker ID."),
+            new ErrorCodeSeedRow(103, "DuplicateOrderId", "Duplicate order ID."),
+            new ErrorCodeSeedRow(200, "NoSecurityDefinition", "No security definition found for request."),
+            new ErrorCodeSeedRow(201, "OrderRejected", "Order rejected by IB server."),
+            new ErrorCodeSeedRow(202, "OrderCancelled", "Order cancelled by IB server."),
+            new ErrorCodeSeedRow(300, "TickerIdNotFound", "Ticker ID not found for cancel or lookup."),
+            new ErrorCodeSeedRow(321, "ServerValidationError", "Server error while validating API request."),
+            new ErrorCodeSeedRow(322, "ServerProcessingError", "Server error while processing API request."),
+            new ErrorCodeSeedRow(326, "ClientIdInUse", "Client ID already in use."),
+            new ErrorCodeSeedRow(330, "ManagedAccountsFaStlOnly", "Managed accounts list request is FA/STL only."),
+            new ErrorCodeSeedRow(331, "NoManagedAccounts", "FA/STL has no managed accounts configured."),
+            new ErrorCodeSeedRow(344, "NotFaAccount", "Action requires an FA account."),
+            new ErrorCodeSeedRow(354, "NoMarketDataSubscription", "Not subscribed to requested market data."),
+            new ErrorCodeSeedRow(420, "InvalidRealtimeQuery", "Invalid real-time query / pacing context."),
+            new ErrorCodeSeedRow(430, "FundamentalsUnavailable", "Fundamental data unavailable for requested security."),
+            new ErrorCodeSeedRow(10090, "PartialMarketDataSubscription", "Part of requested market data is not subscribed."),
+            new ErrorCodeSeedRow(10148, "CancelRejectedState", "Order cannot be cancelled in current state."),
+            new ErrorCodeSeedRow(10230, "FaUnsavedChanges", "Unsaved FA changes; request FA later."),
+            new ErrorCodeSeedRow(10231, "FaInvalidGroupsProfiles", "Invalid accounts in FA groups/profiles."),
+            new ErrorCodeSeedRow(10276, "WshNewsNotAllowed", "WSH news feed not allowed."),
+            new ErrorCodeSeedRow(10277, "WshPermissionsRequired", "WSH news feed permissions required."),
+            new ErrorCodeSeedRow(10278, "WshDuplicateMetaRequest", "Duplicate WSH metadata request."),
+            new ErrorCodeSeedRow(10279, "WshMetaRequestFailed", "WSH metadata request failed."),
+            new ErrorCodeSeedRow(10280, "WshMetaCancelFailed", "WSH metadata cancel failed."),
+            new ErrorCodeSeedRow(10281, "WshDuplicateEventRequest", "Duplicate WSH event data request."),
+            new ErrorCodeSeedRow(10282, "WshMetaNotRequested", "WSH metadata must be requested first."),
+            new ErrorCodeSeedRow(10283, "WshEventRequestFailed", "WSH event data request failed."),
+            new ErrorCodeSeedRow(10284, "WshEventCancelFailed", "WSH event data cancel failed."),
+            new ErrorCodeSeedRow(10285, "FractionalRuleApiCompatibility", "API version does not support fractional size rules."),
+            new ErrorCodeSeedRow(10358, "FundamentalsNotAllowed", "Fundamentals data is not allowed for this account/session.")
+        ];
+    }
+
+    private static ErrorCodeSeedRow[] BuildClientErrorCodes()
+    {
+        return typeof(EClientErrors)
+            .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(f => f.FieldType == typeof(CodeMsgPair))
+            .Select(f => (Name: f.Name, Pair: f.GetValue(null) as CodeMsgPair))
+            .Where(x => x.Pair is not null)
+            .Select(x => new ErrorCodeSeedRow(x.Pair!.Code, x.Name, x.Pair.Message))
+            .OrderBy(x => x.Code)
+            .ThenBy(x => x.Name)
+            .ToArray();
+    }
+
+    private static ObservedErrorRow? ParseObservedError(string line)
+    {
+        var codeIndex = line.IndexOf("code=", StringComparison.OrdinalIgnoreCase);
+        var msgIndex = line.IndexOf(" msg=", StringComparison.OrdinalIgnoreCase);
+        if (codeIndex < 0 || msgIndex < 0 || msgIndex <= codeIndex + 5)
+        {
+            return null;
+        }
+
+        var codeToken = line.Substring(codeIndex + 5, msgIndex - (codeIndex + 5));
+        if (!int.TryParse(codeToken, out var code))
+        {
+            return null;
+        }
+
+        var message = line[(msgIndex + 5)..].Trim();
+        return new ObservedErrorRow(code, message, line);
+    }
+
     private static void ValidateHistoricalBarRequestLimitations(string duration, string barSize)
     {
         if (!TryParseDurationToSeconds(duration, out var durationSeconds))
@@ -1099,9 +2658,74 @@ public sealed class SnapshotRuntime
         }
     }
 
+    private bool IsBlockingErrorForCurrentMode(string error)
+    {
+        if (_options.Mode == RunMode.OptionGreeks && _options.OptionGreeksAutoFallback)
+        {
+            var isExpectedProbeError =
+                (error.Contains("id=98040", StringComparison.OrdinalIgnoreCase) || error.Contains("id=9804", StringComparison.OrdinalIgnoreCase))
+                && (error.Contains("code=200", StringComparison.OrdinalIgnoreCase) || error.Contains("code=300", StringComparison.OrdinalIgnoreCase));
+
+            if (isExpectedProbeError)
+            {
+                return false;
+            }
+        }
+
+        if ((_options.Mode == RunMode.FaAllocationGroups
+            || _options.Mode == RunMode.FaGroupsProfiles
+            || _options.Mode == RunMode.FaUnification
+            || _options.Mode == RunMode.FaModelPortfolios
+            || _options.Mode == RunMode.FaOrder)
+            && error.Contains("code=321", StringComparison.OrdinalIgnoreCase))
+        {
+            var expectedFaValidation =
+                error.Contains("FA data operations ignored for non FA customers", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("Model name", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("cause - Model", StringComparison.OrdinalIgnoreCase);
+
+            if (expectedFaValidation)
+            {
+                return false;
+            }
+        }
+
+        if (_options.Mode == RunMode.FundamentalData && error.Contains("code=10358", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if ((_options.Mode == RunMode.ScannerExamples || _options.Mode == RunMode.ScannerComplex || _options.Mode == RunMode.ScannerParameters || _options.Mode == RunMode.ScannerWorkbench)
+            && (error.Contains("code=162", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=200", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=300", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=365", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=420", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=321", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=354", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=10186", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=10337", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        if ((_options.Mode == RunMode.DisplayGroupsQuery
+            || _options.Mode == RunMode.DisplayGroupsSubscribe
+            || _options.Mode == RunMode.DisplayGroupsUpdate
+            || _options.Mode == RunMode.DisplayGroupsUnsubscribe)
+            && (error.Contains("code=321", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=344", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("code=365", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        return IsBlockingError(error);
+    }
+
     private static bool IsBlockingError(string error)
     {
-        var nonBlockingCodes = new[] { "code=2100", "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=10187", "code=354", "code=322", "code=300", "code=310", "code=420" };
+        var nonBlockingCodes = new[] { "code=2100", "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=10187", "code=10285", "code=354", "code=322", "code=300", "code=310", "code=420" };
 
         if (error.Contains("code=162") && error.Contains("query cancelled", StringComparison.OrdinalIgnoreCase))
         {
@@ -1179,7 +2803,68 @@ public sealed record AppOptions(
     string PositionsMultiAccount,
     string ModelCode,
     string PnlAccount,
-    int PnlConId
+    int PnlConId,
+    string OptionSymbol,
+    string OptionExpiry,
+    double OptionStrike,
+    string OptionRight,
+    string OptionExchange,
+    string OptionCurrency,
+    string OptionMultiplier,
+    string OptionUnderlyingSecType,
+    string OptionFutFopExchange,
+    bool OptionExerciseAllow,
+    int OptionExerciseAction,
+    int OptionExerciseQuantity,
+    int OptionExerciseOverride,
+    string OptionExerciseManualTime,
+    bool OptionGreeksAutoFallback,
+    string CryptoSymbol,
+    string CryptoExchange,
+    string CryptoCurrency,
+    bool CryptoOrderAllow,
+    string CryptoOrderAction,
+    double CryptoOrderQuantity,
+    double CryptoOrderLimit,
+    double CryptoMaxNotional,
+    string FaAccount,
+    string FaModelCode,
+    bool FaOrderAllow,
+    string FaOrderAccount,
+    string FaOrderSymbol,
+    string FaOrderAction,
+    double FaOrderQuantity,
+    double FaOrderLimit,
+    double FaMaxNotional,
+    string FaOrderGroup,
+    string FaOrderMethod,
+    string FaOrderPercentage,
+    string FaOrderProfile,
+    string FaOrderExchange,
+    string FaOrderPrimaryExchange,
+    string FaOrderCurrency,
+    string FundamentalReportType,
+    string WshFilterJson,
+    string ScannerInstrument,
+    string ScannerLocationCode,
+    string ScannerScanCode,
+    int ScannerRows,
+    double ScannerAbovePrice,
+    double ScannerBelowPrice,
+    int ScannerAboveVolume,
+    double ScannerMarketCapAbove,
+    double ScannerMarketCapBelow,
+    string ScannerStockTypeFilter,
+    string ScannerScannerSettingPairs,
+    string ScannerFilterTagValues,
+    string ScannerOptionsTagValues,
+    string ScannerWorkbenchCodes,
+    int ScannerWorkbenchRuns,
+    int ScannerWorkbenchCaptureSeconds,
+    int ScannerWorkbenchMinRows,
+    int DisplayGroupId,
+    string DisplayGroupContractInfo,
+    int DisplayGroupCaptureSeconds
 )
 {
     public static AppOptions Parse(string[] args)
@@ -1229,6 +2914,67 @@ public sealed record AppOptions(
         var modelCode = string.Empty;
         var pnlAccount = account;
         var pnlConId = 0;
+        var optionSymbol = "SIRI";
+        var optionExpiry = DateTime.UtcNow.AddMonths(1).ToString("yyyyMMdd");
+        var optionStrike = 5.0;
+        var optionRight = "C";
+        var optionExchange = "SMART";
+        var optionCurrency = "USD";
+        var optionMultiplier = "100";
+        var optionUnderlyingSecType = "STK";
+        var optionFutFopExchange = string.Empty;
+        var optionExerciseAllow = false;
+        var optionExerciseAction = 1;
+        var optionExerciseQuantity = 1;
+        var optionExerciseOverride = 0;
+        var optionExerciseManualTime = string.Empty;
+        var optionGreeksAutoFallback = false;
+        var cryptoSymbol = "BTC";
+        var cryptoExchange = "PAXOS";
+        var cryptoCurrency = "USD";
+        var cryptoOrderAllow = false;
+        var cryptoOrderAction = "BUY";
+        var cryptoOrderQuantity = 0.001;
+        var cryptoOrderLimit = 30000.0;
+        var cryptoMaxNotional = 100.0;
+        var faAccount = account;
+        var faModelCode = string.Empty;
+        var faOrderAllow = false;
+        var faOrderAccount = account;
+        var faOrderSymbol = "SIRI";
+        var faOrderAction = "BUY";
+        var faOrderQuantity = 1.0;
+        var faOrderLimit = 5.0;
+        var faMaxNotional = 100.0;
+        var faOrderGroup = string.Empty;
+        var faOrderMethod = string.Empty;
+        var faOrderPercentage = string.Empty;
+        var faOrderProfile = string.Empty;
+        var faOrderExchange = "SMART";
+        var faOrderPrimaryExchange = "NASDAQ";
+        var faOrderCurrency = "USD";
+        var fundamentalReportType = "ReportSnapshot";
+        var wshFilterJson = "{}";
+        var scannerInstrument = "STK";
+        var scannerLocationCode = "STK.US.MAJOR";
+        var scannerScanCode = "TOP_PERC_GAIN";
+        var scannerRows = 10;
+        var scannerAbovePrice = 1.0;
+        var scannerBelowPrice = 0.0;
+        var scannerAboveVolume = 100000;
+        var scannerMarketCapAbove = 0.0;
+        var scannerMarketCapBelow = 0.0;
+        var scannerStockTypeFilter = "ALL";
+        var scannerScannerSettingPairs = string.Empty;
+        var scannerFilterTagValues = string.Empty;
+        var scannerOptionsTagValues = string.Empty;
+        var scannerWorkbenchCodes = "TOP_PERC_GAIN,HOT_BY_VOLUME,MOST_ACTIVE";
+        var scannerWorkbenchRuns = 2;
+        var scannerWorkbenchCaptureSeconds = 6;
+        var scannerWorkbenchMinRows = 1;
+        var displayGroupId = 1;
+        var displayGroupContractInfo = "265598@SMART";
+        var displayGroupCaptureSeconds = 4;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -1394,6 +3140,210 @@ public sealed record AppOptions(
                     pnlConId = pcon;
                     i++;
                     break;
+                case "--opt-symbol" when i + 1 < args.Length:
+                    optionSymbol = args[++i].ToUpperInvariant();
+                    break;
+                case "--opt-expiry" when i + 1 < args.Length:
+                    optionExpiry = args[++i];
+                    break;
+                case "--opt-strike" when i + 1 < args.Length && double.TryParse(args[i + 1], out var os):
+                    optionStrike = os;
+                    i++;
+                    break;
+                case "--opt-right" when i + 1 < args.Length:
+                    optionRight = args[++i].ToUpperInvariant();
+                    break;
+                case "--opt-exchange" when i + 1 < args.Length:
+                    optionExchange = args[++i].ToUpperInvariant();
+                    break;
+                case "--opt-currency" when i + 1 < args.Length:
+                    optionCurrency = args[++i].ToUpperInvariant();
+                    break;
+                case "--opt-multiplier" when i + 1 < args.Length:
+                    optionMultiplier = args[++i];
+                    break;
+                case "--opt-underlying-sec-type" when i + 1 < args.Length:
+                    optionUnderlyingSecType = args[++i].ToUpperInvariant();
+                    break;
+                case "--opt-futfop-exchange" when i + 1 < args.Length:
+                    optionFutFopExchange = args[++i].ToUpperInvariant();
+                    break;
+                case "--option-exercise-allow" when i + 1 < args.Length:
+                    optionExerciseAllow = bool.TryParse(args[++i], out var oea) && oea;
+                    break;
+                case "--option-exercise-action" when i + 1 < args.Length && int.TryParse(args[i + 1], out var oaction):
+                    optionExerciseAction = oaction;
+                    i++;
+                    break;
+                case "--option-exercise-qty" when i + 1 < args.Length && int.TryParse(args[i + 1], out var oqty):
+                    optionExerciseQuantity = oqty;
+                    i++;
+                    break;
+                case "--option-exercise-override" when i + 1 < args.Length && int.TryParse(args[i + 1], out var oovr):
+                    optionExerciseOverride = oovr;
+                    i++;
+                    break;
+                case "--option-exercise-time" when i + 1 < args.Length:
+                    optionExerciseManualTime = args[++i];
+                    break;
+                case "--option-greeks-auto-fallback" when i + 1 < args.Length:
+                    optionGreeksAutoFallback = bool.TryParse(args[++i], out var ogf) && ogf;
+                    break;
+                case "--crypto-symbol" when i + 1 < args.Length:
+                    cryptoSymbol = args[++i].ToUpperInvariant();
+                    break;
+                case "--crypto-exchange" when i + 1 < args.Length:
+                    cryptoExchange = args[++i].ToUpperInvariant();
+                    break;
+                case "--crypto-currency" when i + 1 < args.Length:
+                    cryptoCurrency = args[++i].ToUpperInvariant();
+                    break;
+                case "--crypto-order-allow" when i + 1 < args.Length:
+                    cryptoOrderAllow = bool.TryParse(args[++i], out var coa) && coa;
+                    break;
+                case "--crypto-order-action" when i + 1 < args.Length:
+                    cryptoOrderAction = args[++i].ToUpperInvariant();
+                    break;
+                case "--crypto-order-qty" when i + 1 < args.Length && double.TryParse(args[i + 1], out var coq):
+                    cryptoOrderQuantity = coq;
+                    i++;
+                    break;
+                case "--crypto-order-limit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var col):
+                    cryptoOrderLimit = col;
+                    i++;
+                    break;
+                case "--crypto-max-notional" when i + 1 < args.Length && double.TryParse(args[i + 1], out var cmn):
+                    cryptoMaxNotional = cmn;
+                    i++;
+                    break;
+                case "--fa-account" when i + 1 < args.Length:
+                    faAccount = args[++i];
+                    break;
+                case "--fa-model-code" when i + 1 < args.Length:
+                    faModelCode = args[++i];
+                    break;
+                case "--fa-order-allow" when i + 1 < args.Length:
+                    faOrderAllow = bool.TryParse(args[++i], out var foa) && foa;
+                    break;
+                case "--fa-order-account" when i + 1 < args.Length:
+                    faOrderAccount = args[++i];
+                    break;
+                case "--fa-order-symbol" when i + 1 < args.Length:
+                    faOrderSymbol = args[++i].ToUpperInvariant();
+                    break;
+                case "--fa-order-action" when i + 1 < args.Length:
+                    faOrderAction = args[++i].ToUpperInvariant();
+                    break;
+                case "--fa-order-qty" when i + 1 < args.Length && double.TryParse(args[i + 1], out var foq):
+                    faOrderQuantity = foq;
+                    i++;
+                    break;
+                case "--fa-order-limit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var fol):
+                    faOrderLimit = fol;
+                    i++;
+                    break;
+                case "--fa-max-notional" when i + 1 < args.Length && double.TryParse(args[i + 1], out var fmn):
+                    faMaxNotional = fmn;
+                    i++;
+                    break;
+                case "--fa-order-group" when i + 1 < args.Length:
+                    faOrderGroup = args[++i];
+                    break;
+                case "--fa-order-method" when i + 1 < args.Length:
+                    faOrderMethod = args[++i];
+                    break;
+                case "--fa-order-percentage" when i + 1 < args.Length:
+                    faOrderPercentage = args[++i];
+                    break;
+                case "--fa-order-profile" when i + 1 < args.Length:
+                    faOrderProfile = args[++i];
+                    break;
+                case "--fa-order-exchange" when i + 1 < args.Length:
+                    faOrderExchange = args[++i].ToUpperInvariant();
+                    break;
+                case "--fa-order-primary-exchange" when i + 1 < args.Length:
+                    faOrderPrimaryExchange = args[++i].ToUpperInvariant();
+                    break;
+                case "--fa-order-currency" when i + 1 < args.Length:
+                    faOrderCurrency = args[++i].ToUpperInvariant();
+                    break;
+                case "--fund-report-type" when i + 1 < args.Length:
+                    fundamentalReportType = args[++i];
+                    break;
+                case "--wsh-filter-json" when i + 1 < args.Length:
+                    wshFilterJson = args[++i];
+                    break;
+                case "--scanner-instrument" when i + 1 < args.Length:
+                    scannerInstrument = args[++i].ToUpperInvariant();
+                    break;
+                case "--scanner-location" when i + 1 < args.Length:
+                    scannerLocationCode = args[++i].ToUpperInvariant();
+                    break;
+                case "--scanner-code" when i + 1 < args.Length:
+                    scannerScanCode = args[++i].ToUpperInvariant();
+                    break;
+                case "--scanner-rows" when i + 1 < args.Length && int.TryParse(args[i + 1], out var srows):
+                    scannerRows = srows;
+                    i++;
+                    break;
+                case "--scanner-above-price" when i + 1 < args.Length && double.TryParse(args[i + 1], out var sap):
+                    scannerAbovePrice = sap;
+                    i++;
+                    break;
+                case "--scanner-below-price" when i + 1 < args.Length && double.TryParse(args[i + 1], out var sbp):
+                    scannerBelowPrice = sbp;
+                    i++;
+                    break;
+                case "--scanner-above-volume" when i + 1 < args.Length && int.TryParse(args[i + 1], out var sav):
+                    scannerAboveVolume = sav;
+                    i++;
+                    break;
+                case "--scanner-mcap-above" when i + 1 < args.Length && double.TryParse(args[i + 1], out var smca):
+                    scannerMarketCapAbove = smca;
+                    i++;
+                    break;
+                case "--scanner-mcap-below" when i + 1 < args.Length && double.TryParse(args[i + 1], out var smcb):
+                    scannerMarketCapBelow = smcb;
+                    i++;
+                    break;
+                case "--scanner-stock-type" when i + 1 < args.Length:
+                    scannerStockTypeFilter = args[++i].ToUpperInvariant();
+                    break;
+                case "--scanner-setting-pairs" when i + 1 < args.Length:
+                    scannerScannerSettingPairs = args[++i];
+                    break;
+                case "--scanner-filter-tags" when i + 1 < args.Length:
+                    scannerFilterTagValues = args[++i];
+                    break;
+                case "--scanner-options-tags" when i + 1 < args.Length:
+                    scannerOptionsTagValues = args[++i];
+                    break;
+                case "--scanner-workbench-codes" when i + 1 < args.Length:
+                    scannerWorkbenchCodes = args[++i];
+                    break;
+                case "--scanner-workbench-runs" when i + 1 < args.Length && int.TryParse(args[i + 1], out var swr):
+                    scannerWorkbenchRuns = swr;
+                    i++;
+                    break;
+                case "--scanner-workbench-capture-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var swc):
+                    scannerWorkbenchCaptureSeconds = swc;
+                    i++;
+                    break;
+                case "--scanner-workbench-min-rows" when i + 1 < args.Length && int.TryParse(args[i + 1], out var swm):
+                    scannerWorkbenchMinRows = swm;
+                    i++;
+                    break;
+                case "--display-group-id" when i + 1 < args.Length && int.TryParse(args[i + 1], out var dgid):
+                    displayGroupId = dgid;
+                    i++;
+                    break;
+                case "--display-group-contract-info" when i + 1 < args.Length:
+                    displayGroupContractInfo = args[++i];
+                    break;
+                case "--display-group-capture-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var dgcs):
+                    displayGroupCaptureSeconds = dgcs;
+                    i++;
+                    break;
             }
         }
 
@@ -1442,7 +3392,68 @@ public sealed record AppOptions(
             positionsMultiAccount,
             modelCode,
             pnlAccount,
-            pnlConId
+            pnlConId,
+            optionSymbol,
+            optionExpiry,
+            optionStrike,
+            optionRight,
+            optionExchange,
+            optionCurrency,
+            optionMultiplier,
+            optionUnderlyingSecType,
+            optionFutFopExchange,
+            optionExerciseAllow,
+            optionExerciseAction,
+            optionExerciseQuantity,
+            optionExerciseOverride,
+            optionExerciseManualTime,
+            optionGreeksAutoFallback,
+            cryptoSymbol,
+            cryptoExchange,
+            cryptoCurrency,
+            cryptoOrderAllow,
+            cryptoOrderAction,
+            cryptoOrderQuantity,
+            cryptoOrderLimit,
+            cryptoMaxNotional,
+            faAccount,
+            faModelCode,
+            faOrderAllow,
+            faOrderAccount,
+            faOrderSymbol,
+            faOrderAction,
+            faOrderQuantity,
+            faOrderLimit,
+            faMaxNotional,
+            faOrderGroup,
+            faOrderMethod,
+            faOrderPercentage,
+            faOrderProfile,
+            faOrderExchange,
+            faOrderPrimaryExchange,
+            faOrderCurrency,
+            fundamentalReportType,
+            wshFilterJson,
+            scannerInstrument,
+            scannerLocationCode,
+            scannerScanCode,
+            scannerRows,
+            scannerAbovePrice,
+            scannerBelowPrice,
+            scannerAboveVolume,
+            scannerMarketCapAbove,
+            scannerMarketCapBelow,
+            scannerStockTypeFilter,
+            scannerScannerSettingPairs,
+            scannerFilterTagValues,
+            scannerOptionsTagValues,
+            scannerWorkbenchCodes,
+            scannerWorkbenchRuns,
+            scannerWorkbenchCaptureSeconds,
+            scannerWorkbenchMinRows,
+            displayGroupId,
+            displayGroupContractInfo,
+            displayGroupCaptureSeconds
         );
     }
 
@@ -1475,7 +3486,31 @@ public sealed record AppOptions(
             "positions-multi" => RunMode.PositionsMulti,
             "pnl-account" => RunMode.PnlAccount,
             "pnl-single" => RunMode.PnlSingle,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single.")
+            "option-chains" => RunMode.OptionChains,
+            "option-exercise" => RunMode.OptionExercise,
+            "option-greeks" => RunMode.OptionGreeks,
+            "crypto-permissions" => RunMode.CryptoPermissions,
+            "crypto-contract" => RunMode.CryptoContract,
+            "crypto-streaming" => RunMode.CryptoStreaming,
+            "crypto-historical" => RunMode.CryptoHistorical,
+            "crypto-order" => RunMode.CryptoOrder,
+            "fa-allocation-groups" => RunMode.FaAllocationGroups,
+            "fa-groups-profiles" => RunMode.FaGroupsProfiles,
+            "fa-unification" => RunMode.FaUnification,
+            "fa-model-portfolios" => RunMode.FaModelPortfolios,
+            "fa-order" => RunMode.FaOrder,
+            "fundamental-data" => RunMode.FundamentalData,
+            "wsh-filters" => RunMode.WshFilters,
+            "error-codes" => RunMode.ErrorCodes,
+            "scanner-examples" => RunMode.ScannerExamples,
+            "scanner-complex" => RunMode.ScannerComplex,
+            "scanner-parameters" => RunMode.ScannerParameters,
+            "scanner-workbench" => RunMode.ScannerWorkbench,
+            "display-groups-query" => RunMode.DisplayGroupsQuery,
+            "display-groups-subscribe" => RunMode.DisplayGroupsSubscribe,
+            "display-groups-update" => RunMode.DisplayGroupsUpdate,
+            "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe.")
         };
     }
 }
@@ -1506,7 +3541,31 @@ public enum RunMode
     AccountSummaryOnly,
     PositionsMulti,
     PnlAccount,
-    PnlSingle
+    PnlSingle,
+    OptionChains,
+    OptionExercise,
+    OptionGreeks,
+    CryptoPermissions,
+    CryptoContract,
+    CryptoStreaming,
+    CryptoHistorical,
+    CryptoOrder,
+    FaAllocationGroups,
+    FaGroupsProfiles,
+    FaUnification,
+    FaModelPortfolios,
+    FaOrder,
+    FundamentalData,
+    WshFilters,
+    ErrorCodes,
+    ScannerExamples,
+    ScannerComplex,
+    ScannerParameters,
+    ScannerWorkbench,
+    DisplayGroupsQuery,
+    DisplayGroupsSubscribe,
+    DisplayGroupsUpdate,
+    DisplayGroupsUnsubscribe
 }
 
 public sealed record ContractDetailsRow(
@@ -1551,4 +3610,149 @@ public sealed record LiveOrderPlacementRow(
 public sealed record ManagedAccountRow(
     DateTime TimestampUtc,
     string AccountId
+);
+
+public sealed record OptionExerciseRequestRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Expiry,
+    double Strike,
+    string Right,
+    int Action,
+    int Quantity,
+    string Account,
+    int Override,
+    string ManualTime
+);
+
+public sealed record CryptoPermissionRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Exchange,
+    string Currency,
+    bool ContractDetailsResolved,
+    int ContractDetailsCount,
+    int TopTicksCaptured,
+    string[] RelatedErrors
+);
+
+public sealed record CryptoOrderRequestRow(
+    DateTime TimestampUtc,
+    int OrderId,
+    string Symbol,
+    string Exchange,
+    string Currency,
+    string Action,
+    double Quantity,
+    double LimitPrice,
+    double Notional,
+    string Account,
+    string OrderRef
+);
+
+public sealed record FaAllocationMethodRow(
+    string Category,
+    string Method,
+    int TypeNumber,
+    string Notes
+);
+
+public sealed record FaUnificationRow(
+    DateTime TimestampUtc,
+    int GroupPayloadCount,
+    int ProfilePayloadCount,
+    bool ProfileRequestErrored,
+    bool LikelyUnified,
+    string Note
+);
+
+public sealed record FaOrderRequestRow(
+    DateTime TimestampUtc,
+    int OrderId,
+    string Symbol,
+    string Action,
+    double Quantity,
+    double LimitPrice,
+    double Notional,
+    string Account,
+    string FaGroup,
+    string FaProfile,
+    string FaMethod,
+    string FaPercentage,
+    string OrderRef
+);
+
+public sealed record WshFilterSupportRow(
+    DateTime TimestampUtc,
+    bool IsWshSupported,
+    bool HasWshMetaRequest,
+    bool HasWshEventRequest,
+    bool HasWshMetaCallback,
+    bool HasWshEventCallback,
+    string RequestedFilterJson,
+    string Note
+);
+
+public sealed record ErrorCodeSeedRow(
+    int Code,
+    string Name,
+    string Description
+);
+
+public sealed record ErrorCodeRow(
+    int Code,
+    string Name,
+    string Description,
+    int ObservedCount
+);
+
+public sealed record ObservedErrorRow(
+    int Code,
+    string Message,
+    string Raw
+);
+
+public sealed record ScannerRequestRow(
+    int RequestId,
+    string Instrument,
+    string LocationCode,
+    string ScanCode,
+    int NumberOfRows,
+    string ScannerSettingPairs,
+    string FilterTagPairs,
+    string OptionTagPairs
+);
+
+public sealed record ScannerWorkbenchRunRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string ScanCode,
+    int RunIndex,
+    int Rows,
+    double DurationSeconds,
+    double? FirstRowSeconds,
+    int ErrorCount,
+    string ErrorCodes
+);
+
+public sealed record ScannerWorkbenchScoreRow(
+    string ScanCode,
+    int Runs,
+    double AverageRows,
+    double AverageFirstRowSeconds,
+    double AverageErrors,
+    double CoverageScore,
+    double SpeedScore,
+    double StabilityScore,
+    double CleanlinessScore,
+    double WeightedScore,
+    bool HardFail
+);
+
+public sealed record DisplayGroupActionRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    int GroupId,
+    string ContractInfo,
+    string Action
 );

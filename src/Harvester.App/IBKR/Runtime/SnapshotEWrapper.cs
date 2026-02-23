@@ -27,6 +27,14 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _positionMultiEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _pnlFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _pnlSingleFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _optionChainEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _optionGreeksFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _faDataFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _displayGroupListTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _displayGroupUpdatedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _fundamentalDataTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _scannerDataEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _scannerParametersTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ConcurrentQueue<AccountSummaryRow> AccountSummaryRows { get; } = new();
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
@@ -53,6 +61,14 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<PositionMultiRow> PositionMultiRows { get; } = new();
     public ConcurrentQueue<PnlRow> PnlRows { get; } = new();
     public ConcurrentQueue<PnlSingleRow> PnlSingleRows { get; } = new();
+    public ConcurrentQueue<OptionChainRow> OptionChains { get; } = new();
+    public ConcurrentQueue<OptionGreekRow> OptionGreeks { get; } = new();
+    public ConcurrentQueue<FaDataRow> FaDataRows { get; } = new();
+    public ConcurrentQueue<DisplayGroupListRow> DisplayGroupListRows { get; } = new();
+    public ConcurrentQueue<DisplayGroupUpdatedRow> DisplayGroupUpdatedRows { get; } = new();
+    public ConcurrentQueue<FundamentalDataRow> FundamentalDataRows { get; } = new();
+    public ConcurrentQueue<ScannerDataRow> ScannerDataRows { get; } = new();
+    public ConcurrentQueue<ScannerParametersRow> ScannerParametersRows { get; } = new();
 
     public Task<bool> CurrentTimeTask => _currentTimeTcs.Task;
     public Task<bool> AccountSummaryEndTask => _accountSummaryEndTcs.Task;
@@ -75,6 +91,14 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> PositionMultiEndTask => _positionMultiEndTcs.Task;
     public Task<bool> PnlFirstTask => _pnlFirstTcs.Task;
     public Task<bool> PnlSingleFirstTask => _pnlSingleFirstTcs.Task;
+    public Task<bool> OptionChainEndTask => _optionChainEndTcs.Task;
+    public Task<bool> OptionGreeksFirstTask => _optionGreeksFirstTcs.Task;
+    public Task<bool> FaDataFirstTask => _faDataFirstTcs.Task;
+    public Task<bool> DisplayGroupListTask => _displayGroupListTcs.Task;
+    public Task<bool> DisplayGroupUpdatedTask => _displayGroupUpdatedTcs.Task;
+    public Task<bool> FundamentalDataTask => _fundamentalDataTcs.Task;
+    public Task<bool> ScannerDataEndTask => _scannerDataEndTcs.Task;
+    public Task<bool> ScannerParametersTask => _scannerParametersTcs.Task;
 
     public override void currentTime(long time)
     {
@@ -554,6 +578,125 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
         ));
         _pnlSingleFirstTcs.TrySetResult(true);
     }
+
+    public override void securityDefinitionOptionParameter(int reqId, string exchange, int underlyingConId, string tradingClass, string multiplier, HashSet<string> expirations, HashSet<double> strikes)
+    {
+        OptionChains.Enqueue(new OptionChainRow(
+            DateTime.UtcNow,
+            reqId,
+            exchange,
+            underlyingConId,
+            tradingClass,
+            multiplier,
+            expirations.OrderBy(x => x).ToArray(),
+            strikes.OrderBy(x => x).ToArray()
+        ));
+    }
+
+    public override void securityDefinitionOptionParameterEnd(int reqId)
+    {
+        _optionChainEndTcs.TrySetResult(true);
+    }
+
+    public override void tickOptionComputation(int tickerId, int field, double impliedVolatility, double delta, double optPrice, double pvDividend, double gamma, double vega, double theta, double undPrice)
+    {
+        OptionGreeks.Enqueue(new OptionGreekRow(
+            DateTime.UtcNow,
+            tickerId,
+            field,
+            0,
+            impliedVolatility,
+            delta,
+            optPrice,
+            pvDividend,
+            gamma,
+            vega,
+            theta,
+            undPrice
+        ));
+
+        _optionGreeksFirstTcs.TrySetResult(true);
+    }
+
+    public override void receiveFA(int faDataType, string faXmlData)
+    {
+        FaDataRows.Enqueue(new FaDataRow(
+            DateTime.UtcNow,
+            faDataType,
+            faXmlData
+        ));
+
+        _faDataFirstTcs.TrySetResult(true);
+    }
+
+    public override void displayGroupList(int reqId, string groups)
+    {
+        DisplayGroupListRows.Enqueue(new DisplayGroupListRow(
+            DateTime.UtcNow,
+            reqId,
+            groups
+        ));
+
+        _displayGroupListTcs.TrySetResult(true);
+    }
+
+    public override void displayGroupUpdated(int reqId, string contractInfo)
+    {
+        DisplayGroupUpdatedRows.Enqueue(new DisplayGroupUpdatedRow(
+            DateTime.UtcNow,
+            reqId,
+            contractInfo
+        ));
+
+        _displayGroupUpdatedTcs.TrySetResult(true);
+    }
+
+    public override void fundamentalData(int reqId, string data)
+    {
+        FundamentalDataRows.Enqueue(new FundamentalDataRow(
+            DateTime.UtcNow,
+            reqId,
+            data
+        ));
+
+        _fundamentalDataTcs.TrySetResult(true);
+    }
+
+    public override void scannerData(int reqId, int rank, ContractDetails contractDetails, string distance, string benchmark, string projection, string legsStr)
+    {
+        ScannerDataRows.Enqueue(new ScannerDataRow(
+            DateTime.UtcNow,
+            reqId,
+            rank,
+            contractDetails.Contract.ConId,
+            contractDetails.Contract.Symbol,
+            contractDetails.Contract.SecType,
+            contractDetails.Contract.Exchange,
+            contractDetails.Contract.PrimaryExch,
+            contractDetails.Contract.Currency,
+            contractDetails.Contract.LocalSymbol,
+            contractDetails.Contract.TradingClass,
+            distance,
+            benchmark,
+            projection,
+            legsStr
+        ));
+    }
+
+    public override void scannerDataEnd(int reqId)
+    {
+        _scannerDataEndTcs.TrySetResult(true);
+    }
+
+    public override void scannerParameters(string xml)
+    {
+        ScannerParametersRows.Enqueue(new ScannerParametersRow(
+            DateTime.UtcNow,
+            xml
+        ));
+
+        _scannerParametersTcs.TrySetResult(true);
+    }
 }
 
 public sealed record AccountSummaryRow(string Account, string Tag, string Value, string Currency);
@@ -821,4 +964,77 @@ public sealed record PnlSingleRow(
     double UnrealizedPnl,
     double RealizedPnl,
     double Value
+);
+
+public sealed record OptionChainRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Exchange,
+    int UnderlyingConId,
+    string TradingClass,
+    string Multiplier,
+    string[] Expirations,
+    double[] Strikes
+);
+
+public sealed record OptionGreekRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    int Field,
+    int TickAttrib,
+    double ImpliedVolatility,
+    double Delta,
+    double OptionPrice,
+    double PvDividend,
+    double Gamma,
+    double Vega,
+    double Theta,
+    double UnderlyingPrice
+);
+
+public sealed record FaDataRow(
+    DateTime TimestampUtc,
+    int FaDataType,
+    string XmlData
+);
+
+public sealed record DisplayGroupListRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Groups
+);
+
+public sealed record DisplayGroupUpdatedRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string ContractInfo
+);
+
+public sealed record FundamentalDataRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Data
+);
+
+public sealed record ScannerDataRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    int Rank,
+    int ConId,
+    string Symbol,
+    string SecurityType,
+    string Exchange,
+    string PrimaryExchange,
+    string Currency,
+    string LocalSymbol,
+    string TradingClass,
+    string Distance,
+    string Benchmark,
+    string Projection,
+    string Legs
+);
+
+public sealed record ScannerParametersRow(
+    DateTime TimestampUtc,
+    string Xml
 );
