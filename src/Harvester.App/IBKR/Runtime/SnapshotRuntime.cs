@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Diagnostics;
+using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
@@ -54,6 +55,7 @@ public sealed class SnapshotRuntime
             Console.WriteLine($"[OK] managedAccounts={await _wrapper.ManagedAccountsTask}");
 
             var client = session.Client;
+            IBrokerAdapter brokerAdapter = new IbBrokerAdapter();
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
             using var runtimeCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token);
             var monitorTask = MonitorConnectionHealthAsync(session, client, runtimeCts);
@@ -75,25 +77,25 @@ public sealed class SnapshotRuntime
                     await RunConnectMode(client, runtimeCts.Token);
                     break;
                 case RunMode.Orders:
-                    await RunOrdersMode(client, runtimeCts.Token);
+                    await RunOrdersMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.Positions:
                     await RunPositionsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.SnapshotAll:
-                    await RunSnapshotAllMode(client, runtimeCts.Token);
+                    await RunSnapshotAllMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.ContractsValidate:
-                    await RunContractsValidateMode(client, runtimeCts.Token);
+                    await RunContractsValidateMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OrdersDryRun:
                     await RunOrdersDryRunMode();
                     break;
                 case RunMode.OrdersPlaceSim:
-                    await RunOrdersPlaceSimMode(client, runtimeCts.Token);
+                    await RunOrdersPlaceSimMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OrdersWhatIf:
-                    await RunOrdersWhatIfMode(client, runtimeCts.Token);
+                    await RunOrdersWhatIfMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.TopData:
                     await RunTopDataMode(client, runtimeCts.Token);
@@ -150,7 +152,7 @@ public sealed class SnapshotRuntime
                     await RunOptionChainsMode(client, runtimeCts.Token);
                     break;
                 case RunMode.OptionExercise:
-                    await RunOptionExerciseMode(client, runtimeCts.Token);
+                    await RunOptionExerciseMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OptionGreeks:
                     await RunOptionGreeksMode(client, runtimeCts.Token);
@@ -168,7 +170,7 @@ public sealed class SnapshotRuntime
                     await RunCryptoHistoricalMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoOrder:
-                    await RunCryptoOrderPlacementMode(client, runtimeCts.Token);
+                    await RunCryptoOrderPlacementMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FaAllocationGroups:
                     await RunFaAllocationMethodsAndGroupsMode(client, runtimeCts.Token);
@@ -183,7 +185,7 @@ public sealed class SnapshotRuntime
                     await RunFaModelPortfoliosMode(client, runtimeCts.Token);
                     break;
                 case RunMode.FaOrder:
-                    await RunFaOrderPlacementMode(client, runtimeCts.Token);
+                    await RunFaOrderPlacementMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.FundamentalData:
                     await RunFundamentalDataMode(client, runtimeCts.Token);
@@ -470,9 +472,9 @@ public sealed class SnapshotRuntime
         }
     }
 
-    private async Task RunOrdersMode(EClientSocket client, CancellationToken token)
+    private async Task RunOrdersMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitTrackedWithTimeout(
             _wrapper.OpenOrderEndTask,
             token,
@@ -481,7 +483,7 @@ public sealed class SnapshotRuntime
             requestType: "reqOpenOrders",
             origin: nameof(RunOrdersMode));
 
-        client.reqCompletedOrders(true);
+        brokerAdapter.RequestCompletedOrders(client, apiOnly: true);
         await AwaitTrackedWithTimeout(
             _wrapper.CompletedOrdersEndTask,
             token,
@@ -491,7 +493,7 @@ public sealed class SnapshotRuntime
             origin: nameof(RunOrdersMode));
 
         const int executionsReqId = 9201;
-        client.reqExecutions(executionsReqId, new ExecutionFilter());
+        brokerAdapter.RequestExecutions(client, executionsReqId, new ExecutionFilter());
         await AwaitTrackedWithTimeout(
             _wrapper.ExecDetailsEndTask,
             token,
@@ -506,6 +508,7 @@ public sealed class SnapshotRuntime
         var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
         var executionsPath = Path.Combine(outputDir, $"executions_{timestamp}.json");
         var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
+        var canonicalOrderEventsPath = Path.Combine(outputDir, $"order_events_canonical_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
         var reconciliationSummaryPath = Path.Combine(outputDir, $"orders_reconciliation_summary_{timestamp}.json");
@@ -520,6 +523,7 @@ public sealed class SnapshotRuntime
         WriteJson(completedOrdersPath, _wrapper.CompletedOrders.ToArray());
         WriteJson(executionsPath, _wrapper.Executions.ToArray());
         WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
+        WriteJson(canonicalOrderEventsPath, _wrapper.CanonicalOrderEvents.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
@@ -528,6 +532,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
         Console.WriteLine($"[OK] Executions snapshot: {executionsPath} (rows={_wrapper.Executions.Count})");
         Console.WriteLine($"[OK] Commissions snapshot: {commissionsPath} (rows={_wrapper.Commissions.Count})");
+        Console.WriteLine($"[OK] Canonical order events: {canonicalOrderEventsPath} (rows={_wrapper.CanonicalOrderEvents.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
         Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
@@ -571,18 +576,18 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Positions export: {positionsPath} (rows={_wrapper.Positions.Count})");
     }
 
-    private async Task RunSnapshotAllMode(EClientSocket client, CancellationToken token)
+    private async Task RunSnapshotAllMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
 
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
-        client.reqCompletedOrders(true);
+        brokerAdapter.RequestCompletedOrders(client, apiOnly: true);
         await AwaitWithTimeout(_wrapper.CompletedOrdersEndTask, token, "completedOrdersEnd");
 
-        client.reqExecutions(9201, new ExecutionFilter());
+        brokerAdapter.RequestExecutions(client, 9201, new ExecutionFilter());
         await AwaitWithTimeout(_wrapper.ExecDetailsEndTask, token, "execDetailsEnd");
 
         const int summaryReqId = 9001;
@@ -597,6 +602,7 @@ public sealed class SnapshotRuntime
         var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
         var executionsPath = Path.Combine(outputDir, $"executions_{timestamp}.json");
         var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
+        var canonicalOrderEventsPath = Path.Combine(outputDir, $"order_events_canonical_{timestamp}.json");
         var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
         var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
         var reconciliationSummaryPath = Path.Combine(outputDir, $"orders_reconciliation_summary_{timestamp}.json");
@@ -614,6 +620,7 @@ public sealed class SnapshotRuntime
         WriteJson(completedOrdersPath, _wrapper.CompletedOrders.ToArray());
         WriteJson(executionsPath, _wrapper.Executions.ToArray());
         WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
+        WriteJson(canonicalOrderEventsPath, _wrapper.CanonicalOrderEvents.ToArray());
         WriteJson(reconciledOrdersPath, reconciliation.Ledger);
         WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
@@ -625,6 +632,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Completed orders: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
         Console.WriteLine($"[OK] Executions: {executionsPath} (rows={_wrapper.Executions.Count})");
         Console.WriteLine($"[OK] Commissions: {commissionsPath} (rows={_wrapper.Commissions.Count})");
+        Console.WriteLine($"[OK] Canonical order events: {canonicalOrderEventsPath} (rows={_wrapper.CanonicalOrderEvents.Count})");
         Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
         Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
@@ -635,10 +643,15 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Snapshot report: {reportPath}");
     }
 
-    private async Task RunContractsValidateMode(EClientSocket client, CancellationToken token)
+    private async Task RunContractsValidateMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        client.reqContractDetails(9301, contract);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+        brokerAdapter.RequestContractDetails(client, 9301, contract);
         await AwaitWithTimeout(_wrapper.ContractDetailsEndTask, token, "contractDetailsEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -737,7 +750,7 @@ public sealed class SnapshotRuntime
         return Task.CompletedTask;
     }
 
-    private async Task RunOrdersPlaceSimMode(EClientSocket client, CancellationToken token)
+    private async Task RunOrdersPlaceSimMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
         ValidateLiveSafetyInputs();
@@ -753,18 +766,27 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Live order blocked: set --enable-live true to allow transmission.");
         }
 
-        var contract = ContractFactory.Stock(_options.LiveSymbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        var order = OrderFactory.Limit(_options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.LiveSymbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+        var order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+            _options.LiveAction,
+            "LMT",
+            _options.LiveQuantity,
+            LimitPrice: _options.LiveLimitPrice));
         var nextOrderId = await _wrapper.NextValidIdTask;
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_SIM_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
 
-        client.placeOrder(order.OrderId, contract, order);
+        brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={_options.LiveSymbol} action={_options.LiveAction} qty={_options.LiveQuantity} lmt={_options.LiveLimitPrice}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -791,20 +813,26 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Sim status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
-    private async Task RunOrdersWhatIfMode(EClientSocket client, CancellationToken token)
+    private async Task RunOrdersWhatIfMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersWhatIfMode));
         var nextOrderId = await _wrapper.NextValidIdTask;
-        var contract = ContractFactory.Stock(_options.LiveSymbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        var order = BuildWhatIfOrderTemplate(_options.WhatIfTemplate, _options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.LiveSymbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+        var whatIfIntent = BuildWhatIfIntent(_options.WhatIfTemplate, _options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice);
+        var order = brokerAdapter.BuildOrder(whatIfIntent);
 
         order.OrderId = nextOrderId;
         order.WhatIf = true;
         order.Transmit = true;
         order.OrderRef = $"HARVESTER_WHATIF_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
 
-        client.placeOrder(order.OrderId, contract, order);
-        client.reqOpenOrders();
+        brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
+        brokerAdapter.RequestOpenOrders(client);
 
         var whatIfTask = _wrapper.WhatIfOpenOrderTask;
         var openEndTask = _wrapper.OpenOrderEndTask;
@@ -833,18 +861,15 @@ public sealed class SnapshotRuntime
         Console.WriteLine("[INFO] What-if only: no live transmission.");
     }
 
-    private static Order BuildWhatIfOrderTemplate(string template, string action, double quantity, double limitPrice)
+    private static BrokerOrderIntent BuildWhatIfIntent(string template, string action, double quantity, double limitPrice)
     {
         return template.ToLowerInvariant() switch
         {
-            "mkt" => OrderFactory.Market(action, quantity),
-            "lmt" => OrderFactory.Limit(action, quantity, limitPrice),
-            "stp" => OrderFactory.Stop(action, quantity, stopPrice: Math.Max(0.01, limitPrice - 0.2)),
-            "stp_lmt" => OrderFactory.StopLimit(action, quantity, stopPrice: Math.Max(0.01, limitPrice - 0.2), limitPrice),
-            "mit" => OrderFactory.MarketIfTouched(action, quantity, triggerPrice: limitPrice),
-            "trailing" => OrderFactory.TrailingStop(action, quantity, trailingAmount: 0.25),
-            "adaptive" => OrderFactory.Adaptive(OrderFactory.Limit(action, quantity, limitPrice), "Normal"),
-            _ => throw new InvalidOperationException("Unsupported --whatif-template. Use mkt|lmt|stp|stp_lmt|mit|trailing|adaptive")
+            "mkt" => new BrokerOrderIntent(action, "MKT", quantity, WhatIf: true),
+            "lmt" => new BrokerOrderIntent(action, "LMT", quantity, LimitPrice: limitPrice, WhatIf: true),
+            "stp" => new BrokerOrderIntent(action, "STP", quantity, StopPrice: Math.Max(0.01, limitPrice - 0.2), WhatIf: true),
+            "stp_lmt" => new BrokerOrderIntent(action, "STP LMT", quantity, LimitPrice: limitPrice, StopPrice: Math.Max(0.01, limitPrice - 0.2), WhatIf: true),
+            _ => throw new InvalidOperationException("Unsupported --whatif-template. Use mkt|lmt|stp|stp_lmt")
         };
     }
 
@@ -1332,7 +1357,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Option chain export: {chainPath} (rows={_wrapper.OptionChains.Count})");
     }
 
-    private async Task RunOptionExerciseMode(EClientSocket client, CancellationToken token)
+    private async Task RunOptionExerciseMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOptionExerciseMode));
         if (!_options.OptionExerciseAllow)
@@ -1340,15 +1365,15 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Option exercise blocked: set --option-exercise-allow true to proceed.");
         }
 
-        var option = ContractFactory.Option(
+        var option = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Option,
             _options.OptionSymbol,
-            _options.OptionExpiry,
-            _options.OptionStrike,
-            _options.OptionRight,
-            exchange: _options.OptionExchange,
-            currency: _options.OptionCurrency,
-            multiplier: _options.OptionMultiplier
-        );
+            _options.OptionExchange,
+            _options.OptionCurrency,
+            Expiry: _options.OptionExpiry,
+            Strike: _options.OptionStrike,
+            Right: _options.OptionRight,
+            Multiplier: _options.OptionMultiplier));
 
         client.exerciseOptions(
             9803,
@@ -1360,7 +1385,7 @@ public sealed class SnapshotRuntime
         );
 
         await Task.Delay(TimeSpan.FromSeconds(2), token);
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -1771,7 +1796,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Crypto historical bars export: {path} (rows={_wrapper.HistoricalBars.Count})");
     }
 
-    private async Task RunCryptoOrderPlacementMode(EClientSocket client, CancellationToken token)
+    private async Task RunCryptoOrderPlacementMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunCryptoOrderPlacementMode));
         if (!_options.CryptoOrderAllow)
@@ -1801,19 +1826,27 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException($"Crypto order blocked: notional {notional:F2} exceeds --crypto-max-notional {_options.CryptoMaxNotional:F2}.");
         }
 
-        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
-        var order = OrderFactory.Limit(action, _options.CryptoOrderQuantity, _options.CryptoOrderLimit);
+        var crypto = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Crypto,
+            _options.CryptoSymbol,
+            _options.CryptoExchange,
+            _options.CryptoCurrency));
+        var order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+            action,
+            "LMT",
+            _options.CryptoOrderQuantity,
+            LimitPrice: _options.CryptoOrderLimit));
         var nextOrderId = await _wrapper.NextValidIdTask;
 
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_CRYPTO_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
 
-        client.placeOrder(order.OrderId, crypto, order);
+        brokerAdapter.PlaceOrder(client, order.OrderId, crypto, order);
         Console.WriteLine($"[OK] Crypto order transmitted: orderId={order.OrderId} symbol={_options.CryptoSymbol} action={action} qty={_options.CryptoOrderQuantity} lmt={_options.CryptoOrderLimit}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -2029,7 +2062,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] FA model account-updates export: {updatesPath} (rows={updates.Length})");
     }
 
-    private async Task RunFaOrderPlacementMode(EClientSocket client, CancellationToken token)
+    private async Task RunFaOrderPlacementMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunFaOrderPlacementMode));
         if (!_options.FaOrderAllow)
@@ -2064,45 +2097,33 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException($"FA order blocked: notional {notional:F2} exceeds --fa-max-notional {_options.FaMaxNotional:F2}.");
         }
 
-        var contract = ContractFactory.Stock(
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
             _options.FaOrderSymbol,
-            exchange: _options.FaOrderExchange,
-            currency: _options.FaOrderCurrency,
-            primaryExchange: _options.FaOrderPrimaryExchange
-        );
+            _options.FaOrderExchange,
+            _options.FaOrderCurrency,
+            _options.FaOrderPrimaryExchange));
 
-        var order = OrderFactory.Limit(action, _options.FaOrderQuantity, _options.FaOrderLimit);
+        var order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+            action,
+            "LMT",
+            _options.FaOrderQuantity,
+            LimitPrice: _options.FaOrderLimit,
+            Account: string.IsNullOrWhiteSpace(_options.FaOrderAccount) ? _options.Account : _options.FaOrderAccount,
+            FaGroup: _options.FaOrderGroup,
+            FaProfile: _options.FaOrderProfile,
+            FaMethod: _options.FaOrderMethod,
+            FaPercentage: _options.FaOrderPercentage));
         var nextOrderId = await _wrapper.NextValidIdTask;
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_FA_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
-        order.Account = string.IsNullOrWhiteSpace(_options.FaOrderAccount) ? _options.Account : _options.FaOrderAccount;
 
-        if (!string.IsNullOrWhiteSpace(_options.FaOrderGroup))
-        {
-            order.FaGroup = _options.FaOrderGroup;
-        }
-
-        if (!string.IsNullOrWhiteSpace(_options.FaOrderMethod))
-        {
-            order.FaMethod = _options.FaOrderMethod;
-        }
-
-        if (!string.IsNullOrWhiteSpace(_options.FaOrderPercentage))
-        {
-            order.FaPercentage = _options.FaOrderPercentage;
-        }
-
-        if (!string.IsNullOrWhiteSpace(_options.FaOrderProfile))
-        {
-            order.FaProfile = _options.FaOrderProfile;
-        }
-
-        client.placeOrder(order.OrderId, contract, order);
+        brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         Console.WriteLine($"[OK] FA order transmitted: orderId={order.OrderId} symbol={_options.FaOrderSymbol} action={action} qty={_options.FaOrderQuantity} lmt={_options.FaOrderLimit}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
-        client.reqOpenOrders();
+        brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");

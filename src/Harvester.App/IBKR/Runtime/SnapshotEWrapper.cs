@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Wrapper;
 using IBApi;
 
@@ -6,6 +7,7 @@ namespace Harvester.App.IBKR.Runtime;
 
 public sealed class SnapshotEWrapper : HarvesterEWrapper
 {
+    private readonly IBrokerAdapter _brokerAdapter = new IbBrokerAdapter();
     private readonly TaskCompletionSource<bool> _currentTimeTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _accountSummaryEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _openOrderEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -72,6 +74,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<ScannerDataRow> ScannerDataRows { get; } = new();
     public ConcurrentQueue<ScannerParametersRow> ScannerParametersRows { get; } = new();
     public ConcurrentQueue<MarketDataSanitizationRow> MarketDataSanitizationRows { get; } = new();
+    public ConcurrentQueue<CanonicalOrderEvent> CanonicalOrderEvents { get; } = new();
 
     public Task<bool> CurrentTimeTask => _currentTimeTcs.Task;
     public Task<bool> AccountSummaryEndTask => _accountSummaryEndTcs.Task;
@@ -123,6 +126,8 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public override void openOrder(int orderId, Contract contract, Order order, OrderState orderState)
     {
         base.openOrder(orderId, contract, order, orderState);
+
+        CanonicalOrderEvents.Enqueue(_brokerAdapter.TranslateOpenOrder(DateTime.UtcNow, orderId, contract, order, orderState));
 
         OpenOrders.Enqueue(new OpenOrderRow(
             orderId,
@@ -762,6 +767,36 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
         ));
 
         _scannerParametersTcs.TrySetResult(true);
+    }
+
+    public override void orderStatus(
+        int orderId,
+        string status,
+        double filled,
+        double remaining,
+        double avgFillPrice,
+        int permId,
+        int parentId,
+        double lastFillPrice,
+        int clientId,
+        string whyHeld,
+        double mktCapPrice)
+    {
+        base.orderStatus(orderId, status, filled, remaining, avgFillPrice, permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice);
+
+        CanonicalOrderEvents.Enqueue(_brokerAdapter.TranslateOrderStatus(
+            DateTime.UtcNow,
+            orderId,
+            status,
+            filled,
+            remaining,
+            avgFillPrice,
+            permId,
+            parentId,
+            lastFillPrice,
+            clientId,
+            whyHeld,
+            mktCapPrice));
     }
 
     private static bool IsFinite(double value)
