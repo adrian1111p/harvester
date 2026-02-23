@@ -75,4 +75,69 @@ public sealed class IbBrokerAdapter : IBrokerAdapter
     {
         client.placeOrder(orderId, contract, order);
     }
+
+    public void RequestMarketDataType(EClientSocket client, int marketDataType)
+    {
+        client.reqMarketDataType(marketDataType);
+    }
+
+    public void RequestMarketData(EClientSocket client, int requestId, Contract contract, string genericTickList = "")
+    {
+        client.reqMktData(requestId, contract, genericTickList, false, false, new List<TagValue>());
+    }
+
+    public void CancelMarketData(EClientSocket client, int requestId)
+    {
+        client.cancelMktData(requestId);
+    }
+
+    public void RequestMarketDepth(EClientSocket client, int requestId, Contract contract, int rows, bool isSmartDepth)
+    {
+        client.reqMarketDepth(requestId, contract, rows, isSmartDepth, new List<TagValue>());
+    }
+
+    public void CancelMarketDepth(EClientSocket client, int requestId, bool isSmartDepth)
+    {
+        client.cancelMktDepth(requestId, isSmartDepth);
+    }
+
+    public void RequestRealtimeBars(EClientSocket client, int requestId, Contract contract, string whatToShow, bool useRth)
+    {
+        client.reqRealTimeBars(requestId, contract, 5, whatToShow, useRth, new List<TagValue>());
+    }
+
+    public void CancelRealtimeBars(EClientSocket client, int requestId)
+    {
+        client.cancelRealTimeBars(requestId);
+    }
+
+    public void RequestHistoricalData(
+        EClientSocket client,
+        int requestId,
+        Contract contract,
+        string endDateTime,
+        string duration,
+        string barSize,
+        string whatToShow,
+        int useRth,
+        int formatDate,
+        bool keepUpToDate)
+    {
+        client.reqHistoricalData(
+            requestId,
+            contract,
+            endDateTime,
+            duration,
+            barSize,
+            whatToShow,
+            useRth,
+            formatDate,
+            keepUpToDate,
+            new List<TagValue>());
+    }
+
+    public void CancelHistoricalData(EClientSocket client, int requestId)
+    {
+        client.cancelHistoricalData(requestId);
+    }
 }

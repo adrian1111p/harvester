@@ -108,22 +108,22 @@ public sealed class SnapshotRuntime
                     await RunOrdersWhatIfMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.TopData:
-                    await RunTopDataMode(client, runtimeCts.Token);
+                    await RunTopDataMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.MarketDepth:
-                    await RunMarketDepthMode(client, runtimeCts.Token);
+                    await RunMarketDepthMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.RealtimeBars:
-                    await RunRealtimeBarsMode(client, runtimeCts.Token);
+                    await RunRealtimeBarsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.MarketDataAll:
-                    await RunMarketDataAllMode(client, runtimeCts.Token);
+                    await RunMarketDataAllMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalBars:
-                    await RunHistoricalBarsMode(client, runtimeCts.Token);
+                    await RunHistoricalBarsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.HistoricalBarsKeepUpToDate:
-                    await RunHistoricalBarsKeepUpToDateMode(client, runtimeCts.Token);
+                    await RunHistoricalBarsKeepUpToDateMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.Histogram:
                     await RunHistogramMode(client, runtimeCts.Token);
@@ -177,7 +177,7 @@ public sealed class SnapshotRuntime
                     await RunCryptoStreamingMode(client, runtimeCts.Token);
                     break;
                 case RunMode.CryptoHistorical:
-                    await RunCryptoHistoricalMode(client, runtimeCts.Token);
+                    await RunCryptoHistoricalMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.CryptoOrder:
                     await RunCryptoOrderPlacementMode(client, brokerAdapter, runtimeCts.Token);
@@ -907,16 +907,21 @@ public sealed class SnapshotRuntime
         };
     }
 
-    private async Task RunTopDataMode(EClientSocket client, CancellationToken token)
+    private async Task RunTopDataMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
         const int reqId = 9401;
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMktData(reqId, contract, string.Empty, false, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, reqId, contract);
 
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelMktData(reqId);
+        brokerAdapter.CancelMarketData(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -933,16 +938,21 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Top data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
-    private async Task RunMarketDepthMode(EClientSocket client, CancellationToken token)
+    private async Task RunMarketDepthMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: _options.DepthExchange, primaryExchange: _options.PrimaryExchange);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            _options.DepthExchange,
+            "USD",
+            _options.PrimaryExchange));
         const int reqId = 9402;
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMarketDepth(reqId, contract, _options.DepthRows, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketDepth(client, reqId, contract, _options.DepthRows, isSmartDepth: false);
 
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelMktDepth(reqId, false);
+        brokerAdapter.CancelMarketDepth(client, reqId, isSmartDepth: false);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -955,16 +965,21 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Depth data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
-    private async Task RunRealtimeBarsMode(EClientSocket client, CancellationToken token)
+    private async Task RunRealtimeBarsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
         const int reqId = 9403;
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqRealTimeBars(reqId, contract, 5, _options.RealTimeBarsWhatToShow, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestRealtimeBars(client, reqId, contract, _options.RealTimeBarsWhatToShow, useRth: false);
 
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelRealTimeBars(reqId);
+        brokerAdapter.CancelRealtimeBars(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -974,28 +989,38 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Realtime bars export: {barsPath} (rows={_wrapper.RealtimeBars.Count})");
     }
 
-    private async Task RunMarketDataAllMode(EClientSocket client, CancellationToken token)
+    private async Task RunMarketDataAllMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
 
-        var topContract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
-        var depthContract = ContractFactory.Stock(_options.Symbol, exchange: _options.DepthExchange, primaryExchange: _options.PrimaryExchange);
+        var topContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+        var depthContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            _options.DepthExchange,
+            "USD",
+            _options.PrimaryExchange));
 
         const int topReqId = 9501;
         const int depthReqId = 9502;
         const int barsReqId = 9503;
 
-        client.reqMarketDataType(_options.MarketDataType);
-        client.reqMktData(topReqId, topContract, string.Empty, false, false, new List<TagValue>());
-        client.reqMarketDepth(depthReqId, depthContract, _options.DepthRows, false, new List<TagValue>());
-        client.reqRealTimeBars(barsReqId, topContract, 5, _options.RealTimeBarsWhatToShow, false, new List<TagValue>());
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, topReqId, topContract);
+        brokerAdapter.RequestMarketDepth(client, depthReqId, depthContract, _options.DepthRows, isSmartDepth: false);
+        brokerAdapter.RequestRealtimeBars(client, barsReqId, topContract, _options.RealTimeBarsWhatToShow, useRth: false);
 
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
 
-        client.cancelMktData(topReqId);
-        client.cancelMktDepth(depthReqId, false);
-        client.cancelRealTimeBars(barsReqId);
+        brokerAdapter.CancelMarketData(client, topReqId);
+        brokerAdapter.CancelMarketDepth(client, depthReqId, isSmartDepth: false);
+        brokerAdapter.CancelRealtimeBars(client, barsReqId);
 
         var topPath = Path.Combine(outputDir, $"top_data_{_options.Symbol}_{timestamp}.json");
         var typePath = Path.Combine(outputDir, $"top_data_type_{_options.Symbol}_{timestamp}.json");
@@ -1038,14 +1063,20 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Market data report: {reportPath}");
     }
 
-    private async Task RunHistoricalBarsMode(EClientSocket client, CancellationToken token)
+    private async Task RunHistoricalBarsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
 
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
         const int reqId = 9601;
 
-        client.reqHistoricalData(
+        brokerAdapter.RequestHistoricalData(
+            client,
             reqId,
             contract,
             _options.HistoricalEndDateTime,
@@ -1054,8 +1085,7 @@ public sealed class SnapshotRuntime
             _options.HistoricalWhatToShow,
             _options.HistoricalUseRth,
             _options.HistoricalFormatDate,
-            false,
-            new List<TagValue>()
+            keepUpToDate: false
         );
 
         await AwaitWithTimeout(_wrapper.HistoricalDataEndTask, token, "historicalDataEnd");
@@ -1078,7 +1108,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Historical bars canonical export: {canonicalBarsPath} (rows={canonicalBars.Count})");
     }
 
-    private async Task RunHistoricalBarsKeepUpToDateMode(EClientSocket client, CancellationToken token)
+    private async Task RunHistoricalBarsKeepUpToDateMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
 
@@ -1092,10 +1122,16 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Historical keepUpToDate requires bar size >= 5 secs.");
         }
 
-        var contract = ContractFactory.Stock(_options.Symbol, exchange: "SMART", primaryExchange: _options.PrimaryExchange);
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
         const int reqId = 9602;
 
-        client.reqHistoricalData(
+        brokerAdapter.RequestHistoricalData(
+            client,
             reqId,
             contract,
             string.Empty,
@@ -1104,12 +1140,11 @@ public sealed class SnapshotRuntime
             _options.HistoricalWhatToShow,
             _options.HistoricalUseRth,
             _options.HistoricalFormatDate,
-            true,
-            new List<TagValue>()
+            keepUpToDate: true
         );
 
         await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
-        client.cancelHistoricalData(reqId);
+        brokerAdapter.CancelHistoricalData(client, reqId);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -1833,13 +1868,18 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Crypto market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
     }
 
-    private async Task RunCryptoHistoricalMode(EClientSocket client, CancellationToken token)
+    private async Task RunCryptoHistoricalMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
 
-        var crypto = ContractFactory.Crypto(_options.CryptoSymbol, exchange: _options.CryptoExchange, currency: _options.CryptoCurrency);
+        var crypto = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Crypto,
+            _options.CryptoSymbol,
+            _options.CryptoExchange,
+            _options.CryptoCurrency));
 
-        client.reqHistoricalData(
+        brokerAdapter.RequestHistoricalData(
+            client,
             9905,
             crypto,
             _options.HistoricalEndDateTime,
@@ -1848,8 +1888,7 @@ public sealed class SnapshotRuntime
             _options.HistoricalWhatToShow,
             _options.HistoricalUseRth,
             _options.HistoricalFormatDate,
-            false,
-            new List<TagValue>()
+            keepUpToDate: false
         );
 
         try

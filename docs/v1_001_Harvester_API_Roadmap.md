@@ -708,6 +708,16 @@ This checklist merges:
 
 Use IDs directly as tracker tickets (Azure DevOps/Jira/GitHub Issues).
 
+### 15.0 Execution Status (as of 2026-02-23)
+
+- ✅ **HV-001..HV-005 completed** (foundation + reconciliation)
+- ✅ **HV-006..HV-009 completed** (reconnect ladder + lifecycle + runtime state store)
+- ✅ **HV-010..HV-012 completed** (contract/order translation + vendor-neutral historical ingestion)
+- ✅ **HV-013..HV-016 completed** (FA strictness + pre-trade DSL + cost telemetry + clock-skew gate)
+
+Latest implementation commits in sequence:
+- `45ff822`, `e5b242b`, `6884dbb`, `e60ca1e`, `e1da135`, `bcdd38c`, `41cf79e`, `75949c0`, `248ce7a`, `3709893`
+
 ### 15.1 P0 — Reliability + Runtime Foundation (must finish first)
 
 - **HV-001 — Implement `IbErrorPolicy` classification/throttling (LEAN)**

@@ -33,6 +33,25 @@ public interface IBrokerAdapter
     void RequestExecutions(EClientSocket client, int requestId, ExecutionFilter filter);
     void RequestContractDetails(EClientSocket client, int requestId, Contract contract);
     void PlaceOrder(EClientSocket client, int orderId, Contract contract, Order order);
+    void RequestMarketDataType(EClientSocket client, int marketDataType);
+    void RequestMarketData(EClientSocket client, int requestId, Contract contract, string genericTickList = "");
+    void CancelMarketData(EClientSocket client, int requestId);
+    void RequestMarketDepth(EClientSocket client, int requestId, Contract contract, int rows, bool isSmartDepth);
+    void CancelMarketDepth(EClientSocket client, int requestId, bool isSmartDepth);
+    void RequestRealtimeBars(EClientSocket client, int requestId, Contract contract, string whatToShow, bool useRth);
+    void CancelRealtimeBars(EClientSocket client, int requestId);
+    void RequestHistoricalData(
+        EClientSocket client,
+        int requestId,
+        Contract contract,
+        string endDateTime,
+        string duration,
+        string barSize,
+        string whatToShow,
+        int useRth,
+        int formatDate,
+        bool keepUpToDate);
+    void CancelHistoricalData(EClientSocket client, int requestId);
 }
 
 public enum BrokerAssetType
