@@ -13,6 +13,7 @@ public sealed class SnapshotRuntime
     private readonly SnapshotEWrapper _wrapper;
     private readonly IbErrorPolicy _errorPolicy;
     private readonly RequestRegistry _requestRegistry;
+    private bool _hasReconciliationQualityFailure;
 
     public SnapshotRuntime(AppOptions options)
     {
@@ -203,11 +204,15 @@ public sealed class SnapshotRuntime
 
             var hasBlockingErrors = _wrapper.ApiErrors
                 .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
-            if (hasBlockingErrors)
+            if (hasBlockingErrors || _hasReconciliationQualityFailure)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
                 PrintErrors();
                 PrintRequestDiagnostics();
+                if (_hasReconciliationQualityFailure)
+                {
+                    Console.WriteLine("[WARN] Completed with reconciliation quality gate failure.");
+                }
                 return 1;
             }
 
@@ -312,6 +317,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
         Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
         Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
+        EvaluateReconciliationQualityGate(reconciliation.Summary, nameof(RunOrdersMode));
     }
 
     private async Task RunPositionsMode(EClientSocket client, CancellationToken token)
@@ -408,6 +414,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
         Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
         Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
+        EvaluateReconciliationQualityGate(reconciliation.Summary, nameof(RunSnapshotAllMode));
         Console.WriteLine($"[OK] Account summary: {accountSummaryPath} (rows={_wrapper.AccountSummaryRows.Count})");
         Console.WriteLine($"[OK] Positions: {positionsPath} (rows={_wrapper.Positions.Count})");
         Console.WriteLine($"[OK] Snapshot report: {reportPath}");
@@ -2841,6 +2848,42 @@ public sealed class SnapshotRuntime
         }
     }
 
+    private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
+    {
+        if (_options.ReconciliationGateAction == ReconciliationGateAction.Off)
+        {
+            return;
+        }
+
+        var violations = new List<string>();
+        if (summary.ExecutionCommissionCoveragePct < _options.ReconciliationMinCommissionCoverage)
+        {
+            violations.Add(
+                $"execution->commission coverage {summary.ExecutionCommissionCoveragePct:P2} < threshold {_options.ReconciliationMinCommissionCoverage:P2}");
+        }
+
+        if (summary.ExecutionOrderMetadataCoveragePct < _options.ReconciliationMinOrderCoverage)
+        {
+            violations.Add(
+                $"execution->order coverage {summary.ExecutionOrderMetadataCoveragePct:P2} < threshold {_options.ReconciliationMinOrderCoverage:P2}");
+        }
+
+        if (violations.Count == 0)
+        {
+            return;
+        }
+
+        var message = $"[{context}] reconciliation quality gate violations: {string.Join("; ", violations)}";
+        if (_options.ReconciliationGateAction == ReconciliationGateAction.Warn)
+        {
+            Console.WriteLine($"[WARN] {message}");
+            return;
+        }
+
+        Console.WriteLine($"[FAIL] {message}");
+        _hasReconciliationQualityFailure = true;
+    }
+
     private bool IsBlockingErrorForCurrentMode(string error)
     {
         if (_options.Mode == RunMode.OptionGreeks && _options.OptionGreeksAutoFallback)
@@ -3065,7 +3108,10 @@ public sealed record AppOptions(
     int ScannerWorkbenchMinRows,
     int DisplayGroupId,
     string DisplayGroupContractInfo,
-    int DisplayGroupCaptureSeconds
+    int DisplayGroupCaptureSeconds,
+    ReconciliationGateAction ReconciliationGateAction,
+    double ReconciliationMinCommissionCoverage,
+    double ReconciliationMinOrderCoverage
 )
 {
     public static AppOptions Parse(string[] args)
@@ -3176,6 +3222,9 @@ public sealed record AppOptions(
         var displayGroupId = 1;
         var displayGroupContractInfo = "265598@SMART";
         var displayGroupCaptureSeconds = 4;
+        var reconciliationGateAction = ReconciliationGateAction.Warn;
+        var reconciliationMinCommissionCoverage = 0.80;
+        var reconciliationMinOrderCoverage = 0.95;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -3545,6 +3594,17 @@ public sealed record AppOptions(
                     displayGroupCaptureSeconds = dgcs;
                     i++;
                     break;
+                case "--recon-gate-action" when i + 1 < args.Length:
+                    reconciliationGateAction = ParseReconciliationGateAction(args[++i]);
+                    break;
+                case "--recon-min-commission-coverage" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rmcc):
+                    reconciliationMinCommissionCoverage = rmcc;
+                    i++;
+                    break;
+                case "--recon-min-order-coverage" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rmoc):
+                    reconciliationMinOrderCoverage = rmoc;
+                    i++;
+                    break;
             }
         }
 
@@ -3654,8 +3714,22 @@ public sealed record AppOptions(
             scannerWorkbenchMinRows,
             displayGroupId,
             displayGroupContractInfo,
-            displayGroupCaptureSeconds
+            displayGroupCaptureSeconds,
+            reconciliationGateAction,
+            reconciliationMinCommissionCoverage,
+            reconciliationMinOrderCoverage
         );
+    }
+
+    private static ReconciliationGateAction ParseReconciliationGateAction(string value)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "off" => ReconciliationGateAction.Off,
+            "warn" => ReconciliationGateAction.Warn,
+            "fail" => ReconciliationGateAction.Fail,
+            _ => throw new ArgumentException($"Unknown reconciliation gate action '{value}'. Use off|warn|fail.")
+        };
     }
 
     private static RunMode ParseMode(string value)
@@ -3714,6 +3788,13 @@ public sealed record AppOptions(
             _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe.")
         };
     }
+}
+
+public enum ReconciliationGateAction
+{
+    Off,
+    Warn,
+    Fail
 }
 
 public enum RunMode
