@@ -72,6 +72,7 @@ The low-level IBKR API classes themselves (`EClientSocket`, `EWrapper`, `Contrac
   - contracts/orders: `contracts-validate`, `orders-dryrun`, `orders-place-sim`, `orders-whatif`
   - streaming market data: `top-data`, `market-depth`, `realtime-bars`, `market-data-all`
   - historical market data: `historical-bars`, `historical-bars-live`, `histogram`, `historical-ticks`, `head-timestamp`
+  - account & portfolio: `managed-accounts`, `family-codes`, `account-updates`, `account-updates-multi`, `account-summary`, `positions-multi`, `pnl-account`, `pnl-single`
   - implementation files:
     - [src/Harvester.App/IBKR/Connection/IbkrSession.cs](src/Harvester.App/IBKR/Connection/IbkrSession.cs)
     - [src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs](src/Harvester.App/IBKR/Runtime/SnapshotEWrapper.cs)

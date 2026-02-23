@@ -88,6 +88,30 @@ public sealed class SnapshotRuntime
                 case RunMode.HeadTimestamp:
                     await RunHeadTimestampMode(client, timeoutCts.Token);
                     break;
+                case RunMode.ManagedAccounts:
+                    await RunManagedAccountsMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.FamilyCodes:
+                    await RunFamilyCodesMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.AccountUpdates:
+                    await RunAccountUpdatesMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.AccountUpdatesMulti:
+                    await RunAccountUpdatesMultiMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.AccountSummaryOnly:
+                    await RunAccountSummaryOnlyMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.PositionsMulti:
+                    await RunPositionsMultiMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.PnlAccount:
+                    await RunPnlAccountMode(client, timeoutCts.Token);
+                    break;
+                case RunMode.PnlSingle:
+                    await RunPnlSingleMode(client, timeoutCts.Token);
+                    break;
             }
 
             var hasBlockingErrors = _wrapper.Errors.Any(IsBlockingError);
@@ -726,6 +750,163 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Head timestamp export: {headPath} (rows={_wrapper.HeadTimestamps.Count})");
     }
 
+    private async Task RunManagedAccountsMode(EClientSocket client, CancellationToken token)
+    {
+        client.reqManagedAccts();
+        var accountsList = await AwaitWithTimeout(_wrapper.ManagedAccountsTask, token, "managedAccounts");
+
+        var accounts = accountsList
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(a => new ManagedAccountRow(DateTime.UtcNow, a))
+            .ToArray();
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"managed_accounts_{timestamp}.json");
+        WriteJson(path, accounts);
+
+        Console.WriteLine($"[OK] Managed accounts export: {path} (rows={accounts.Length})");
+    }
+
+    private async Task RunFamilyCodesMode(EClientSocket client, CancellationToken token)
+    {
+        client.reqFamilyCodes();
+        await AwaitWithTimeout(_wrapper.FamilyCodesTask, token, "familyCodes");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"family_codes_{timestamp}.json");
+        WriteJson(path, _wrapper.FamilyCodesRows.ToArray());
+
+        Console.WriteLine($"[OK] Family codes export: {path} (rows={_wrapper.FamilyCodesRows.Count})");
+    }
+
+    private async Task RunAccountUpdatesMode(EClientSocket client, CancellationToken token)
+    {
+        var subscriptionAccount = string.IsNullOrWhiteSpace(_options.UpdateAccount) ? _options.Account : _options.UpdateAccount;
+
+        client.reqAccountUpdates(true, subscriptionAccount);
+        await AwaitWithTimeout(_wrapper.AccountDownloadEndTask, token, "accountDownloadEnd");
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.reqAccountUpdates(false, subscriptionAccount);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var valuesPath = Path.Combine(outputDir, $"account_updates_values_{timestamp}.json");
+        var portfolioPath = Path.Combine(outputDir, $"account_updates_portfolio_{timestamp}.json");
+        var timesPath = Path.Combine(outputDir, $"account_updates_time_{timestamp}.json");
+
+        WriteJson(valuesPath, _wrapper.AccountValueUpdates.ToArray());
+        WriteJson(portfolioPath, _wrapper.PortfolioUpdates.ToArray());
+        WriteJson(timesPath, _wrapper.AccountUpdateTimes.ToArray());
+
+        Console.WriteLine($"[OK] Account update values export: {valuesPath} (rows={_wrapper.AccountValueUpdates.Count})");
+        Console.WriteLine($"[OK] Account update portfolio export: {portfolioPath} (rows={_wrapper.PortfolioUpdates.Count})");
+        Console.WriteLine($"[OK] Account update times export: {timesPath} (rows={_wrapper.AccountUpdateTimes.Count})");
+    }
+
+    private async Task RunAccountUpdatesMultiMode(EClientSocket client, CancellationToken token)
+    {
+        const int reqId = 9701;
+        client.reqAccountUpdatesMulti(reqId, _options.AccountUpdatesMultiAccount, _options.ModelCode, true);
+        await AwaitWithTimeout(_wrapper.AccountUpdateMultiEndTask, token, "accountUpdateMultiEnd");
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.cancelAccountUpdatesMulti(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"account_updates_multi_{timestamp}.json");
+        WriteJson(path, _wrapper.AccountUpdateMultiRows.ToArray());
+
+        Console.WriteLine($"[OK] Account updates multi export: {path} (rows={_wrapper.AccountUpdateMultiRows.Count})");
+    }
+
+    private async Task RunAccountSummaryOnlyMode(EClientSocket client, CancellationToken token)
+    {
+        const int reqId = 9702;
+        client.reqAccountSummary(reqId, _options.AccountSummaryGroup, _options.AccountSummaryTags);
+        await AwaitWithTimeout(_wrapper.AccountSummaryEndTask, token, "accountSummaryEnd");
+        client.cancelAccountSummary(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"account_summary_subscription_{timestamp}.json");
+        WriteJson(path, _wrapper.AccountSummaryRows.ToArray());
+
+        Console.WriteLine($"[OK] Account summary export: {path} (rows={_wrapper.AccountSummaryRows.Count})");
+    }
+
+    private async Task RunPositionsMultiMode(EClientSocket client, CancellationToken token)
+    {
+        const int reqId = 9703;
+        client.reqPositionsMulti(reqId, _options.PositionsMultiAccount, _options.ModelCode);
+        await AwaitWithTimeout(_wrapper.PositionMultiEndTask, token, "positionMultiEnd");
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.cancelPositionsMulti(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"positions_multi_{timestamp}.json");
+        WriteJson(path, _wrapper.PositionMultiRows.ToArray());
+
+        Console.WriteLine($"[OK] Positions multi export: {path} (rows={_wrapper.PositionMultiRows.Count})");
+    }
+
+    private async Task RunPnlAccountMode(EClientSocket client, CancellationToken token)
+    {
+        const int reqId = 9704;
+        var pnlAccount = string.IsNullOrWhiteSpace(_options.PnlAccount) ? _options.Account : _options.PnlAccount;
+
+        client.reqPnL(reqId, pnlAccount, _options.ModelCode);
+        await AwaitWithTimeout(_wrapper.PnlFirstTask, token, "pnl");
+        await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        client.cancelPnL(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"pnl_account_{timestamp}.json");
+        WriteJson(path, _wrapper.PnlRows.ToArray());
+
+        Console.WriteLine($"[OK] PnL account export: {path} (rows={_wrapper.PnlRows.Count})");
+    }
+
+    private async Task RunPnlSingleMode(EClientSocket client, CancellationToken token)
+    {
+        if (_options.PnlConId <= 0)
+        {
+            throw new InvalidOperationException("pnl-single mode requires --pnl-conid > 0.");
+        }
+
+        const int reqId = 9705;
+        var pnlAccount = string.IsNullOrWhiteSpace(_options.PnlAccount) ? _options.Account : _options.PnlAccount;
+
+        client.reqPnLSingle(reqId, pnlAccount, _options.ModelCode, _options.PnlConId);
+        var receivedFirstUpdate = true;
+        try
+        {
+            await AwaitWithTimeout(_wrapper.PnlSingleFirstTask, token, "pnlSingle");
+        }
+        catch (TimeoutException)
+        {
+            receivedFirstUpdate = false;
+            Console.WriteLine("[WARN] PnL single returned no update for the provided conId/account during capture window; exporting current rows.");
+        }
+
+        if (receivedFirstUpdate)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(_options.CaptureSeconds), token);
+        }
+
+        client.cancelPnLSingle(reqId);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"pnl_single_{_options.PnlConId}_{timestamp}.json");
+        WriteJson(path, _wrapper.PnlSingleRows.ToArray());
+
+        Console.WriteLine($"[OK] PnL single export: {path} (rows={_wrapper.PnlSingleRows.Count})");
+    }
+
     private static void ValidateHistoricalBarRequestLimitations(string duration, string barSize)
     {
         if (!TryParseDurationToSeconds(duration, out var durationSeconds))
@@ -920,7 +1101,7 @@ public sealed class SnapshotRuntime
 
     private static bool IsBlockingError(string error)
     {
-        var nonBlockingCodes = new[] { "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=10187", "code=354", "code=300", "code=310", "code=420" };
+        var nonBlockingCodes = new[] { "code=2100", "code=2104", "code=2106", "code=2158", "code=10089", "code=10167", "code=10168", "code=10187", "code=354", "code=322", "code=300", "code=310", "code=420" };
 
         if (error.Contains("code=162") && error.Contains("query cancelled", StringComparison.OrdinalIgnoreCase))
         {
@@ -990,7 +1171,15 @@ public sealed record AppOptions(
     int HistoricalTicksNumber,
     string HistoricalTicksWhatToShow,
     bool HistoricalTickIgnoreSize,
-    string HeadTimestampWhatToShow
+    string HeadTimestampWhatToShow,
+    string UpdateAccount,
+    string AccountSummaryGroup,
+    string AccountSummaryTags,
+    string AccountUpdatesMultiAccount,
+    string PositionsMultiAccount,
+    string ModelCode,
+    string PnlAccount,
+    int PnlConId
 )
 {
     public static AppOptions Parse(string[] args)
@@ -1032,6 +1221,14 @@ public sealed record AppOptions(
         var historicalTicksWhatToShow = "TRADES";
         var historicalTickIgnoreSize = true;
         var headTimestampWhatToShow = "TRADES";
+        var updateAccount = account;
+        var accountSummaryGroup = "All";
+        var accountSummaryTags = "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds";
+        var accountUpdatesMultiAccount = account;
+        var positionsMultiAccount = account;
+        var modelCode = string.Empty;
+        var pnlAccount = account;
+        var pnlConId = 0;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -1165,6 +1362,38 @@ public sealed record AppOptions(
                 case "--head-what" when i + 1 < args.Length:
                     headTimestampWhatToShow = args[++i].ToUpperInvariant();
                     break;
+                case "--update-account" when i + 1 < args.Length:
+                    updateAccount = args[++i];
+                    break;
+                case "--summary-group" when i + 1 < args.Length:
+                    accountSummaryGroup = args[++i];
+                    break;
+                case "--summary-tags" when i + 1 < args.Length:
+                    accountSummaryTags = args[++i];
+                    break;
+                case "--updates-multi-account" when i + 1 < args.Length:
+                    accountUpdatesMultiAccount = args[++i];
+                    break;
+                case "--positions-multi-account" when i + 1 < args.Length:
+                    positionsMultiAccount = args[++i];
+                    break;
+                case "--model-code":
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    {
+                        modelCode = args[++i];
+                    }
+                    else
+                    {
+                        modelCode = string.Empty;
+                    }
+                    break;
+                case "--pnl-account" when i + 1 < args.Length:
+                    pnlAccount = args[++i];
+                    break;
+                case "--pnl-conid" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pcon):
+                    pnlConId = pcon;
+                    i++;
+                    break;
             }
         }
 
@@ -1205,7 +1434,15 @@ public sealed record AppOptions(
             historicalTicksNumber,
             historicalTicksWhatToShow,
             historicalTickIgnoreSize,
-            headTimestampWhatToShow
+            headTimestampWhatToShow,
+            updateAccount,
+            accountSummaryGroup,
+            accountSummaryTags,
+            accountUpdatesMultiAccount,
+            positionsMultiAccount,
+            modelCode,
+            pnlAccount,
+            pnlConId
         );
     }
 
@@ -1230,7 +1467,15 @@ public sealed record AppOptions(
             "histogram" => RunMode.Histogram,
             "historical-ticks" => RunMode.HistoricalTicks,
             "head-timestamp" => RunMode.HeadTimestamp,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp.")
+            "managed-accounts" => RunMode.ManagedAccounts,
+            "family-codes" => RunMode.FamilyCodes,
+            "account-updates" => RunMode.AccountUpdates,
+            "account-updates-multi" => RunMode.AccountUpdatesMulti,
+            "account-summary" => RunMode.AccountSummaryOnly,
+            "positions-multi" => RunMode.PositionsMulti,
+            "pnl-account" => RunMode.PnlAccount,
+            "pnl-single" => RunMode.PnlSingle,
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single.")
         };
     }
 }
@@ -1253,7 +1498,15 @@ public enum RunMode
     HistoricalBarsKeepUpToDate,
     Histogram,
     HistoricalTicks,
-    HeadTimestamp
+    HeadTimestamp,
+    ManagedAccounts,
+    FamilyCodes,
+    AccountUpdates,
+    AccountUpdatesMulti,
+    AccountSummaryOnly,
+    PositionsMulti,
+    PnlAccount,
+    PnlSingle
 }
 
 public sealed record ContractDetailsRow(
@@ -1293,4 +1546,9 @@ public sealed record LiveOrderPlacementRow(
     double Notional,
     string Account,
     string OrderRef
+);
+
+public sealed record ManagedAccountRow(
+    DateTime TimestampUtc,
+    string AccountId
 );

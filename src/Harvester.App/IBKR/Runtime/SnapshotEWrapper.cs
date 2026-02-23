@@ -21,6 +21,12 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _histogramDataTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _historicalTicksDoneTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _headTimestampTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _familyCodesTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _accountDownloadEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _accountUpdateMultiEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _positionMultiEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _pnlFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _pnlSingleFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ConcurrentQueue<AccountSummaryRow> AccountSummaryRows { get; } = new();
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
@@ -39,6 +45,14 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public ConcurrentQueue<HistoricalTickBidAskRow> HistoricalTicksBidAsk { get; } = new();
     public ConcurrentQueue<HistoricalTickLastRow> HistoricalTicksLast { get; } = new();
     public ConcurrentQueue<HeadTimestampRow> HeadTimestamps { get; } = new();
+    public ConcurrentQueue<FamilyCodeRow> FamilyCodesRows { get; } = new();
+    public ConcurrentQueue<AccountValueUpdateRow> AccountValueUpdates { get; } = new();
+    public ConcurrentQueue<PortfolioUpdateRow> PortfolioUpdates { get; } = new();
+    public ConcurrentQueue<AccountUpdateTimeRow> AccountUpdateTimes { get; } = new();
+    public ConcurrentQueue<AccountUpdateMultiRow> AccountUpdateMultiRows { get; } = new();
+    public ConcurrentQueue<PositionMultiRow> PositionMultiRows { get; } = new();
+    public ConcurrentQueue<PnlRow> PnlRows { get; } = new();
+    public ConcurrentQueue<PnlSingleRow> PnlSingleRows { get; } = new();
 
     public Task<bool> CurrentTimeTask => _currentTimeTcs.Task;
     public Task<bool> AccountSummaryEndTask => _accountSummaryEndTcs.Task;
@@ -55,6 +69,12 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> HistogramDataTask => _histogramDataTcs.Task;
     public Task<bool> HistoricalTicksDoneTask => _historicalTicksDoneTcs.Task;
     public Task<bool> HeadTimestampTask => _headTimestampTcs.Task;
+    public Task<bool> FamilyCodesTask => _familyCodesTcs.Task;
+    public Task<bool> AccountDownloadEndTask => _accountDownloadEndTcs.Task;
+    public Task<bool> AccountUpdateMultiEndTask => _accountUpdateMultiEndTcs.Task;
+    public Task<bool> PositionMultiEndTask => _positionMultiEndTcs.Task;
+    public Task<bool> PnlFirstTask => _pnlFirstTcs.Task;
+    public Task<bool> PnlSingleFirstTask => _pnlSingleFirstTcs.Task;
 
     public override void currentTime(long time)
     {
@@ -414,6 +434,126 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
         HeadTimestamps.Enqueue(new HeadTimestampRow(DateTime.UtcNow, reqId, headTimestamp));
         _headTimestampTcs.TrySetResult(true);
     }
+
+    public override void familyCodes(FamilyCode[] familyCodes)
+    {
+        foreach (var familyCode in familyCodes)
+        {
+            FamilyCodesRows.Enqueue(new FamilyCodeRow(
+                DateTime.UtcNow,
+                familyCode.AccountID,
+                familyCode.FamilyCodeStr
+            ));
+        }
+
+        _familyCodesTcs.TrySetResult(true);
+    }
+
+    public override void updateAccountValue(string key, string value, string currency, string accountName)
+    {
+        AccountValueUpdates.Enqueue(new AccountValueUpdateRow(
+            DateTime.UtcNow,
+            accountName,
+            key,
+            value,
+            currency
+        ));
+    }
+
+    public override void updatePortfolio(Contract contract, double position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName)
+    {
+        PortfolioUpdates.Enqueue(new PortfolioUpdateRow(
+            DateTime.UtcNow,
+            accountName,
+            contract.ConId,
+            contract.Symbol,
+            contract.SecType,
+            contract.Currency,
+            contract.Exchange,
+            position,
+            marketPrice,
+            marketValue,
+            averageCost,
+            unrealizedPNL,
+            realizedPNL
+        ));
+    }
+
+    public override void updateAccountTime(string timestamp)
+    {
+        AccountUpdateTimes.Enqueue(new AccountUpdateTimeRow(DateTime.UtcNow, timestamp));
+    }
+
+    public override void accountDownloadEnd(string account)
+    {
+        _accountDownloadEndTcs.TrySetResult(true);
+    }
+
+    public override void accountUpdateMulti(int reqId, string account, string modelCode, string key, string value, string currency)
+    {
+        AccountUpdateMultiRows.Enqueue(new AccountUpdateMultiRow(
+            DateTime.UtcNow,
+            reqId,
+            account,
+            modelCode,
+            key,
+            value,
+            currency
+        ));
+    }
+
+    public override void accountUpdateMultiEnd(int reqId)
+    {
+        _accountUpdateMultiEndTcs.TrySetResult(true);
+    }
+
+    public override void positionMulti(int reqId, string account, string modelCode, Contract contract, double pos, double avgCost)
+    {
+        PositionMultiRows.Enqueue(new PositionMultiRow(
+            DateTime.UtcNow,
+            reqId,
+            account,
+            modelCode,
+            contract.ConId,
+            contract.Symbol,
+            contract.SecType,
+            contract.Currency,
+            contract.Exchange,
+            pos,
+            avgCost
+        ));
+    }
+
+    public override void positionMultiEnd(int reqId)
+    {
+        _positionMultiEndTcs.TrySetResult(true);
+    }
+
+    public override void pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL)
+    {
+        PnlRows.Enqueue(new PnlRow(
+            DateTime.UtcNow,
+            reqId,
+            dailyPnL,
+            unrealizedPnL,
+            realizedPnL
+        ));
+        _pnlFirstTcs.TrySetResult(true);
+    }
+
+    public override void pnlSingle(int reqId, int pos, double dailyPnL, double unrealizedPnL, double realizedPnL, double value)
+    {
+        PnlSingleRows.Enqueue(new PnlSingleRow(
+            DateTime.UtcNow,
+            reqId,
+            pos,
+            dailyPnL,
+            unrealizedPnL,
+            realizedPnL,
+            value
+        ));
+        _pnlSingleFirstTcs.TrySetResult(true);
+    }
 }
 
 public sealed record AccountSummaryRow(string Account, string Tag, string Value, string Currency);
@@ -604,4 +744,81 @@ public sealed record HeadTimestampRow(
     DateTime TimestampUtc,
     int RequestId,
     string HeadTimestamp
+);
+
+public sealed record FamilyCodeRow(
+    DateTime TimestampUtc,
+    string AccountId,
+    string FamilyCode
+);
+
+public sealed record AccountValueUpdateRow(
+    DateTime TimestampUtc,
+    string Account,
+    string Key,
+    string Value,
+    string Currency
+);
+
+public sealed record PortfolioUpdateRow(
+    DateTime TimestampUtc,
+    string Account,
+    int ConId,
+    string Symbol,
+    string SecurityType,
+    string Currency,
+    string Exchange,
+    double Position,
+    double MarketPrice,
+    double MarketValue,
+    double AverageCost,
+    double UnrealizedPnl,
+    double RealizedPnl
+);
+
+public sealed record AccountUpdateTimeRow(
+    DateTime TimestampUtc,
+    string AccountTimestamp
+);
+
+public sealed record AccountUpdateMultiRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Account,
+    string ModelCode,
+    string Key,
+    string Value,
+    string Currency
+);
+
+public sealed record PositionMultiRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string Account,
+    string ModelCode,
+    int ConId,
+    string Symbol,
+    string SecurityType,
+    string Currency,
+    string Exchange,
+    double Position,
+    double AverageCost
+);
+
+public sealed record PnlRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    double DailyPnl,
+    double UnrealizedPnl,
+    double RealizedPnl
+);
+
+public sealed record PnlSingleRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    int Position,
+    double DailyPnl,
+    double UnrealizedPnl,
+    double RealizedPnl,
+    double Value
 );
