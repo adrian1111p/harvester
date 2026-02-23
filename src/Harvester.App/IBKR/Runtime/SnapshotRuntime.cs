@@ -12,12 +12,14 @@ public sealed class SnapshotRuntime
     private readonly AppOptions _options;
     private readonly SnapshotEWrapper _wrapper;
     private readonly IbErrorPolicy _errorPolicy;
+    private readonly RequestRegistry _requestRegistry;
 
     public SnapshotRuntime(AppOptions options)
     {
         _options = options;
         _wrapper = new SnapshotEWrapper();
         _errorPolicy = new IbErrorPolicy();
+        _requestRegistry = new RequestRegistry();
     }
 
     public async Task<int> RunAsync()
@@ -39,7 +41,13 @@ public sealed class SnapshotRuntime
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.TimeoutSeconds));
 
             client.reqCurrentTime();
-            await AwaitWithTimeout(_wrapper.CurrentTimeTask, timeoutCts.Token, "currentTime");
+            await AwaitTrackedWithTimeout(
+                _wrapper.CurrentTimeTask,
+                timeoutCts.Token,
+                stage: "currentTime",
+                requestId: null,
+                requestType: "reqCurrentTime",
+                origin: _options.Mode.ToString());
             Console.WriteLine("[OK] currentTime callback received");
 
             switch (_options.Mode)
@@ -199,6 +207,7 @@ public sealed class SnapshotRuntime
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
                 PrintErrors();
+                PrintRequestDiagnostics();
                 return 1;
             }
 
@@ -209,12 +218,14 @@ public sealed class SnapshotRuntime
         {
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
+            PrintRequestDiagnostics();
             return 2;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[FAIL] {ex.Message}");
             PrintErrors();
+            PrintRequestDiagnostics();
             return 2;
         }
     }
@@ -223,7 +234,13 @@ public sealed class SnapshotRuntime
     {
         const int summaryReqId = 9001;
         client.reqAccountSummary(summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower");
-        await AwaitWithTimeout(_wrapper.AccountSummaryEndTask, token, "accountSummaryEnd");
+        await AwaitTrackedWithTimeout(
+            _wrapper.AccountSummaryEndTask,
+            token,
+            stage: "accountSummaryEnd",
+            requestId: summaryReqId,
+            requestType: "reqAccountSummary",
+            origin: nameof(RunConnectMode));
         client.cancelAccountSummary(summaryReqId);
 
         Console.WriteLine("\n=== Account Summary Rows ===");
@@ -236,13 +253,32 @@ public sealed class SnapshotRuntime
     private async Task RunOrdersMode(EClientSocket client, CancellationToken token)
     {
         client.reqOpenOrders();
-        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+        await AwaitTrackedWithTimeout(
+            _wrapper.OpenOrderEndTask,
+            token,
+            stage: "openOrderEnd",
+            requestId: null,
+            requestType: "reqOpenOrders",
+            origin: nameof(RunOrdersMode));
 
         client.reqCompletedOrders(true);
-        await AwaitWithTimeout(_wrapper.CompletedOrdersEndTask, token, "completedOrdersEnd");
+        await AwaitTrackedWithTimeout(
+            _wrapper.CompletedOrdersEndTask,
+            token,
+            stage: "completedOrdersEnd",
+            requestId: null,
+            requestType: "reqCompletedOrders",
+            origin: nameof(RunOrdersMode));
 
-        client.reqExecutions(9201, new ExecutionFilter());
-        await AwaitWithTimeout(_wrapper.ExecDetailsEndTask, token, "execDetailsEnd");
+        const int executionsReqId = 9201;
+        client.reqExecutions(executionsReqId, new ExecutionFilter());
+        await AwaitTrackedWithTimeout(
+            _wrapper.ExecDetailsEndTask,
+            token,
+            stage: "execDetailsEnd",
+            requestId: executionsReqId,
+            requestType: "reqExecutions",
+            origin: nameof(RunOrdersMode));
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
@@ -265,8 +301,20 @@ public sealed class SnapshotRuntime
         client.reqAccountSummary(summaryReqId, "All", "AccountType,NetLiquidation,TotalCashValue,BuyingPower,MaintMarginReq,AvailableFunds");
         client.reqPositions();
 
-        await AwaitWithTimeout(_wrapper.AccountSummaryEndTask, token, "accountSummaryEnd");
-        await AwaitWithTimeout(_wrapper.PositionEndTask, token, "positionEnd");
+        await AwaitTrackedWithTimeout(
+            _wrapper.AccountSummaryEndTask,
+            token,
+            stage: "accountSummaryEnd",
+            requestId: summaryReqId,
+            requestType: "reqAccountSummary",
+            origin: nameof(RunPositionsMode));
+        await AwaitTrackedWithTimeout(
+            _wrapper.PositionEndTask,
+            token,
+            stage: "positionEnd",
+            requestId: null,
+            requestType: "reqPositions",
+            origin: nameof(RunPositionsMode));
 
         client.cancelAccountSummary(summaryReqId);
         client.cancelPositions();
@@ -2651,6 +2699,39 @@ public sealed class SnapshotRuntime
         throw new TimeoutException($"Timed out waiting for {stage}.");
     }
 
+    private async Task<T> AwaitTrackedWithTimeout<T>(
+        Task<T> task,
+        CancellationToken cancellationToken,
+        string stage,
+        int? requestId,
+        string requestType,
+        string origin)
+    {
+        var correlationId = _requestRegistry.Register(
+            requestId,
+            requestType,
+            origin,
+            DateTime.UtcNow.AddSeconds(_options.TimeoutSeconds));
+
+        try
+        {
+            var result = await AwaitWithTimeout(task, cancellationToken, stage);
+            _requestRegistry.Complete(correlationId, details: stage);
+            return result;
+        }
+        catch (TimeoutException ex)
+        {
+            _requestRegistry.Timeout(correlationId, ex.Message);
+            var context = _requestRegistry.Describe(correlationId);
+            throw new TimeoutException($"Timed out waiting for {stage}. {context}", ex);
+        }
+        catch (Exception ex)
+        {
+            _requestRegistry.Fail(correlationId, ex.Message);
+            throw;
+        }
+    }
+
     private void PrintErrors()
     {
         if (_wrapper.ApiErrors.IsEmpty)
@@ -2689,6 +2770,25 @@ public sealed class SnapshotRuntime
         foreach (var item in throttledCounts.OrderBy(kvp => kvp.Key))
         {
             Console.WriteLine($"[THROTTLED] code={item.Key} suppressed={item.Value}");
+        }
+    }
+
+    private void PrintRequestDiagnostics()
+    {
+        var rows = _requestRegistry
+            .Snapshot()
+            .Where(r => r.Status is RequestStatus.TimedOut or RequestStatus.Failed or RequestStatus.Started)
+            .ToArray();
+
+        if (rows.Length == 0)
+        {
+            return;
+        }
+
+        Console.WriteLine("\n=== Request Diagnostics ===");
+        foreach (var row in rows)
+        {
+            Console.WriteLine($"[REQ] corr={row.CorrelationId} reqId={row.RequestId?.ToString() ?? "n/a"} type={row.Type} origin={row.Origin} status={row.Status} started={row.StartedAtUtc:O} deadline={row.DeadlineUtc:O} details={row.Details ?? "n/a"}");
         }
     }
 
