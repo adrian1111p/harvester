@@ -20,6 +20,7 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
 
         var elapsedSeconds = Math.Max(0, (utcNow - context.RunStartedUtc).TotalSeconds);
         var intervalSeconds = Math.Max(1, context.ScheduledIntervalSeconds);
+        var marketCloseWarningMinutes = Math.Max(1, context.MarketCloseWarningMinutes);
         var slot = (long)Math.Floor(elapsedSeconds / intervalSeconds);
 
         var lastSlot = _lastIntervalSlotByRun.GetOrAdd(runKey, -1);
@@ -47,6 +48,13 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
 
         if (sessionWindowsAvailable && sessionWindow.IsTradingDay)
         {
+            var marketCloseWarningKey = $"{runKey}|market_close_warning";
+            var warningStartUtc = sessionWindow.SessionCloseUtc.AddMinutes(-marketCloseWarningMinutes);
+            if (utcNow >= warningStartUtc && utcNow < sessionWindow.SessionCloseUtc && _emittedOneShot.TryAdd(marketCloseWarningKey, 1))
+            {
+                events.Add("market_close_warning");
+            }
+
             var afterCloseKey = $"{runKey}|after_close";
             if (utcNow >= sessionWindow.SessionCloseUtc && _emittedOneShot.TryAdd(afterCloseKey, 1))
             {
@@ -84,6 +92,13 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
 
             if (TryParseUtcTime(context.SessionEndUtc, out var sessionEndUtc))
             {
+                var marketCloseWarningKey = $"{runKey}|market_close_warning";
+                var warningStartUtc = sessionEndUtc.Add(TimeSpan.FromMinutes(-marketCloseWarningMinutes));
+                if (utcNow.TimeOfDay >= warningStartUtc && utcNow.TimeOfDay < sessionEndUtc && _emittedOneShot.TryAdd(marketCloseWarningKey, 1))
+                {
+                    events.Add("market_close_warning");
+                }
+
                 var afterCloseKey = $"{runKey}|after_close";
                 if (utcNow.TimeOfDay >= sessionEndUtc && _emittedOneShot.TryAdd(afterCloseKey, 1))
                 {

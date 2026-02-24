@@ -13,7 +13,8 @@ public sealed record StrategyRuntimeContext(
     string OutputDirectory,
     string SessionStartUtc,
     string SessionEndUtc,
-    int ScheduledIntervalSeconds
+    int ScheduledIntervalSeconds,
+    int MarketCloseWarningMinutes
 );
 
 public sealed record StrategyDataSlice(

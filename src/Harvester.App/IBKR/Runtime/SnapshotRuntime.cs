@@ -3529,7 +3529,8 @@ public sealed class SnapshotRuntime
             EnsureOutputDir(),
             _options.PreTradeSessionStartUtc,
             _options.PreTradeSessionEndUtc,
-            Math.Max(1, _options.HeartbeatIntervalSeconds));
+                Math.Max(1, _options.HeartbeatIntervalSeconds),
+                Math.Max(1, _options.MarketCloseWarningMinutes));
     }
 
     private async Task NotifyScheduledEventsAsync(StrategyRuntimeContext context, DateTime nowUtc, CancellationToken cancellationToken)
@@ -3953,6 +3954,7 @@ public sealed record AppOptions(
     int PreTradeMaxDailyOrders,
     string PreTradeSessionStartUtc,
     string PreTradeSessionEndUtc,
+    int MarketCloseWarningMinutes,
     PreTradeCostProfile PreTradeCostProfile,
     double PreTradeCommissionPerUnit,
     double PreTradeSlippageBps,
@@ -4082,6 +4084,7 @@ public sealed record AppOptions(
         var preTradeMaxDailyOrders = 5;
         var preTradeSessionStartUtc = "13:30";
         var preTradeSessionEndUtc = "16:15";
+        var marketCloseWarningMinutes = 15;
         var preTradeCostProfile = PreTradeCostProfile.MicroEquity;
         var preTradeCommissionPerUnit = 0.0035;
         var preTradeSlippageBps = 4.0;
@@ -4426,6 +4429,10 @@ public sealed record AppOptions(
                 case "--pretrade-session-end" when i + 1 < args.Length:
                     preTradeSessionEndUtc = args[++i];
                     break;
+                case "--market-close-warning-minutes" when i + 1 < args.Length && int.TryParse(args[i + 1], out var mcw):
+                    marketCloseWarningMinutes = mcw;
+                    i++;
+                    break;
                 case "--pretrade-cost-profile" when i + 1 < args.Length:
                     preTradeCostProfile = ParsePreTradeCostProfile(args[++i]);
                     break;
@@ -4648,6 +4655,7 @@ public sealed record AppOptions(
             preTradeMaxDailyOrders,
             preTradeSessionStartUtc,
             preTradeSessionEndUtc,
+            marketCloseWarningMinutes,
             preTradeCostProfile,
             preTradeCommissionPerUnit,
             preTradeSlippageBps,
