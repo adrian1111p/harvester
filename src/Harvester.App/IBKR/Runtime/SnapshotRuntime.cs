@@ -2913,9 +2913,22 @@ public sealed class SnapshotRuntime
     {
         var replayDriver = new StrategyReplayDriver();
         var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows);
+        var staticReplayOrders = ReplayExecutionSimulator.LoadOrderIntents(_options.ReplayOrdersInputPath, _options.ReplayMaxRows);
+        var staticReplayCursor = 0;
         var replayClock = new DeterministicReplayClock(slices[0].TimestampUtc);
+        var replaySimulator = new ReplayExecutionSimulator(
+            _options.ReplayInitialCash,
+            _options.ReplayCommissionPerUnit,
+            _options.ReplaySlippageBps);
+        var replayOrderRows = new List<ReplayOrderIntent>();
+        var replayFillRows = new List<ReplayFillRow>();
+        var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
+        if (staticReplayOrders.Count > 0)
+        {
+            Console.WriteLine($"[INFO] strategy-replay loaded external orders={staticReplayOrders.Count} source={Path.GetFullPath(_options.ReplayOrdersInputPath)}");
+        }
 
         foreach (var slice in slices)
         {
@@ -2923,6 +2936,33 @@ public sealed class SnapshotRuntime
             replayClock.AdvanceTo(slice.TimestampUtc);
             await NotifyScheduledEventsAsync(strategyContext, replayClock.UtcNow, token);
             await NotifyStrategyDataSliceAsync(slice, token);
+
+            var dueOrders = new List<ReplayOrderIntent>();
+            while (staticReplayCursor < staticReplayOrders.Count && staticReplayOrders[staticReplayCursor].TimestampUtc <= slice.TimestampUtc)
+            {
+                dueOrders.Add(staticReplayOrders[staticReplayCursor]);
+                staticReplayCursor++;
+            }
+
+            if (_strategyRuntime is IReplayOrderSignalSource replaySignalSource)
+            {
+                var strategyOrders = replaySignalSource.GetReplayOrderIntents(slice, strategyContext)
+                    .Where(x => x.Quantity > 0)
+                    .Select(x => x with
+                    {
+                        TimestampUtc = x.TimestampUtc == default ? slice.TimestampUtc : x.TimestampUtc,
+                        Symbol = string.IsNullOrWhiteSpace(x.Symbol) ? strategyContext.Symbol : x.Symbol,
+                        Source = string.IsNullOrWhiteSpace(x.Source) ? "strategy" : x.Source
+                    })
+                    .Where(x => x.TimestampUtc <= slice.TimestampUtc)
+                    .ToArray();
+                dueOrders.AddRange(strategyOrders);
+            }
+
+            var simulation = replaySimulator.ProcessSlice(slice, strategyContext.Symbol, dueOrders);
+            replayOrderRows.AddRange(simulation.Orders);
+            replayFillRows.AddRange(simulation.Fills);
+            replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
             {
@@ -2933,8 +2973,17 @@ public sealed class SnapshotRuntime
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
         var replayPath = Path.Combine(outputDir, $"strategy_replay_slices_{timestamp}.json");
+        var replayOrdersPath = Path.Combine(outputDir, $"strategy_replay_orders_{timestamp}.json");
+        var replayFillsPath = Path.Combine(outputDir, $"strategy_replay_fills_{timestamp}.json");
+        var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         WriteJson(replayPath, slices);
+        WriteJson(replayOrdersPath, replayOrderRows);
+        WriteJson(replayFillsPath, replayFillRows);
+        WriteJson(replayPortfolioPath, replayPortfolioRows);
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
+        Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
     }
 
     private ScannerSubscription BuildScannerSubscriptionFromOptions()
@@ -4017,8 +4066,12 @@ public sealed record AppOptions(
     string DisplayGroupContractInfo,
     int DisplayGroupCaptureSeconds,
     string ReplayInputPath,
+    string ReplayOrdersInputPath,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
+    double ReplayInitialCash,
+    double ReplayCommissionPerUnit,
+    double ReplaySlippageBps,
     bool HeartbeatMonitorEnabled,
     int HeartbeatIntervalSeconds,
     int HeartbeatProbeTimeoutSeconds,
@@ -4150,8 +4203,12 @@ public sealed record AppOptions(
         var displayGroupContractInfo = "265598@SMART";
         var displayGroupCaptureSeconds = 4;
         var replayInputPath = string.Empty;
+        var replayOrdersInputPath = string.Empty;
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
+        var replayInitialCash = 100000.0;
+        var replayCommissionPerUnit = preTradeCommissionPerUnit;
+        var replaySlippageBps = preTradeSlippageBps;
         var heartbeatMonitorEnabled = true;
         var heartbeatIntervalSeconds = 6;
         var heartbeatProbeTimeoutSeconds = 4;
@@ -4566,12 +4623,27 @@ public sealed record AppOptions(
                 case "--replay-input" when i + 1 < args.Length:
                     replayInputPath = args[++i];
                     break;
+                case "--replay-orders-input" when i + 1 < args.Length:
+                    replayOrdersInputPath = args[++i];
+                    break;
                 case "--replay-interval-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ris):
                     replayIntervalSeconds = ris;
                     i++;
                     break;
                 case "--replay-max-rows" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rmr):
                     replayMaxRows = rmr;
+                    i++;
+                    break;
+                case "--replay-initial-cash" when i + 1 < args.Length && double.TryParse(args[i + 1], out var ric):
+                    replayInitialCash = ric;
+                    i++;
+                    break;
+                case "--replay-commission-per-unit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rcpu):
+                    replayCommissionPerUnit = rcpu;
+                    i++;
+                    break;
+                case "--replay-slippage-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rsb):
+                    replaySlippageBps = rsb;
                     i++;
                     break;
                 case "--heartbeat-monitor" when i + 1 < args.Length:
@@ -4735,8 +4807,12 @@ public sealed record AppOptions(
             displayGroupContractInfo,
             displayGroupCaptureSeconds,
             replayInputPath,
+            replayOrdersInputPath,
             replayIntervalSeconds,
             replayMaxRows,
+            replayInitialCash,
+            replayCommissionPerUnit,
+            replaySlippageBps,
             heartbeatMonitorEnabled,
             heartbeatIntervalSeconds,
             heartbeatProbeTimeoutSeconds,
