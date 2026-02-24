@@ -11,6 +11,8 @@ public sealed record ReplayOrderIntent(
     string OrderType,
     double? LimitPrice,
     double? StopPrice,
+    double? TrailAmount,
+    double? TrailPercent,
     string TimeInForce,
     DateTime? ExpireAtUtc,
     string Source,
@@ -61,9 +63,22 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
     IReadOnlyList<ReplayOrderActivationRow> Activations,
+    IReadOnlyList<ReplayTrailingStopUpdateRow> TrailingStopUpdates,
     IReadOnlyList<ReplayOrderTriggerRow> Triggers,
     IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayTrailingStopUpdateRow(
+    DateTime TimestampUtc,
+    string OrderId,
+    string Symbol,
+    string Side,
+    string OrderType,
+    double AnchorPrice,
+    double PreviousStopPrice,
+    double UpdatedStopPrice,
+    string Source
 );
 
 public sealed record ReplayOrderActivationRow(
@@ -308,6 +323,7 @@ public sealed class ReplayExecutionSimulator
         var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
         var cashRejections = new List<ReplayCashRejectionRow>();
         var activations = new List<ReplayOrderActivationRow>();
+        var trailingStopUpdates = new List<ReplayTrailingStopUpdateRow>();
         var triggers = new List<ReplayOrderTriggerRow>();
         var cancellations = new List<ReplayOrderCancellationRow>();
 
@@ -424,6 +440,11 @@ public sealed class ReplayExecutionSimulator
                 continue;
             }
 
+            if (TryUpdateTrailingStop(active, slice.TimestampUtc, bar, markPrice, out var trailingUpdate))
+            {
+                trailingStopUpdates.Add(trailingUpdate);
+            }
+
             if (TryTriggerStopOrder(active, slice.TimestampUtc, bar, markPrice, out var triggerRow))
             {
                 triggers.Add(triggerRow);
@@ -528,7 +549,100 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, triggers, cancellations, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, trailingStopUpdates, triggers, cancellations, portfolio);
+    }
+
+    private static bool TryUpdateTrailingStop(
+        ActiveReplayOrder active,
+        DateTime timestampUtc,
+        HistoricalBarRow? bar,
+        double markPrice,
+        out ReplayTrailingStopUpdateRow update)
+    {
+        update = null!;
+        if (!IsTrailingStopOrderType(active.Intent.OrderType) || active.IsTriggered)
+        {
+            return false;
+        }
+
+        var side = ParseSide(active.Intent.Side);
+        if (side == 0)
+        {
+            return false;
+        }
+
+        var currentReference = bar is not null
+            ? (side > 0 ? bar.Low : bar.High)
+            : markPrice;
+        if (currentReference <= 0)
+        {
+            return false;
+        }
+
+        if (!active.TrailingAnchorPrice.HasValue)
+        {
+            active.TrailingAnchorPrice = currentReference;
+        }
+        else
+        {
+            active.TrailingAnchorPrice = side > 0
+                ? Math.Min(active.TrailingAnchorPrice.Value, currentReference)
+                : Math.Max(active.TrailingAnchorPrice.Value, currentReference);
+        }
+
+        var offset = ResolveTrailingOffset(active, active.TrailingAnchorPrice.Value);
+        if (offset <= 0)
+        {
+            return false;
+        }
+
+        var nextStop = side > 0
+            ? active.TrailingAnchorPrice.Value + offset
+            : active.TrailingAnchorPrice.Value - offset;
+
+        if (!active.CurrentStopPrice.HasValue)
+        {
+            active.CurrentStopPrice = nextStop;
+        }
+        else
+        {
+            active.CurrentStopPrice = side > 0
+                ? Math.Min(active.CurrentStopPrice.Value, nextStop)
+                : Math.Max(active.CurrentStopPrice.Value, nextStop);
+        }
+
+        var previous = active.Intent.StopPrice ?? active.CurrentStopPrice.Value;
+        if (Math.Abs(previous - active.CurrentStopPrice.Value) <= 1e-9)
+        {
+            return false;
+        }
+
+        update = new ReplayTrailingStopUpdateRow(
+            timestampUtc,
+            active.Intent.OrderId,
+            active.Intent.Symbol,
+            active.Intent.Side,
+            active.Intent.OrderType,
+            active.TrailingAnchorPrice.Value,
+            previous,
+            active.CurrentStopPrice.Value,
+            active.Intent.Source);
+        return true;
+    }
+
+    private static double ResolveTrailingOffset(ActiveReplayOrder active, double anchor)
+    {
+        if (active.Intent.TrailAmount.HasValue && active.Intent.TrailAmount.Value > 0)
+        {
+            return active.Intent.TrailAmount.Value;
+        }
+
+        if (active.Intent.TrailPercent.HasValue && active.Intent.TrailPercent.Value > 0)
+        {
+            return anchor * (active.Intent.TrailPercent.Value / 100.0);
+        }
+
+        return 0;
     }
 
     private void ActivateChildren(string filledOrderId, DateTime timestampUtc, List<ReplayOrderActivationRow> activations)
@@ -620,7 +734,8 @@ public sealed class ReplayExecutionSimulator
         out ReplayOrderTriggerRow triggerRow)
     {
         triggerRow = null!;
-        if (active.IsTriggered || !IsStopOrderType(active.Intent.OrderType) || !active.Intent.StopPrice.HasValue || active.Intent.StopPrice <= 0)
+        var stopPrice = active.CurrentStopPrice ?? active.Intent.StopPrice;
+        if (active.IsTriggered || !IsStopOrderType(active.Intent.OrderType) || !stopPrice.HasValue || stopPrice <= 0)
         {
             return false;
         }
@@ -631,7 +746,7 @@ public sealed class ReplayExecutionSimulator
             return false;
         }
 
-        var stop = active.Intent.StopPrice.Value;
+        var stop = stopPrice.Value;
         var isTriggered = bar is not null
             ? (side > 0 ? bar.High >= stop : bar.Low <= stop)
             : (side > 0 ? markPrice >= stop : markPrice <= stop);
@@ -663,7 +778,8 @@ public sealed class ReplayExecutionSimulator
         }
 
         var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
-        return normalized is "STP" or "STOP" or "STOPMARKET" or "STPLMT" or "STOPLIMIT";
+        return normalized is "STP" or "STOP" or "STOPMARKET" or "STPLMT" or "STOPLIMIT"
+            or "TRAIL" or "TRAILINGSTOP" or "TRAILSTOP" or "TRAILLMT" or "TRAILLIMIT";
     }
 
     private static bool IsStopLimitOrderType(string orderType)
@@ -674,7 +790,18 @@ public sealed class ReplayExecutionSimulator
         }
 
         var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
-        return normalized is "STPLMT" or "STOPLIMIT";
+        return normalized is "STPLMT" or "STOPLIMIT" or "TRAILLMT" or "TRAILLIMIT";
+    }
+
+    private static bool IsTrailingStopOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "TRAIL" or "TRAILINGSTOP" or "TRAILSTOP" or "TRAILLMT" or "TRAILLIMIT";
     }
 
     private static bool IsOrderExpired(ActiveReplayOrder order, DateTime sliceTimestampUtc)
@@ -819,6 +946,8 @@ public sealed class ReplayExecutionSimulator
             "MKT",
             null,
             null,
+            null,
+            null,
             "DAY",
             null,
             "margin");
@@ -960,6 +1089,8 @@ public sealed class ReplayExecutionSimulator
             forcedSide,
             Math.Abs(_positionQuantity),
             "MKT",
+            null,
+            null,
             null,
             null,
             "DAY",
@@ -1213,6 +1344,8 @@ public sealed class ReplayExecutionSimulator
             IsActive = isActive;
             IsTriggered = false;
             TriggeredAtUtc = null;
+            TrailingAnchorPrice = null;
+            CurrentStopPrice = intent.StopPrice;
         }
 
         public ReplayOrderIntent Intent { get; }
@@ -1221,5 +1354,7 @@ public sealed class ReplayExecutionSimulator
         public bool IsActive { get; set; }
         public bool IsTriggered { get; set; }
         public DateTime? TriggeredAtUtc { get; set; }
+        public double? TrailingAnchorPrice { get; set; }
+        public double? CurrentStopPrice { get; set; }
     }
 }
