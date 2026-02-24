@@ -2930,7 +2930,9 @@ public sealed class SnapshotRuntime
             replayCorporateActions,
             replayNormalizationMode,
             _options.ReplayInitialMarginRate,
-            _options.ReplayMaintenanceMarginRate);
+            _options.ReplayMaintenanceMarginRate,
+            _options.ReplaySettlementLagDays,
+            _options.ReplayEnforceSettledCash);
         var replayOrderRows = new List<ReplayOrderIntent>();
         var replayFillRows = new List<ReplayFillRow>();
         var replayCorporateActionAppliedRows = new List<ReplayCorporateActionAppliedRow>();
@@ -2941,6 +2943,8 @@ public sealed class SnapshotRuntime
         var replayLocateRejectionRows = new List<ReplayLocateRejectionRow>();
         var replayMarginRejectionRows = new List<ReplayMarginRejectionRow>();
         var replayMarginEventRows = new List<ReplayMarginEventRow>();
+        var replayCashSettlementRows = new List<ReplayCashSettlementRow>();
+        var replayCashRejectionRows = new List<ReplayCashRejectionRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
@@ -3014,6 +3018,8 @@ public sealed class SnapshotRuntime
             replayLocateRejectionRows.AddRange(simulation.LocateRejections);
             replayMarginRejectionRows.AddRange(simulation.MarginRejections);
             replayMarginEventRows.AddRange(simulation.MarginEvents);
+            replayCashSettlementRows.AddRange(simulation.CashSettlements);
+            replayCashRejectionRows.AddRange(simulation.CashRejections);
             replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
@@ -3035,6 +3041,8 @@ public sealed class SnapshotRuntime
         var replayLocateRejectionsPath = Path.Combine(outputDir, $"strategy_replay_locate_rejections_{timestamp}.json");
         var replayMarginRejectionsPath = Path.Combine(outputDir, $"strategy_replay_margin_rejections_{timestamp}.json");
         var replayMarginEventsPath = Path.Combine(outputDir, $"strategy_replay_margin_events_{timestamp}.json");
+        var replayCashSettlementsPath = Path.Combine(outputDir, $"strategy_replay_cash_settlements_{timestamp}.json");
+        var replayCashRejectionsPath = Path.Combine(outputDir, $"strategy_replay_cash_rejections_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -3054,6 +3062,8 @@ public sealed class SnapshotRuntime
         WriteJson(replayLocateRejectionsPath, replayLocateRejectionRows);
         WriteJson(replayMarginRejectionsPath, replayMarginRejectionRows);
         WriteJson(replayMarginEventsPath, replayMarginEventRows);
+        WriteJson(replayCashSettlementsPath, replayCashSettlementRows);
+        WriteJson(replayCashRejectionsPath, replayCashRejectionRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3069,6 +3079,8 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay locate rejections export: {replayLocateRejectionsPath} (rows={replayLocateRejectionRows.Count})");
         Console.WriteLine($"[OK] Strategy replay margin rejections export: {replayMarginRejectionsPath} (rows={replayMarginRejectionRows.Count})");
         Console.WriteLine($"[OK] Strategy replay margin events export: {replayMarginEventsPath} (rows={replayMarginEventRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay cash settlements export: {replayCashSettlementsPath} (rows={replayCashSettlementRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay cash rejections export: {replayCashRejectionsPath} (rows={replayCashRejectionRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4168,6 +4180,8 @@ public sealed record AppOptions(
     double ReplaySlippageBps,
     double ReplayInitialMarginRate,
     double ReplayMaintenanceMarginRate,
+    int ReplaySettlementLagDays,
+    bool ReplayEnforceSettledCash,
     bool HeartbeatMonitorEnabled,
     int HeartbeatIntervalSeconds,
     int HeartbeatProbeTimeoutSeconds,
@@ -4312,6 +4326,8 @@ public sealed record AppOptions(
         var replaySlippageBps = preTradeSlippageBps;
         var replayInitialMarginRate = 0.50;
         var replayMaintenanceMarginRate = 0.30;
+        var replaySettlementLagDays = 2;
+        var replayEnforceSettledCash = true;
         var heartbeatMonitorEnabled = true;
         var heartbeatIntervalSeconds = 6;
         var heartbeatProbeTimeoutSeconds = 4;
@@ -4772,6 +4788,13 @@ public sealed record AppOptions(
                     replayMaintenanceMarginRate = Math.Max(0, rmmr);
                     i++;
                     break;
+                case "--replay-settlement-lag-days" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rsld):
+                    replaySettlementLagDays = Math.Max(0, rsld);
+                    i++;
+                    break;
+                case "--replay-enforce-settled-cash" when i + 1 < args.Length:
+                    replayEnforceSettledCash = bool.TryParse(args[++i], out var resc) && resc;
+                    break;
                 case "--heartbeat-monitor" when i + 1 < args.Length:
                     heartbeatMonitorEnabled = bool.TryParse(args[++i], out var hm) && hm;
                     break;
@@ -4946,6 +4969,8 @@ public sealed record AppOptions(
             replaySlippageBps,
             replayInitialMarginRate,
             replayMaintenanceMarginRate,
+            replaySettlementLagDays,
+            replayEnforceSettledCash,
             heartbeatMonitorEnabled,
             heartbeatIntervalSeconds,
             heartbeatProbeTimeoutSeconds,

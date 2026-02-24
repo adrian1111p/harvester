@@ -32,6 +32,8 @@ public sealed record ReplayPortfolioRow(
     double AveragePrice,
     double MarketPrice,
     double Cash,
+    double SettledCash,
+    double UnsettledCash,
     double RealizedPnl,
     double UnrealizedPnl,
     double Equity
@@ -46,6 +48,8 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayLocateRejectionRow> LocateRejections,
     IReadOnlyList<ReplayMarginRejectionRow> MarginRejections,
     IReadOnlyList<ReplayMarginEventRow> MarginEvents,
+    IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
+    IReadOnlyList<ReplayCashRejectionRow> CashRejections,
     ReplayPortfolioRow Portfolio
 );
 
@@ -120,6 +124,28 @@ public sealed record ReplayMarginEventRow(
     string Source
 );
 
+public sealed record ReplayCashSettlementRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string EventType,
+    double Amount,
+    double SettledCash,
+    double UnsettledCash,
+    DateTime? SettleDateUtc,
+    string Source
+);
+
+public sealed record ReplayCashRejectionRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    double Quantity,
+    double RequiredSettledCash,
+    double AvailableSettledCash,
+    string Reason,
+    string Source
+);
+
 public sealed class ReplayExecutionSimulator
 {
     private readonly double _commissionPerUnit;
@@ -133,6 +159,10 @@ public sealed class ReplayExecutionSimulator
     private readonly ReplayPriceNormalizationMode _normalizationMode;
     private readonly double _initialMarginRate;
     private readonly double _maintenanceMarginRate;
+    private readonly int _settlementLagDays;
+    private readonly bool _enforceSettledCash;
+    private double _settledCash;
+    private readonly List<PendingSettlement> _pendingSettlements;
     private DateTime? _lastFinancingTimestampUtc;
 
     public ReplayExecutionSimulator(
@@ -142,9 +172,12 @@ public sealed class ReplayExecutionSimulator
         IReadOnlyList<ReplayCorporateActionRow> corporateActions,
         ReplayPriceNormalizationMode normalizationMode,
         double initialMarginRate,
-        double maintenanceMarginRate)
+        double maintenanceMarginRate,
+        int settlementLagDays,
+        bool enforceSettledCash)
     {
         _cash = initialCash;
+        _settledCash = initialCash;
         _commissionPerUnit = Math.Max(0, commissionPerUnit);
         _slippageBps = Math.Max(0, slippageBps);
         _corporateActions = corporateActions
@@ -153,6 +186,9 @@ public sealed class ReplayExecutionSimulator
         _normalizationMode = normalizationMode;
         _initialMarginRate = Math.Max(0, initialMarginRate);
         _maintenanceMarginRate = Math.Max(0, maintenanceMarginRate);
+        _settlementLagDays = Math.Max(0, settlementLagDays);
+        _enforceSettledCash = enforceSettledCash;
+        _pendingSettlements = [];
         _corporateActionCursor = 0;
         _lastFinancingTimestampUtc = null;
     }
@@ -197,6 +233,8 @@ public sealed class ReplayExecutionSimulator
         var locateRejections = new List<ReplayLocateRejectionRow>();
         var marginRejections = new List<ReplayMarginRejectionRow>();
         var marginEvents = new List<ReplayMarginEventRow>();
+        var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
+        var cashRejections = new List<ReplayCashRejectionRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
@@ -274,6 +312,13 @@ public sealed class ReplayExecutionSimulator
                 continue;
             }
 
+            var cashValidation = ValidateSettledCash(normalized, fillPrice.Value);
+            if (cashValidation is not null)
+            {
+                cashRejections.Add(cashValidation);
+                continue;
+            }
+
             if (locateValidation.FeeApplied is not null)
             {
                 appliedFinancing.Add(locateValidation.FeeApplied);
@@ -316,11 +361,75 @@ public sealed class ReplayExecutionSimulator
             _averagePrice,
             markPrice,
             _cash,
+            _settledCash,
+            GetUnsettledCash(),
             _realizedPnl,
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, portfolio);
+    }
+
+    private IReadOnlyList<ReplayCashSettlementRow> ApplyDueSettlements(DateTime timestampUtc, string symbol)
+    {
+        if (_pendingSettlements.Count == 0)
+        {
+            return [];
+        }
+
+        var applied = new List<ReplayCashSettlementRow>();
+        for (var index = _pendingSettlements.Count - 1; index >= 0; index--)
+        {
+            var row = _pendingSettlements[index];
+            if (row.SettleDateUtc > timestampUtc)
+            {
+                continue;
+            }
+
+            _settledCash += row.Amount;
+            applied.Add(new ReplayCashSettlementRow(
+                timestampUtc,
+                row.Symbol,
+                "SETTLED",
+                row.Amount,
+                _settledCash,
+                GetUnsettledCashExcluding(index),
+                row.SettleDateUtc,
+                row.Source));
+            _pendingSettlements.RemoveAt(index);
+        }
+
+        return applied.OrderBy(x => x.SettleDateUtc).ToArray();
+    }
+
+    private ReplayCashRejectionRow? ValidateSettledCash(ReplayOrderIntent intent, double fillPrice)
+    {
+        if (!_enforceSettledCash)
+        {
+            return null;
+        }
+
+        var side = ParseSide(intent.Side);
+        if (side <= 0)
+        {
+            return null;
+        }
+
+        var required = (intent.Quantity * fillPrice) + (intent.Quantity * _commissionPerUnit);
+        if (_settledCash + 1e-9 >= required)
+        {
+            return null;
+        }
+
+        return new ReplayCashRejectionRow(
+            intent.TimestampUtc,
+            intent.Symbol,
+            intent.Side,
+            intent.Quantity,
+            required,
+            _settledCash,
+            "INSUFFICIENT_SETTLED_CASH",
+            intent.Source);
     }
 
     private ReplayMarginRejectionRow? ValidateInitialMargin(ReplayOrderIntent intent, double fillPrice)
@@ -659,6 +768,7 @@ public sealed class ReplayExecutionSimulator
         }
 
         _positionQuantity = nextQuantity;
+        ApplySettlementEffects(intent, fillPrice, commission);
 
         return new ReplayFillRow(
             intent.TimestampUtc,
@@ -672,6 +782,56 @@ public sealed class ReplayExecutionSimulator
             intent.Source);
     }
 
+    private void ApplySettlementEffects(ReplayOrderIntent intent, double fillPrice, double commission)
+    {
+        var side = ParseSide(intent.Side);
+        var notional = intent.Quantity * fillPrice;
+
+        if (side > 0)
+        {
+            _settledCash -= (notional + commission);
+            return;
+        }
+
+        if (side < 0)
+        {
+            _settledCash -= commission;
+            if (_settlementLagDays == 0)
+            {
+                _settledCash += notional;
+            }
+            else
+            {
+                _pendingSettlements.Add(new PendingSettlement(
+                    intent.TimestampUtc.AddDays(_settlementLagDays),
+                    intent.Symbol,
+                    notional,
+                    string.IsNullOrWhiteSpace(intent.Source) ? "trade" : intent.Source));
+            }
+        }
+    }
+
+    private double GetUnsettledCash()
+    {
+        return _pendingSettlements.Sum(x => x.Amount);
+    }
+
+    private double GetUnsettledCashExcluding(int excludedIndex)
+    {
+        var unsettled = 0.0;
+        for (var index = 0; index < _pendingSettlements.Count; index++)
+        {
+            if (index == excludedIndex)
+            {
+                continue;
+            }
+
+            unsettled += _pendingSettlements[index].Amount;
+        }
+
+        return unsettled;
+    }
+
     private static int ParseSide(string side)
     {
         return side.ToUpperInvariant() switch
@@ -681,4 +841,11 @@ public sealed class ReplayExecutionSimulator
             _ => 0
         };
     }
+
+    private sealed record PendingSettlement(
+        DateTime SettleDateUtc,
+        string Symbol,
+        double Amount,
+        string Source
+    );
 }
