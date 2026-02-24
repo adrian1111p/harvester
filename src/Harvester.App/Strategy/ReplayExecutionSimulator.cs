@@ -248,6 +248,7 @@ public sealed class ReplayExecutionSimulator
     private readonly double _tafFeeCapPerOrder;
     private readonly double _exchangeFeePerShare;
     private readonly double _maxFillParticipationRate;
+    private readonly double _replayPriceIncrement;
     private readonly bool _enforceQueuePriority;
     private readonly int _settlementLagDays;
     private readonly bool _enforceSettledCash;
@@ -272,6 +273,7 @@ public sealed class ReplayExecutionSimulator
         double tafFeeCapPerOrder,
         double exchangeFeePerShare,
         double maxFillParticipationRate,
+        double replayPriceIncrement,
         bool enforceQueuePriority,
         int settlementLagDays,
         bool enforceSettledCash)
@@ -291,6 +293,7 @@ public sealed class ReplayExecutionSimulator
         _tafFeeCapPerOrder = Math.Max(0, tafFeeCapPerOrder);
         _exchangeFeePerShare = Math.Max(0, exchangeFeePerShare);
         _maxFillParticipationRate = Math.Clamp(maxFillParticipationRate, 0, 1);
+        _replayPriceIncrement = Math.Max(0, replayPriceIncrement);
         _enforceQueuePriority = enforceQueuePriority;
         _settlementLagDays = Math.Max(0, settlementLagDays);
         _enforceSettledCash = enforceSettledCash;
@@ -416,6 +419,8 @@ public sealed class ReplayExecutionSimulator
                 TimestampUtc = intent.TimestampUtc == default ? slice.TimestampUtc : intent.TimestampUtc,
                 Side = intent.Side.ToUpperInvariant(),
                 OrderType = intent.OrderType.ToUpperInvariant(),
+                LimitPrice = QuantizeNullablePrice(intent.LimitPrice),
+                StopPrice = QuantizeNullablePrice(intent.StopPrice),
                 TimeInForce = string.IsNullOrWhiteSpace(intent.TimeInForce) ? "DAY" : intent.TimeInForce.ToUpperInvariant(),
                 OrderId = ResolveOrderId(intent.OrderId),
                 ParentOrderId = string.IsNullOrWhiteSpace(intent.ParentOrderId) ? string.Empty : intent.ParentOrderId.Trim(),
@@ -645,7 +650,7 @@ public sealed class ReplayExecutionSimulator
         return true;
     }
 
-    private static bool TryUpdateTrailingStop(
+    private bool TryUpdateTrailingStop(
         ActiveReplayOrder active,
         DateTime timestampUtc,
         HistoricalBarRow? bar,
@@ -689,9 +694,10 @@ public sealed class ReplayExecutionSimulator
             return false;
         }
 
-        var nextStop = side > 0
+        var nextStopRaw = side > 0
             ? active.TrailingAnchorPrice.Value + offset
             : active.TrailingAnchorPrice.Value - offset;
+        var nextStop = QuantizePrice(nextStopRaw);
 
         if (!active.CurrentStopPrice.HasValue)
         {
@@ -1329,20 +1335,20 @@ public sealed class ReplayExecutionSimulator
 
             if (bar is not null && bar.Open > 0)
             {
-                return bar.Open;
+                return QuantizePrice(bar.Open);
             }
 
-            return markPrice > 0 ? markPrice : null;
+            return markPrice > 0 ? QuantizePrice(markPrice) : null;
         }
 
         if (IsMarketOnCloseOrderType(intent.OrderType))
         {
             if (bar is not null && bar.Close > 0)
             {
-                return bar.Close;
+                return QuantizePrice(bar.Close);
             }
 
-            return markPrice > 0 ? markPrice : null;
+            return markPrice > 0 ? QuantizePrice(markPrice) : null;
         }
 
         if (string.Equals(intent.OrderType, "LMT", StringComparison.OrdinalIgnoreCase)
@@ -1357,13 +1363,13 @@ public sealed class ReplayExecutionSimulator
             if (bar is null)
             {
                 var canFillNoBar = side > 0 ? markPrice <= limit : markPrice >= limit;
-                return canFillNoBar ? limit : null;
+                return canFillNoBar ? QuantizePrice(limit) : null;
             }
 
             var canFill = side > 0
                 ? bar.Low <= limit
                 : bar.High >= limit;
-            return canFill ? limit : null;
+            return canFill ? QuantizePrice(limit) : null;
         }
 
         if (markPrice <= 0)
@@ -1372,7 +1378,34 @@ public sealed class ReplayExecutionSimulator
         }
 
         var slippageFactor = 1 + (side * (_slippageBps / 10000.0));
-        return markPrice * slippageFactor;
+        return QuantizePrice(markPrice * slippageFactor);
+    }
+
+    private double QuantizePrice(double price)
+    {
+        if (price <= 0)
+        {
+            return price;
+        }
+
+        if (_replayPriceIncrement <= 0)
+        {
+            return price;
+        }
+
+        var ticks = Math.Round(price / _replayPriceIncrement, MidpointRounding.AwayFromZero);
+        var quantized = ticks * _replayPriceIncrement;
+        return Math.Round(quantized, 8, MidpointRounding.AwayFromZero);
+    }
+
+    private double? QuantizeNullablePrice(double? price)
+    {
+        if (!price.HasValue)
+        {
+            return null;
+        }
+
+        return QuantizePrice(price.Value);
     }
 
     private static bool IsMarketOnOpenOrder(ReplayOrderIntent intent)

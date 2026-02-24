@@ -2936,6 +2936,7 @@ public sealed class SnapshotRuntime
             _options.ReplayTafFeeCapPerOrder,
             _options.ReplayExchangeFeePerShare,
             _options.ReplayMaxFillParticipationRate,
+            _options.ReplayPriceIncrement,
             _options.ReplayEnforceQueuePriority,
             _options.ReplaySettlementLagDays,
             _options.ReplayEnforceSettledCash);
@@ -4267,6 +4268,7 @@ public sealed record AppOptions(
     double ReplayTafFeeCapPerOrder,
     double ReplayExchangeFeePerShare,
     double ReplayMaxFillParticipationRate,
+    double ReplayPriceIncrement,
     bool ReplayEnforceQueuePriority,
     int ReplaySettlementLagDays,
     bool ReplayEnforceSettledCash,
@@ -4419,6 +4421,7 @@ public sealed record AppOptions(
         var replayTafFeeCapPerOrder = 0.0;
         var replayExchangeFeePerShare = 0.0;
         var replayMaxFillParticipationRate = 1.0;
+        var replayPriceIncrement = 0.0;
         var replayEnforceQueuePriority = true;
         var replaySettlementLagDays = 2;
         var replayEnforceSettledCash = true;
@@ -4902,6 +4905,10 @@ public sealed record AppOptions(
                     replayMaxFillParticipationRate = Math.Clamp(rmfp, 0, 1);
                     i++;
                     break;
+                case "--replay-price-increment" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rpi):
+                    replayPriceIncrement = Math.Max(0, rpi);
+                    i++;
+                    break;
                 case "--replay-enforce-queue-priority" when i + 1 < args.Length:
                     replayEnforceQueuePriority = bool.TryParse(args[++i], out var reqp) && reqp;
                     break;
@@ -5091,6 +5098,7 @@ public sealed record AppOptions(
             replayTafFeeCapPerOrder,
             replayExchangeFeePerShare,
             replayMaxFillParticipationRate,
+            replayPriceIncrement,
             replayEnforceQueuePriority,
             replaySettlementLagDays,
             replayEnforceSettledCash,
