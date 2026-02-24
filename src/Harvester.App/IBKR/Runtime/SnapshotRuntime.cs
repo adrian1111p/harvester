@@ -2976,14 +2976,27 @@ public sealed class SnapshotRuntime
         var replayOrdersPath = Path.Combine(outputDir, $"strategy_replay_orders_{timestamp}.json");
         var replayFillsPath = Path.Combine(outputDir, $"strategy_replay_fills_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
+        var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
+        var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
+        var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
+
+        var performanceAnalyzer = new ReplayPerformanceAnalyzer();
+        var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
+
         WriteJson(replayPath, slices);
         WriteJson(replayOrdersPath, replayOrderRows);
         WriteJson(replayFillsPath, replayFillRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
+        WriteJson(replayBenchmarkPath, performance.Benchmark);
+        WriteJson(replayPacketsPath, performance.Packets);
+        WriteJson(replaySummaryPath, new[] { performance.Summary });
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
+        Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
+        Console.WriteLine($"[OK] Strategy replay performance summary export: {replaySummaryPath}");
     }
 
     private ScannerSubscription BuildScannerSubscriptionFromOptions()
