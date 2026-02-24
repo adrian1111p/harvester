@@ -2916,7 +2916,9 @@ public sealed class SnapshotRuntime
         var replayCorporateActions = ReplayCorporateActionsEngine.LoadCorporateActions(_options.ReplayCorporateActionsInputPath, _options.ReplayMaxRows);
         var replaySymbolMappings = ReplaySymbolEventsEngine.LoadSymbolMappings(_options.ReplaySymbolMappingsInputPath, _options.ReplayMaxRows);
         var replayDelistEvents = ReplaySymbolEventsEngine.LoadDelistEvents(_options.ReplayDelistEventsInputPath, _options.ReplayMaxRows);
+        var replayBorrowLocateProfiles = ReplayFinancingEngine.LoadBorrowLocateProfiles(_options.ReplayBorrowLocateInputPath, _options.ReplayMaxRows);
         var replaySymbolTimeline = new ReplaySymbolTimeline(strategyContext.Symbol, replaySymbolMappings, replayDelistEvents);
+        var replayBorrowLocateTimeline = new ReplayBorrowLocateTimeline(replayBorrowLocateProfiles);
         var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows, replayCorporateActions, replayNormalizationMode);
         var staticReplayOrders = ReplayExecutionSimulator.LoadOrderIntents(_options.ReplayOrdersInputPath, _options.ReplayMaxRows);
         var staticReplayCursor = 0;
@@ -2932,6 +2934,9 @@ public sealed class SnapshotRuntime
         var replayCorporateActionAppliedRows = new List<ReplayCorporateActionAppliedRow>();
         var replayDelistAppliedRows = new List<ReplayDelistAppliedRow>();
         var replaySymbolEventRows = new List<ReplaySymbolEventArtifactRow>();
+        var replayBorrowLocateEventRows = new List<ReplayBorrowLocateEventArtifactRow>();
+        var replayFinancingAppliedRows = new List<ReplayFinancingAppliedRow>();
+        var replayLocateRejectionRows = new List<ReplayLocateRejectionRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
@@ -2951,6 +2956,10 @@ public sealed class SnapshotRuntime
         {
             Console.WriteLine($"[INFO] strategy-replay loaded delist events={replayDelistEvents.Count} source={Path.GetFullPath(_options.ReplayDelistEventsInputPath)}");
         }
+        if (replayBorrowLocateProfiles.Count > 0)
+        {
+            Console.WriteLine($"[INFO] strategy-replay loaded borrow/locate profiles={replayBorrowLocateProfiles.Count} source={Path.GetFullPath(_options.ReplayBorrowLocateInputPath)}");
+        }
 
         foreach (var slice in slices)
         {
@@ -2962,6 +2971,9 @@ public sealed class SnapshotRuntime
             var timelineStep = replaySymbolTimeline.Apply(slice.TimestampUtc);
             replaySymbolEventRows.AddRange(timelineStep.SymbolEvents);
             var activeSymbol = timelineStep.CurrentSymbol;
+            var borrowLocateStep = replayBorrowLocateTimeline.Apply(slice.TimestampUtc);
+            replayBorrowLocateEventRows.AddRange(borrowLocateStep.Events);
+            var activeBorrowLocateProfile = replayBorrowLocateTimeline.GetProfile(activeSymbol);
 
             var dueOrders = new List<ReplayOrderIntent>();
             while (staticReplayCursor < staticReplayOrders.Count && staticReplayOrders[staticReplayCursor].TimestampUtc <= slice.TimestampUtc)
@@ -2989,11 +3001,13 @@ public sealed class SnapshotRuntime
                 dueOrders.AddRange(strategyOrders);
             }
 
-            var simulation = replaySimulator.ProcessSlice(slice, activeSymbol, dueOrders, timelineStep.DueDelistEvents);
+            var simulation = replaySimulator.ProcessSlice(slice, activeSymbol, dueOrders, timelineStep.DueDelistEvents, activeBorrowLocateProfile);
             replayOrderRows.AddRange(simulation.Orders);
             replayFillRows.AddRange(simulation.Fills);
             replayCorporateActionAppliedRows.AddRange(simulation.AppliedCorporateActions);
             replayDelistAppliedRows.AddRange(simulation.AppliedDelists);
+            replayFinancingAppliedRows.AddRange(simulation.AppliedFinancing);
+            replayLocateRejectionRows.AddRange(simulation.LocateRejections);
             replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
@@ -3010,6 +3024,9 @@ public sealed class SnapshotRuntime
         var replayCorporateActionsAppliedPath = Path.Combine(outputDir, $"strategy_replay_corporate_actions_applied_{timestamp}.json");
         var replaySymbolEventsPath = Path.Combine(outputDir, $"strategy_replay_symbol_events_{timestamp}.json");
         var replayDelistAppliedPath = Path.Combine(outputDir, $"strategy_replay_delist_applied_{timestamp}.json");
+        var replayBorrowLocateEventsPath = Path.Combine(outputDir, $"strategy_replay_borrow_locate_events_{timestamp}.json");
+        var replayFinancingAppliedPath = Path.Combine(outputDir, $"strategy_replay_financing_applied_{timestamp}.json");
+        var replayLocateRejectionsPath = Path.Combine(outputDir, $"strategy_replay_locate_rejections_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -3024,6 +3041,9 @@ public sealed class SnapshotRuntime
         WriteJson(replayCorporateActionsAppliedPath, replayCorporateActionAppliedRows);
         WriteJson(replaySymbolEventsPath, replaySymbolEventRows);
         WriteJson(replayDelistAppliedPath, replayDelistAppliedRows);
+        WriteJson(replayBorrowLocateEventsPath, replayBorrowLocateEventRows);
+        WriteJson(replayFinancingAppliedPath, replayFinancingAppliedRows);
+        WriteJson(replayLocateRejectionsPath, replayLocateRejectionRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3034,6 +3054,9 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay applied corporate actions export: {replayCorporateActionsAppliedPath} (rows={replayCorporateActionAppliedRows.Count})");
         Console.WriteLine($"[OK] Strategy replay symbol events export: {replaySymbolEventsPath} (rows={replaySymbolEventRows.Count})");
         Console.WriteLine($"[OK] Strategy replay applied delist export: {replayDelistAppliedPath} (rows={replayDelistAppliedRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay borrow/locate events export: {replayBorrowLocateEventsPath} (rows={replayBorrowLocateEventRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay financing applied export: {replayFinancingAppliedPath} (rows={replayFinancingAppliedRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay locate rejections export: {replayLocateRejectionsPath} (rows={replayLocateRejectionRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4124,6 +4147,7 @@ public sealed record AppOptions(
     string ReplayCorporateActionsInputPath,
     string ReplaySymbolMappingsInputPath,
     string ReplayDelistEventsInputPath,
+    string ReplayBorrowLocateInputPath,
     string ReplayPriceNormalization,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
@@ -4265,6 +4289,7 @@ public sealed record AppOptions(
         var replayCorporateActionsInputPath = string.Empty;
         var replaySymbolMappingsInputPath = string.Empty;
         var replayDelistEventsInputPath = string.Empty;
+        var replayBorrowLocateInputPath = string.Empty;
         var replayPriceNormalization = "raw";
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
@@ -4697,6 +4722,9 @@ public sealed record AppOptions(
                 case "--replay-delist-events-input" when i + 1 < args.Length:
                     replayDelistEventsInputPath = args[++i];
                     break;
+                case "--replay-borrow-locate-input" when i + 1 < args.Length:
+                    replayBorrowLocateInputPath = args[++i];
+                    break;
                 case "--replay-price-normalization" when i + 1 < args.Length:
                     replayPriceNormalization = args[++i];
                     break;
@@ -4885,6 +4913,7 @@ public sealed record AppOptions(
             replayCorporateActionsInputPath,
             replaySymbolMappingsInputPath,
             replayDelistEventsInputPath,
+            replayBorrowLocateInputPath,
             replayPriceNormalization,
             replayIntervalSeconds,
             replayMaxRows,

@@ -42,6 +42,8 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayFillRow> Fills,
     IReadOnlyList<ReplayCorporateActionAppliedRow> AppliedCorporateActions,
     IReadOnlyList<ReplayDelistAppliedRow> AppliedDelists,
+    IReadOnlyList<ReplayFinancingAppliedRow> AppliedFinancing,
+    IReadOnlyList<ReplayLocateRejectionRow> LocateRejections,
     ReplayPortfolioRow Portfolio
 );
 
@@ -68,6 +70,30 @@ public sealed record ReplayDelistAppliedRow(
     string Source
 );
 
+public sealed record ReplayFinancingAppliedRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string FinancingType,
+    double PositionQuantity,
+    double MarketPrice,
+    double RateBps,
+    double QuantityApplied,
+    double CashDelta,
+    double CashAfter,
+    string Source
+);
+
+public sealed record ReplayLocateRejectionRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    double Quantity,
+    string Reason,
+    bool LocateAvailable,
+    double LocateFeePerShare,
+    string Source
+);
+
 public sealed class ReplayExecutionSimulator
 {
     private readonly double _commissionPerUnit;
@@ -79,6 +105,7 @@ public sealed class ReplayExecutionSimulator
     private readonly IReadOnlyList<ReplayCorporateActionRow> _corporateActions;
     private int _corporateActionCursor;
     private readonly ReplayPriceNormalizationMode _normalizationMode;
+    private DateTime? _lastFinancingTimestampUtc;
 
     public ReplayExecutionSimulator(
         double initialCash,
@@ -95,6 +122,7 @@ public sealed class ReplayExecutionSimulator
             .ToArray();
         _normalizationMode = normalizationMode;
         _corporateActionCursor = 0;
+        _lastFinancingTimestampUtc = null;
     }
 
     public static IReadOnlyList<ReplayOrderIntent> LoadOrderIntents(string inputPath, int maxRows)
@@ -122,7 +150,8 @@ public sealed class ReplayExecutionSimulator
         StrategyDataSlice slice,
         string defaultSymbol,
         IReadOnlyList<ReplayOrderIntent> intents,
-        IReadOnlyList<ReplayDelistEventRow> dueDelistEvents)
+        IReadOnlyList<ReplayDelistEventRow> dueDelistEvents,
+        ReplayBorrowLocateProfileRow borrowLocateProfile)
     {
         var symbol = string.IsNullOrWhiteSpace(defaultSymbol)
             ? (slice.TopTicks.FirstOrDefault()?.Value ?? "N/A")
@@ -132,11 +161,19 @@ public sealed class ReplayExecutionSimulator
         var accepted = new List<ReplayOrderIntent>();
         var appliedActions = ApplyCorporateActions(slice.TimestampUtc, symbol);
         var appliedDelists = new List<ReplayDelistAppliedRow>();
+        var appliedFinancing = new List<ReplayFinancingAppliedRow>();
+        var locateRejections = new List<ReplayLocateRejectionRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
             ? bar.Close
             : (slice.TopTicks.FirstOrDefault()?.Price ?? 0);
+
+        var borrowCharge = ApplyBorrowFinancing(slice.TimestampUtc, symbol, markPrice, borrowLocateProfile);
+        if (borrowCharge is not null)
+        {
+            appliedFinancing.Add(borrowCharge);
+        }
 
         if (dueDelistEvents.Count > 0)
         {
@@ -196,10 +233,24 @@ public sealed class ReplayExecutionSimulator
                 continue;
             }
 
+            var locateValidation = ValidateLocateAndApplyFee(normalized, fillPrice.Value, borrowLocateProfile);
+            if (locateValidation.Rejected is not null)
+            {
+                locateRejections.Add(locateValidation.Rejected);
+                continue;
+            }
+
+            if (locateValidation.FeeApplied is not null)
+            {
+                appliedFinancing.Add(locateValidation.FeeApplied);
+            }
+
             accepted.Add(normalized);
             var fill = ApplyFill(normalized, fillPrice.Value);
             fills.Add(fill);
         }
+
+        _lastFinancingTimestampUtc = slice.TimestampUtc;
 
         var unrealizedPnl = (_positionQuantity == 0 || markPrice <= 0)
             ? 0
@@ -217,7 +268,110 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, portfolio);
+    }
+
+    private ReplayFinancingAppliedRow? ApplyBorrowFinancing(
+        DateTime timestampUtc,
+        string symbol,
+        double markPrice,
+        ReplayBorrowLocateProfileRow profile)
+    {
+        if (_lastFinancingTimestampUtc is null)
+        {
+            return null;
+        }
+
+        if (_positionQuantity >= 0 || markPrice <= 0 || profile.BorrowRateBps <= 0)
+        {
+            return null;
+        }
+
+        var elapsedDays = (timestampUtc - _lastFinancingTimestampUtc.Value).TotalDays;
+        if (elapsedDays <= 0)
+        {
+            return null;
+        }
+
+        var shortShares = Math.Abs(_positionQuantity);
+        var rate = profile.BorrowRateBps / 10000.0;
+        var charge = shortShares * markPrice * rate * (elapsedDays / 365.0);
+        if (charge <= 0)
+        {
+            return null;
+        }
+
+        _cash -= charge;
+        return new ReplayFinancingAppliedRow(
+            timestampUtc,
+            symbol,
+            "BORROW",
+            _positionQuantity,
+            markPrice,
+            profile.BorrowRateBps,
+            shortShares,
+            -charge,
+            _cash,
+            profile.Source);
+    }
+
+    private (ReplayFinancingAppliedRow? FeeApplied, ReplayLocateRejectionRow? Rejected) ValidateLocateAndApplyFee(
+        ReplayOrderIntent intent,
+        double fillPrice,
+        ReplayBorrowLocateProfileRow profile)
+    {
+        var side = ParseSide(intent.Side);
+        if (side >= 0)
+        {
+            return (null, null);
+        }
+
+        var signedQuantity = side * intent.Quantity;
+        var projected = _positionQuantity + signedQuantity;
+        var currentShort = Math.Max(0, -_positionQuantity);
+        var projectedShort = Math.Max(0, -projected);
+        var incrementalShort = projectedShort - currentShort;
+
+        if (incrementalShort <= 0)
+        {
+            return (null, null);
+        }
+
+        if (!profile.LocateAvailable)
+        {
+            return (
+                null,
+                new ReplayLocateRejectionRow(
+                    intent.TimestampUtc,
+                    intent.Symbol,
+                    intent.Side,
+                    intent.Quantity,
+                    "LOCATE_UNAVAILABLE",
+                    profile.LocateAvailable,
+                    profile.LocateFeePerShare,
+                    profile.Source));
+        }
+
+        if (profile.LocateFeePerShare <= 0)
+        {
+            return (null, null);
+        }
+
+        var fee = incrementalShort * profile.LocateFeePerShare;
+        _cash -= fee;
+        return (
+            new ReplayFinancingAppliedRow(
+                intent.TimestampUtc,
+                intent.Symbol,
+                "LOCATE_FEE",
+                _positionQuantity,
+                fillPrice,
+                0,
+                incrementalShort,
+                -fee,
+                _cash,
+                profile.Source),
+            null);
     }
 
     private (ReplayOrderIntent Order, ReplayFillRow Fill, double PositionQuantityBefore)? ApplyTerminalDelistLiquidation(
