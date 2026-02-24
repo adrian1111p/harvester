@@ -159,6 +159,10 @@ public sealed class ReplayExecutionSimulator
     private readonly ReplayPriceNormalizationMode _normalizationMode;
     private readonly double _initialMarginRate;
     private readonly double _maintenanceMarginRate;
+    private readonly double _secFeeRatePerDollar;
+    private readonly double _tafFeePerShare;
+    private readonly double _tafFeeCapPerOrder;
+    private readonly double _exchangeFeePerShare;
     private readonly int _settlementLagDays;
     private readonly bool _enforceSettledCash;
     private double _settledCash;
@@ -173,6 +177,10 @@ public sealed class ReplayExecutionSimulator
         ReplayPriceNormalizationMode normalizationMode,
         double initialMarginRate,
         double maintenanceMarginRate,
+        double secFeeRatePerDollar,
+        double tafFeePerShare,
+        double tafFeeCapPerOrder,
+        double exchangeFeePerShare,
         int settlementLagDays,
         bool enforceSettledCash)
     {
@@ -186,6 +194,10 @@ public sealed class ReplayExecutionSimulator
         _normalizationMode = normalizationMode;
         _initialMarginRate = Math.Max(0, initialMarginRate);
         _maintenanceMarginRate = Math.Max(0, maintenanceMarginRate);
+        _secFeeRatePerDollar = Math.Max(0, secFeeRatePerDollar);
+        _tafFeePerShare = Math.Max(0, tafFeePerShare);
+        _tafFeeCapPerOrder = Math.Max(0, tafFeeCapPerOrder);
+        _exchangeFeePerShare = Math.Max(0, exchangeFeePerShare);
         _settlementLagDays = Math.Max(0, settlementLagDays);
         _enforceSettledCash = enforceSettledCash;
         _pendingSettlements = [];
@@ -727,7 +739,12 @@ public sealed class ReplayExecutionSimulator
     {
         var side = ParseSide(intent.Side);
         var signedQuantity = side * intent.Quantity;
-        var commission = intent.Quantity * _commissionPerUnit;
+        var baseCommission = intent.Quantity * _commissionPerUnit;
+        var secFee = side < 0 ? (intent.Quantity * fillPrice * _secFeeRatePerDollar) : 0.0;
+        var tafFeeRaw = side < 0 ? (intent.Quantity * _tafFeePerShare) : 0.0;
+        var tafFee = _tafFeeCapPerOrder > 0 ? Math.Min(tafFeeRaw, _tafFeeCapPerOrder) : tafFeeRaw;
+        var exchangeFee = intent.Quantity * _exchangeFeePerShare;
+        var commission = baseCommission + secFee + tafFee + exchangeFee;
 
         var realizedDelta = 0.0;
         if (_positionQuantity != 0 && Math.Sign(_positionQuantity) != Math.Sign(signedQuantity))

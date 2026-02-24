@@ -2931,6 +2931,10 @@ public sealed class SnapshotRuntime
             replayNormalizationMode,
             _options.ReplayInitialMarginRate,
             _options.ReplayMaintenanceMarginRate,
+            _options.ReplaySecFeeRatePerDollar,
+            _options.ReplayTafFeePerShare,
+            _options.ReplayTafFeeCapPerOrder,
+            _options.ReplayExchangeFeePerShare,
             _options.ReplaySettlementLagDays,
             _options.ReplayEnforceSettledCash);
         var replayOrderRows = new List<ReplayOrderIntent>();
@@ -3043,10 +3047,41 @@ public sealed class SnapshotRuntime
         var replayMarginEventsPath = Path.Combine(outputDir, $"strategy_replay_margin_events_{timestamp}.json");
         var replayCashSettlementsPath = Path.Combine(outputDir, $"strategy_replay_cash_settlements_{timestamp}.json");
         var replayCashRejectionsPath = Path.Combine(outputDir, $"strategy_replay_cash_rejections_{timestamp}.json");
+        var replayFeeBreakdownPath = Path.Combine(outputDir, $"strategy_replay_fee_breakdown_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
         var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
+
+        var replayFeeBreakdownRows = replayFillRows
+            .Select(fill =>
+            {
+                var baseCommission = fill.Quantity * _options.ReplayCommissionPerUnit;
+                var secFee = string.Equals(fill.Side, "SELL", StringComparison.OrdinalIgnoreCase)
+                    ? (fill.Quantity * fill.FillPrice * _options.ReplaySecFeeRatePerDollar)
+                    : 0.0;
+                var tafRaw = string.Equals(fill.Side, "SELL", StringComparison.OrdinalIgnoreCase)
+                    ? (fill.Quantity * _options.ReplayTafFeePerShare)
+                    : 0.0;
+                var tafFee = _options.ReplayTafFeeCapPerOrder > 0
+                    ? Math.Min(tafRaw, _options.ReplayTafFeeCapPerOrder)
+                    : tafRaw;
+                var exchangeFee = fill.Quantity * _options.ReplayExchangeFeePerShare;
+
+                return new ReplayFeeBreakdownArtifactRow(
+                    fill.TimestampUtc,
+                    fill.Symbol,
+                    fill.Side,
+                    fill.Quantity,
+                    fill.FillPrice,
+                    baseCommission,
+                    secFee,
+                    tafFee,
+                    exchangeFee,
+                    fill.Commission,
+                    fill.Source);
+            })
+            .ToArray();
 
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
@@ -3064,6 +3099,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayMarginEventsPath, replayMarginEventRows);
         WriteJson(replayCashSettlementsPath, replayCashSettlementRows);
         WriteJson(replayCashRejectionsPath, replayCashRejectionRows);
+        WriteJson(replayFeeBreakdownPath, replayFeeBreakdownRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3081,6 +3117,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay margin events export: {replayMarginEventsPath} (rows={replayMarginEventRows.Count})");
         Console.WriteLine($"[OK] Strategy replay cash settlements export: {replayCashSettlementsPath} (rows={replayCashSettlementRows.Count})");
         Console.WriteLine($"[OK] Strategy replay cash rejections export: {replayCashRejectionsPath} (rows={replayCashRejectionRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay fee breakdown export: {replayFeeBreakdownPath} (rows={replayFeeBreakdownRows.Length})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4180,6 +4217,10 @@ public sealed record AppOptions(
     double ReplaySlippageBps,
     double ReplayInitialMarginRate,
     double ReplayMaintenanceMarginRate,
+    double ReplaySecFeeRatePerDollar,
+    double ReplayTafFeePerShare,
+    double ReplayTafFeeCapPerOrder,
+    double ReplayExchangeFeePerShare,
     int ReplaySettlementLagDays,
     bool ReplayEnforceSettledCash,
     bool HeartbeatMonitorEnabled,
@@ -4326,6 +4367,10 @@ public sealed record AppOptions(
         var replaySlippageBps = preTradeSlippageBps;
         var replayInitialMarginRate = 0.50;
         var replayMaintenanceMarginRate = 0.30;
+        var replaySecFeeRatePerDollar = 0.0;
+        var replayTafFeePerShare = 0.0;
+        var replayTafFeeCapPerOrder = 0.0;
+        var replayExchangeFeePerShare = 0.0;
         var replaySettlementLagDays = 2;
         var replayEnforceSettledCash = true;
         var heartbeatMonitorEnabled = true;
@@ -4788,6 +4833,22 @@ public sealed record AppOptions(
                     replayMaintenanceMarginRate = Math.Max(0, rmmr);
                     i++;
                     break;
+                case "--replay-sec-fee-rate" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rsfr):
+                    replaySecFeeRatePerDollar = Math.Max(0, rsfr);
+                    i++;
+                    break;
+                case "--replay-taf-fee-per-share" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rtfs):
+                    replayTafFeePerShare = Math.Max(0, rtfs);
+                    i++;
+                    break;
+                case "--replay-taf-fee-cap" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rtfc):
+                    replayTafFeeCapPerOrder = Math.Max(0, rtfc);
+                    i++;
+                    break;
+                case "--replay-exchange-fee-per-share" when i + 1 < args.Length && double.TryParse(args[i + 1], out var refs):
+                    replayExchangeFeePerShare = Math.Max(0, refs);
+                    i++;
+                    break;
                 case "--replay-settlement-lag-days" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rsld):
                     replaySettlementLagDays = Math.Max(0, rsld);
                     i++;
@@ -4969,6 +5030,10 @@ public sealed record AppOptions(
             replaySlippageBps,
             replayInitialMarginRate,
             replayMaintenanceMarginRate,
+            replaySecFeeRatePerDollar,
+            replayTafFeePerShare,
+            replayTafFeeCapPerOrder,
+            replayExchangeFeePerShare,
             replaySettlementLagDays,
             replayEnforceSettledCash,
             heartbeatMonitorEnabled,
@@ -5361,4 +5426,18 @@ public sealed record StrategySchedulerEventArtifactRow(
     string Mode,
     string ExchangeCalendar,
     string EventName
+);
+
+public sealed record ReplayFeeBreakdownArtifactRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    double Quantity,
+    double FillPrice,
+    double BrokerCommission,
+    double SecFee,
+    double TafFee,
+    double ExchangeFee,
+    double TotalFees,
+    string Source
 );
