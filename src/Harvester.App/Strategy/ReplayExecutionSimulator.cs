@@ -257,6 +257,7 @@ public sealed class ReplayExecutionSimulator
     private readonly HashSet<string> _filledOrderIds;
     private int _generatedOrderIdSeed;
     private DateTime? _lastFinancingTimestampUtc;
+    private DateTime? _lastProcessedSliceDateUtc;
 
     public ReplayExecutionSimulator(
         double initialCash,
@@ -299,6 +300,7 @@ public sealed class ReplayExecutionSimulator
         _generatedOrderIdSeed = 0;
         _corporateActionCursor = 0;
         _lastFinancingTimestampUtc = null;
+        _lastProcessedSliceDateUtc = null;
     }
 
     public static IReadOnlyList<ReplayOrderIntent> LoadOrderIntents(string inputPath, int maxRows)
@@ -356,6 +358,8 @@ public sealed class ReplayExecutionSimulator
         var availableSliceQuantity = bar is null
             ? double.MaxValue
             : Math.Max(0, (double)bar.Volume * _maxFillParticipationRate);
+        var isSessionOpenSlice = !_lastProcessedSliceDateUtc.HasValue
+            || _lastProcessedSliceDateUtc.Value != slice.TimestampUtc.Date;
 
         var borrowCharge = ApplyBorrowFinancing(slice.TimestampUtc, symbol, markPrice, borrowLocateProfile);
         if (borrowCharge is not null)
@@ -489,7 +493,7 @@ public sealed class ReplayExecutionSimulator
             }
 
             var executableIntent = GetExecutableIntent(active, slice.TimestampUtc);
-            var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice);
+            var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice, isSessionOpenSlice);
             if (fillPrice is null)
             {
                 continue;
@@ -563,6 +567,7 @@ public sealed class ReplayExecutionSimulator
         }
 
         _lastFinancingTimestampUtc = slice.TimestampUtc;
+        _lastProcessedSliceDateUtc = slice.TimestampUtc.Date;
 
         var unrealizedPnl = (_positionQuantity == 0 || markPrice <= 0)
             ? 0
@@ -1307,12 +1312,37 @@ public sealed class ReplayExecutionSimulator
         return applied;
     }
 
-    private double? ResolveFillPrice(ReplayOrderIntent intent, HistoricalBarRow? bar, double markPrice)
+    private double? ResolveFillPrice(ReplayOrderIntent intent, HistoricalBarRow? bar, double markPrice, bool isSessionOpenSlice)
     {
         var side = ParseSide(intent.Side);
         if (side == 0)
         {
             return null;
+        }
+
+        if (IsMarketOnOpenOrder(intent))
+        {
+            if (!isSessionOpenSlice)
+            {
+                return null;
+            }
+
+            if (bar is not null && bar.Open > 0)
+            {
+                return bar.Open;
+            }
+
+            return markPrice > 0 ? markPrice : null;
+        }
+
+        if (IsMarketOnCloseOrderType(intent.OrderType))
+        {
+            if (bar is not null && bar.Close > 0)
+            {
+                return bar.Close;
+            }
+
+            return markPrice > 0 ? markPrice : null;
         }
 
         if (string.Equals(intent.OrderType, "LMT", StringComparison.OrdinalIgnoreCase)
@@ -1343,6 +1373,35 @@ public sealed class ReplayExecutionSimulator
 
         var slippageFactor = 1 + (side * (_slippageBps / 10000.0));
         return markPrice * slippageFactor;
+    }
+
+    private static bool IsMarketOnOpenOrder(ReplayOrderIntent intent)
+    {
+        return IsMarketOnOpenOrderType(intent.OrderType)
+            || (string.Equals(intent.OrderType, "MKT", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(intent.TimeInForce, "OPG", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsMarketOnOpenOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "MOO" or "MARKETONOPEN";
+    }
+
+    private static bool IsMarketOnCloseOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "MOC" or "MARKETONCLOSE";
     }
 
     private ReplayFillRow ApplyFill(
