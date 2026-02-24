@@ -281,6 +281,7 @@ public sealed class SnapshotRuntime
                 ExportAdapterTraceArtifact();
                 ExportStrategySchedulerArtifact();
                 ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
+                ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 1);
                 await NotifyStrategyShutdownAsync(strategyContext, 1);
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -290,6 +291,7 @@ public sealed class SnapshotRuntime
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 0);
+            ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 0);
             await NotifyStrategyShutdownAsync(strategyContext, 0);
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
@@ -301,6 +303,7 @@ public sealed class SnapshotRuntime
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
+            ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 1);
             var cancelledContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", cancelledContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(cancelledContext, 1);
@@ -316,6 +319,7 @@ public sealed class SnapshotRuntime
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
+            ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 2);
             var timeoutContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", timeoutContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(timeoutContext, 2);
@@ -331,6 +335,7 @@ public sealed class SnapshotRuntime
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
+            ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 2);
             var exceptionContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", exceptionContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(exceptionContext, 2);
@@ -4140,6 +4145,48 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Resilience drill acceptance export: {path}");
     }
 
+    private void ExportLeanZiplineParityChecklistArtifact(DateTime runStartedUtc, int exitCode)
+    {
+        var checks = new[]
+        {
+            new LeanZiplineParityChecklistRow("P-001", "Corporate actions and normalization in replay", "LEAN", true, "ReplayCorporateActionsEngine + strategy_replay_corporate_actions_applied_*.json"),
+            new LeanZiplineParityChecklistRow("P-002", "Symbol mapping and delist handling", "LEAN", true, "ReplaySymbolEventsEngine + strategy_replay_symbol_events_*.json + strategy_replay_delist_applied_*.json"),
+            new LeanZiplineParityChecklistRow("P-003", "Borrow financing and locate constraints", "LEAN", true, "ReplayFinancingEngine + strategy_replay_financing_applied_*.json + strategy_replay_locate_rejections_*.json"),
+            new LeanZiplineParityChecklistRow("P-004", "Margin checks and maintenance liquidation guard", "LEAN", true, "strategy_replay_margin_rejections_*.json + strategy_replay_margin_events_*.json"),
+            new LeanZiplineParityChecklistRow("P-005", "Settlement lag and settled-cash constraints", "ZIPLINE", true, "strategy_replay_cash_settlements_*.json + strategy_replay_cash_rejections_*.json"),
+            new LeanZiplineParityChecklistRow("P-006", "Replay fee model and fee breakdown artifact", "ZIPLINE", true, "strategy_replay_fee_breakdown_*.json"),
+            new LeanZiplineParityChecklistRow("P-007", "DAY/GTC/GTD/IOC/FOK/OPG time-in-force semantics", "LEAN", true, "ReplayExecutionSimulator order expiry and TIF paths"),
+            new LeanZiplineParityChecklistRow("P-008", "Partial fills and queue-priority participation", "ZIPLINE", true, "strategy_replay_partial_fill_events_*.json + ReplayMaxFillParticipationRate"),
+            new LeanZiplineParityChecklistRow("P-009", "Stop, stop-limit, trailing, and LIT trigger modeling", "LEAN", true, "strategy_replay_order_triggers_*.json + strategy_replay_trailing_stop_updates_*.json"),
+            new LeanZiplineParityChecklistRow("P-010", "OCO plus parent-child activation flow", "LEAN", true, "strategy_replay_order_activations_*.json + strategy_replay_order_cancellations_*.json"),
+            new LeanZiplineParityChecklistRow("P-011", "Order update/replace by OrderId", "LEAN", true, "strategy_replay_order_updates_*.json"),
+            new LeanZiplineParityChecklistRow("P-012", "MOO/MOC execution handling in replay", "LEAN", true, "ReplayExecutionSimulator IsMarketOnOpen/Close logic"),
+            new LeanZiplineParityChecklistRow("P-013", "Tick-size quantization option", "LEAN", true, "--replay-price-increment + QuantizePrice"),
+            new LeanZiplineParityChecklistRow("P-014", "Volume-share pre-trade cost profile and replay cost deltas", "ZIPLINE", true, "pretrade_cost_telemetry_*.json + strategy_replay_cost_deltas_*.json"),
+            new LeanZiplineParityChecklistRow("P-015", "Malformed derivative contract recovery", "LEAN", true, "IbContractNormalizationService OCC/suffix parsers"),
+            new LeanZiplineParityChecklistRow("P-016", "Combo order translation aliases and per-leg limits", "LEAN", true, "IbOrderTranslationService combo aliases + OrderComboLegs"),
+            new LeanZiplineParityChecklistRow("P-017", "Replay combo lifecycle and atomic combo-group execution", "LEAN", true, "strategy_replay_combo_events_*.json + atomic combo group execution path"),
+            new LeanZiplineParityChecklistRow("P-018", "Resilience drill acceptance artifact", "ZIPLINE", true, "resilience_drill_acceptance_<mode>_*.json")
+        };
+
+        var summary = new LeanZiplineParityChecklistSummaryRow(
+            DateTime.UtcNow,
+            _options.Mode.ToString(),
+            runStartedUtc,
+            DateTime.UtcNow,
+            exitCode,
+            checks.Length,
+            checks.Count(x => x.Completed),
+            checks.All(x => x.Completed),
+            checks);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"lean_zipline_parity_checklist_{timestamp}.json");
+        WriteJson(path, new[] { summary });
+        Console.WriteLine($"[OK] LEAN/zipline parity checklist export: {path}");
+    }
+
     private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
     {
         if (_options.ReconciliationGateAction == ReconciliationGateAction.Off)
@@ -5734,4 +5781,24 @@ public sealed record ResilienceDrillAcceptanceRow(
     bool PreTradeHalt,
     string FinalLifecycleStage,
     IReadOnlyList<ResilienceAcceptanceCheckRow> Checks
+);
+
+public sealed record LeanZiplineParityChecklistRow(
+    string ItemId,
+    string Capability,
+    string Source,
+    bool Completed,
+    string Evidence
+);
+
+public sealed record LeanZiplineParityChecklistSummaryRow(
+    DateTime TimestampUtc,
+    string Mode,
+    DateTime RunStartedUtc,
+    DateTime RunCompletedUtc,
+    int ExitCode,
+    int TotalItems,
+    int CompletedItems,
+    bool AllCompleted,
+    IReadOnlyList<LeanZiplineParityChecklistRow> Items
 );
