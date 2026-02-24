@@ -3066,6 +3066,7 @@ public sealed class SnapshotRuntime
         var replayOrderTriggersPath = Path.Combine(outputDir, $"strategy_replay_order_triggers_{timestamp}.json");
         var replayOrderCancellationsPath = Path.Combine(outputDir, $"strategy_replay_order_cancellations_{timestamp}.json");
         var replayFeeBreakdownPath = Path.Combine(outputDir, $"strategy_replay_fee_breakdown_{timestamp}.json");
+        var replayCostDeltasPath = Path.Combine(outputDir, $"strategy_replay_cost_deltas_{timestamp}.json");
         var replayPartialFillEventsPath = Path.Combine(outputDir, $"strategy_replay_partial_fill_events_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
@@ -3117,6 +3118,59 @@ public sealed class SnapshotRuntime
                 fill.Source))
             .ToArray();
 
+        var closeByTimestampAndSymbol = slices
+            .Select(slice =>
+            {
+                var symbol = slice.TopTicks.FirstOrDefault()?.Value
+                    ?? strategyContext.Symbol;
+                var close = slice.HistoricalBars.FirstOrDefault()?.Close
+                    ?? slice.TopTicks.FirstOrDefault()?.Price
+                    ?? 0.0;
+
+                return new
+                {
+                    slice.TimestampUtc,
+                    Symbol = symbol.ToUpperInvariant(),
+                    Close = close
+                };
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol) && x.Close > 0)
+            .GroupBy(x => (x.TimestampUtc, x.Symbol))
+            .ToDictionary(g => g.Key, g => g.Last().Close);
+
+        var replayCostDeltaRows = replayFillRows
+            .Select(fill =>
+            {
+                var hasReference = closeByTimestampAndSymbol.TryGetValue((fill.TimestampUtc, fill.Symbol.ToUpperInvariant()), out var referencePrice)
+                    && referencePrice > 0;
+
+                var estimatedCommission = fill.Quantity * _options.ReplayCommissionPerUnit;
+                var realizedCommission = fill.Commission;
+                var estimatedSlippage = hasReference
+                    ? (fill.Quantity * referencePrice * (_options.ReplaySlippageBps / 10000.0))
+                    : (double?)null;
+                var realizedSlippage = hasReference
+                    ? ComputeReplayRealizedSlippage(fill.Side, fill.Quantity, referencePrice, fill.FillPrice)
+                    : (double?)null;
+
+                return new ReplayCostDeltaArtifactRow(
+                    fill.TimestampUtc,
+                    fill.Symbol,
+                    fill.Side,
+                    fill.OrderType,
+                    fill.Quantity,
+                    fill.FillPrice,
+                    hasReference ? referencePrice : null,
+                    estimatedCommission,
+                    realizedCommission,
+                    realizedCommission - estimatedCommission,
+                    estimatedSlippage,
+                    realizedSlippage,
+                    estimatedSlippage is null || realizedSlippage is null ? null : realizedSlippage.Value - estimatedSlippage.Value,
+                    fill.Source);
+            })
+            .ToArray();
+
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
 
@@ -3139,6 +3193,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayOrderTriggersPath, replayOrderTriggerRows);
         WriteJson(replayOrderCancellationsPath, replayOrderCancellationRows);
         WriteJson(replayFeeBreakdownPath, replayFeeBreakdownRows);
+        WriteJson(replayCostDeltasPath, replayCostDeltaRows);
         WriteJson(replayPartialFillEventsPath, replayPartialFillRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
@@ -3163,6 +3218,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay order triggers export: {replayOrderTriggersPath} (rows={replayOrderTriggerRows.Count})");
         Console.WriteLine($"[OK] Strategy replay order cancellations export: {replayOrderCancellationsPath} (rows={replayOrderCancellationRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fee breakdown export: {replayFeeBreakdownPath} (rows={replayFeeBreakdownRows.Length})");
+        Console.WriteLine($"[OK] Strategy replay cost delta export: {replayCostDeltasPath} (rows={replayCostDeltaRows.Length})");
         Console.WriteLine($"[OK] Strategy replay partial fill events export: {replayPartialFillEventsPath} (rows={replayPartialFillRows.Length})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
@@ -3585,6 +3641,8 @@ public sealed class SnapshotRuntime
             estimate.Profile,
             orderRef,
             estimate.EstimatedCommission,
+            estimate.EffectiveSlippageBps,
+            estimate.EstimatedVolumeShare,
             null,
             null,
             estimate.EstimatedSlippage,
@@ -3679,6 +3737,20 @@ public sealed class SnapshotRuntime
         var slippagePerUnit = normalizedAction == "SELL"
             ? Math.Max(0, limitPrice - fillPrice)
             : Math.Max(0, fillPrice - limitPrice);
+        return slippagePerUnit * Math.Abs(quantity);
+    }
+
+    private static double ComputeReplayRealizedSlippage(string side, double quantity, double referencePrice, double fillPrice)
+    {
+        if (referencePrice <= 0 || fillPrice <= 0 || quantity <= 0)
+        {
+            return 0;
+        }
+
+        var normalizedSide = (side ?? string.Empty).ToUpperInvariant();
+        var slippagePerUnit = normalizedSide == "SELL"
+            ? Math.Max(0, referencePrice - fillPrice)
+            : Math.Max(0, fillPrice - referencePrice);
         return slippagePerUnit * Math.Abs(quantity);
     }
 
@@ -5145,7 +5217,10 @@ public sealed record AppOptions(
             "micro" => PreTradeCostProfile.MicroEquity,
             "microequity" => PreTradeCostProfile.MicroEquity,
             "conservative" => PreTradeCostProfile.Conservative,
-            _ => throw new ArgumentException($"Unknown pretrade cost profile '{value}'. Use micro|conservative.")
+            "volume-share" => PreTradeCostProfile.VolumeShareImpact,
+            "volumeshare" => PreTradeCostProfile.VolumeShareImpact,
+            "volshare" => PreTradeCostProfile.VolumeShareImpact,
+            _ => throw new ArgumentException($"Unknown pretrade cost profile '{value}'. Use micro|conservative|volume-share.")
         };
     }
 
@@ -5518,5 +5593,22 @@ public sealed record ReplayPartialFillArtifactRow(
     double FilledQuantity,
     double RemainingQuantity,
     double FillPrice,
+    string Source
+);
+
+public sealed record ReplayCostDeltaArtifactRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    string OrderType,
+    double Quantity,
+    double FillPrice,
+    double? ReferencePrice,
+    double EstimatedCommission,
+    double RealizedCommission,
+    double CommissionDelta,
+    double? EstimatedSlippage,
+    double? RealizedSlippage,
+    double? SlippageDelta,
     string Source
 );
