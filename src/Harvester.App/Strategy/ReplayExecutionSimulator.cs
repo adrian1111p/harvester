@@ -443,7 +443,7 @@ public sealed class ReplayExecutionSimulator
         for (var index = _activeOrders.Count - 1; index >= 0; index--)
         {
             var active = _activeOrders[index];
-            if (IsOrderExpired(active, slice.TimestampUtc))
+            if (TryGetOrderExpiry(active, slice.TimestampUtc, out var cancelReason))
             {
                 cancellations.Add(new ReplayOrderCancellationRow(
                     slice.TimestampUtc,
@@ -454,7 +454,7 @@ public sealed class ReplayExecutionSimulator
                     active.Intent.TimeInForce,
                     active.SubmittedAtUtc,
                     active.Intent.ExpireAtUtc,
-                    "EXPIRED",
+                    cancelReason,
                     active.Intent.Source));
                 _activeOrders.RemoveAt(index);
                 continue;
@@ -977,20 +977,48 @@ public sealed class ReplayExecutionSimulator
         return normalized is "TRAIL" or "TRAILINGSTOP" or "TRAILSTOP" or "TRAILLMT" or "TRAILLIMIT";
     }
 
-    private static bool IsOrderExpired(ActiveReplayOrder order, DateTime sliceTimestampUtc)
+    private static bool TryGetOrderExpiry(ActiveReplayOrder order, DateTime sliceTimestampUtc, out string cancelReason)
     {
+        cancelReason = string.Empty;
+
         if (order.Intent.ExpireAtUtc.HasValue && order.Intent.ExpireAtUtc.Value <= sliceTimestampUtc)
         {
+            cancelReason = "EXPIRE_AT_REACHED";
             return true;
         }
 
-        var tif = string.IsNullOrWhiteSpace(order.Intent.TimeInForce) ? "DAY" : order.Intent.TimeInForce;
+        var tif = string.IsNullOrWhiteSpace(order.Intent.TimeInForce)
+            ? "DAY"
+            : order.Intent.TimeInForce.ToUpperInvariant();
+
+        if (string.Equals(tif, "GTD", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!order.Intent.ExpireAtUtc.HasValue)
+            {
+                if (order.SubmittedAtUtc.Date < sliceTimestampUtc.Date)
+                {
+                    cancelReason = "GTD_MISSING_EXPIRE_AT";
+                    return true;
+                }
+
+                return false;
+            }
+
+            return false;
+        }
+
         if (string.Equals(tif, "GTC", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        return order.SubmittedAtUtc.Date < sliceTimestampUtc.Date;
+        if (order.SubmittedAtUtc.Date < sliceTimestampUtc.Date)
+        {
+            cancelReason = "DAY_EXPIRED";
+            return true;
+        }
+
+        return false;
     }
 
     private IReadOnlyList<ReplayCashSettlementRow> ApplyDueSettlements(DateTime timestampUtc, string symbol)
