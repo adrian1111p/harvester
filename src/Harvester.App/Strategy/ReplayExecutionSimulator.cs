@@ -481,11 +481,52 @@ public sealed class ReplayExecutionSimulator
             ? _activeOrders.OrderBy(x => x.SubmittedAtUtc).ToArray()
             : _activeOrders.ToArray();
 
+        var processedComboOrderIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var orderedComboGroups = orderedActiveOrders
+            .Where(x => x.IsActive)
+            .Where(x => !string.IsNullOrWhiteSpace(x.Intent.ComboGroupId))
+            .GroupBy(x => x.Intent.ComboGroupId, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(g => g.Min(x => x.SubmittedAtUtc))
+            .ToArray();
+
+        foreach (var comboGroup in orderedComboGroups)
+        {
+            if (availableSliceQuantity <= 0)
+            {
+                break;
+            }
+
+            TryExecuteAtomicComboGroup(
+                comboGroup.Key,
+                slice,
+                bar,
+                markPrice,
+                isSessionOpenSlice,
+                borrowLocateProfile,
+                fills,
+                appliedFinancing,
+                locateRejections,
+                marginRejections,
+                cashRejections,
+                activations,
+                comboEvents,
+                trailingStopUpdates,
+                triggers,
+                cancellations,
+                processedComboOrderIds,
+                ref availableSliceQuantity);
+        }
+
         foreach (var active in orderedActiveOrders)
         {
             if (availableSliceQuantity <= 0)
             {
                 break;
+            }
+
+            if (processedComboOrderIds.Contains(active.Intent.OrderId))
+            {
+                continue;
             }
 
             if (!_activeOrders.Contains(active) || !active.IsActive)
@@ -731,6 +772,281 @@ public sealed class ReplayExecutionSimulator
 
             _activeOrders.Remove(sibling);
         }
+    }
+
+    private void TryExecuteAtomicComboGroup(
+        string comboGroupId,
+        StrategyDataSlice slice,
+        HistoricalBarRow? bar,
+        double markPrice,
+        bool isSessionOpenSlice,
+        ReplayBorrowLocateProfileRow borrowLocateProfile,
+        List<ReplayFillRow> fills,
+        List<ReplayFinancingAppliedRow> appliedFinancing,
+        List<ReplayLocateRejectionRow> locateRejections,
+        List<ReplayMarginRejectionRow> marginRejections,
+        List<ReplayCashRejectionRow> cashRejections,
+        List<ReplayOrderActivationRow> activations,
+        List<ReplayComboLifecycleRow> comboEvents,
+        List<ReplayTrailingStopUpdateRow> trailingStopUpdates,
+        List<ReplayOrderTriggerRow> triggers,
+        List<ReplayOrderCancellationRow> cancellations,
+        HashSet<string> processedComboOrderIds,
+        ref double availableSliceQuantity)
+    {
+        var legs = _activeOrders
+            .Where(x => x.IsActive)
+            .Where(x => string.Equals(x.Intent.ComboGroupId, comboGroupId, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.SubmittedAtUtc)
+            .ToArray();
+
+        if (legs.Length == 0)
+        {
+            return;
+        }
+
+        foreach (var leg in legs)
+        {
+            processedComboOrderIds.Add(leg.Intent.OrderId);
+        }
+
+        foreach (var leg in legs)
+        {
+            if (TryUpdateTrailingStop(leg, slice.TimestampUtc, bar, markPrice, out var trailingUpdate))
+            {
+                trailingStopUpdates.Add(trailingUpdate);
+            }
+
+            if (TryTriggerStopOrder(leg, slice.TimestampUtc, bar, markPrice, out var triggerRow))
+            {
+                triggers.Add(triggerRow);
+            }
+
+            if (TryTriggerTouchedOrder(leg, slice.TimestampUtc, bar, markPrice, out var touchedTriggerRow))
+            {
+                triggers.Add(touchedTriggerRow);
+            }
+        }
+
+        if (legs.Any(leg => !CanExecuteOnSlice(leg)))
+        {
+            return;
+        }
+
+        var executableLegs = legs
+            .Select(leg => (Active: leg, Intent: GetExecutableIntent(leg, slice.TimestampUtc)))
+            .ToArray();
+
+        var pricedLegs = new List<(ActiveReplayOrder Active, ReplayOrderIntent Intent, double FillPrice)>();
+        foreach (var leg in executableLegs)
+        {
+            var fillPrice = ResolveFillPrice(leg.Intent, bar, markPrice, isSessionOpenSlice);
+            if (!fillPrice.HasValue)
+            {
+                if (IsImmediateOrCancelTimeInForce(leg.Active.Intent.TimeInForce))
+                {
+                    CancelEntireComboGroup(
+                        comboGroupId,
+                        slice.TimestampUtc,
+                        cancellations,
+                        comboEvents,
+                        IsFillOrKillTimeInForce(leg.Active.Intent.TimeInForce)
+                            ? "FOK_NOT_FILLED_IMMEDIATE"
+                            : "IOC_NOT_FILLED_IMMEDIATE");
+                }
+
+                return;
+            }
+
+            pricedLegs.Add((leg.Active, leg.Intent, fillPrice.Value));
+        }
+
+        if (pricedLegs.Count == 0)
+        {
+            return;
+        }
+
+        var maxGroupFillQuantity = Math.Min(
+            availableSliceQuantity,
+            pricedLegs.Min(x => x.Active.RemainingQuantity));
+        if (maxGroupFillQuantity <= 0)
+        {
+            return;
+        }
+
+        if (pricedLegs.Any(x => IsFillOrKillTimeInForce(x.Active.Intent.TimeInForce)
+            && maxGroupFillQuantity + 1e-9 < x.Active.RemainingQuantity))
+        {
+            CancelEntireComboGroup(comboGroupId, slice.TimestampUtc, cancellations, comboEvents, "FOK_NOT_FULLY_FILLABLE");
+            return;
+        }
+
+        var tempCash = _cash;
+        var tempSettledCash = _settledCash;
+        var tempPosition = _positionQuantity;
+        var locateFeeRows = new List<ReplayFinancingAppliedRow>();
+
+        foreach (var leg in pricedLegs)
+        {
+            var intent = leg.Intent with
+            {
+                TimestampUtc = slice.TimestampUtc,
+                Quantity = maxGroupFillQuantity
+            };
+
+            var locatePreview = ValidateLocatePreview(intent, leg.FillPrice, borrowLocateProfile, tempPosition);
+            if (locatePreview.Rejected is not null)
+            {
+                locateRejections.Add(locatePreview.Rejected);
+                CancelEntireComboGroup(comboGroupId, slice.TimestampUtc, cancellations, comboEvents, locatePreview.Rejected.Reason);
+                return;
+            }
+
+            if (locatePreview.FeeApplied is not null)
+            {
+                locateFeeRows.Add(locatePreview.FeeApplied);
+                tempCash += locatePreview.FeeApplied.CashDelta;
+            }
+
+            var cashPreview = ValidateSettledCashPreview(intent, leg.FillPrice, tempSettledCash);
+            if (cashPreview is not null)
+            {
+                cashRejections.Add(cashPreview);
+                CancelEntireComboGroup(comboGroupId, slice.TimestampUtc, cancellations, comboEvents, cashPreview.Reason);
+                return;
+            }
+
+            var marginPreview = ValidateInitialMarginPreview(intent, leg.FillPrice, tempCash, tempPosition);
+            if (marginPreview is not null)
+            {
+                marginRejections.Add(marginPreview);
+                CancelEntireComboGroup(comboGroupId, slice.TimestampUtc, cancellations, comboEvents, marginPreview.Reason);
+                return;
+            }
+
+            var side = ParseSide(intent.Side);
+            var signedQuantity = side * intent.Quantity;
+            tempPosition += signedQuantity;
+
+            var notional = intent.Quantity * leg.FillPrice;
+            var settlementCommission = intent.Quantity * _commissionPerUnit;
+            if (side > 0)
+            {
+                tempSettledCash -= (notional + settlementCommission);
+            }
+            else if (side < 0)
+            {
+                tempSettledCash -= settlementCommission;
+                if (_settlementLagDays == 0)
+                {
+                    tempSettledCash += notional;
+                }
+            }
+        }
+
+        foreach (var feeRow in locateFeeRows)
+        {
+            _cash += feeRow.CashDelta;
+            appliedFinancing.Add(feeRow with { CashAfter = _cash });
+        }
+
+        foreach (var leg in pricedLegs)
+        {
+            var executableIntent = leg.Intent with
+            {
+                TimestampUtc = slice.TimestampUtc,
+                Quantity = maxGroupFillQuantity
+            };
+
+            var fill = ApplyFill(
+                executableIntent,
+                leg.FillPrice,
+                leg.Active.SubmittedAtUtc,
+                leg.Active.Intent.Quantity,
+                leg.Active.RemainingQuantity - maxGroupFillQuantity);
+            fills.Add(fill);
+
+            leg.Active.RemainingQuantity -= maxGroupFillQuantity;
+            if (leg.Active.RemainingQuantity <= 1e-9)
+            {
+                _filledOrderIds.Add(leg.Active.Intent.OrderId);
+                _activeOrders.Remove(leg.Active);
+                ActivateChildren(leg.Active.Intent.OrderId, slice.TimestampUtc, activations);
+            }
+        }
+
+        availableSliceQuantity -= maxGroupFillQuantity;
+
+        comboEvents.Add(new ReplayComboLifecycleRow(
+            slice.TimestampUtc,
+            comboGroupId,
+            "GROUP_FILLED",
+            pricedLegs[0].Active.Intent.OrderId,
+            pricedLegs[0].Active.Intent.Symbol,
+            pricedLegs[0].Active.Intent.Side,
+            $"filledQuantity={maxGroupFillQuantity}",
+            pricedLegs[0].Active.Intent.Source));
+
+        if (pricedLegs.Any(x => IsImmediateOrCancelTimeInForce(x.Active.Intent.TimeInForce)
+            && x.Active.RemainingQuantity > 1e-9))
+        {
+            CancelEntireComboGroup(comboGroupId, slice.TimestampUtc, cancellations, comboEvents, "IOC_REMAINDER_CANCELLED");
+        }
+    }
+
+    private void CancelEntireComboGroup(
+        string comboGroupId,
+        DateTime timestampUtc,
+        List<ReplayOrderCancellationRow> cancellations,
+        List<ReplayComboLifecycleRow> comboEvents,
+        string reason)
+    {
+        var legs = _activeOrders
+            .Where(x => x.RemainingQuantity > 1e-9)
+            .Where(x => string.Equals(x.Intent.ComboGroupId, comboGroupId, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (legs.Length == 0)
+        {
+            return;
+        }
+
+        foreach (var leg in legs)
+        {
+            cancellations.Add(new ReplayOrderCancellationRow(
+                timestampUtc,
+                leg.Intent.Symbol,
+                leg.Intent.Side,
+                leg.RemainingQuantity,
+                leg.Intent.OrderType,
+                leg.Intent.TimeInForce,
+                leg.SubmittedAtUtc,
+                leg.Intent.ExpireAtUtc,
+                "COMBO_GROUP_CANCELLED",
+                leg.Intent.Source));
+
+            comboEvents.Add(new ReplayComboLifecycleRow(
+                timestampUtc,
+                comboGroupId,
+                "LEG_CANCELLED",
+                leg.Intent.OrderId,
+                leg.Intent.Symbol,
+                leg.Intent.Side,
+                reason,
+                leg.Intent.Source));
+
+            _activeOrders.Remove(leg);
+        }
+
+        comboEvents.Add(new ReplayComboLifecycleRow(
+            timestampUtc,
+            comboGroupId,
+            "GROUP_CANCELLED",
+            legs[0].Intent.OrderId,
+            legs[0].Intent.Symbol,
+            legs[0].Intent.Side,
+            reason,
+            legs[0].Intent.Source));
     }
 
     private bool TryApplyOrderUpdate(
@@ -1243,6 +1559,36 @@ public sealed class ReplayExecutionSimulator
             intent.Source);
     }
 
+    private ReplayCashRejectionRow? ValidateSettledCashPreview(ReplayOrderIntent intent, double fillPrice, double settledCash)
+    {
+        if (!_enforceSettledCash)
+        {
+            return null;
+        }
+
+        var side = ParseSide(intent.Side);
+        if (side <= 0)
+        {
+            return null;
+        }
+
+        var required = (intent.Quantity * fillPrice) + (intent.Quantity * _commissionPerUnit);
+        if (settledCash + 1e-9 >= required)
+        {
+            return null;
+        }
+
+        return new ReplayCashRejectionRow(
+            intent.TimestampUtc,
+            intent.Symbol,
+            intent.Side,
+            intent.Quantity,
+            required,
+            settledCash,
+            "INSUFFICIENT_SETTLED_CASH",
+            intent.Source);
+    }
+
     private ReplayMarginRejectionRow? ValidateInitialMargin(ReplayOrderIntent intent, double fillPrice)
     {
         if (_initialMarginRate <= 0)
@@ -1260,6 +1606,47 @@ public sealed class ReplayExecutionSimulator
         var commission = intent.Quantity * _commissionPerUnit;
         var projectedCash = _cash - (signedQuantity * fillPrice) - commission;
         var projectedPosition = _positionQuantity + signedQuantity;
+        var projectedEquity = projectedCash + (projectedPosition * fillPrice);
+        var projectedInitialMargin = Math.Abs(projectedPosition * fillPrice) * _initialMarginRate;
+
+        if (projectedEquity + 1e-9 >= projectedInitialMargin)
+        {
+            return null;
+        }
+
+        return new ReplayMarginRejectionRow(
+            intent.TimestampUtc,
+            intent.Symbol,
+            intent.Side,
+            intent.Quantity,
+            fillPrice,
+            projectedEquity,
+            projectedInitialMargin,
+            "INITIAL_MARGIN_BREACH",
+            intent.Source);
+    }
+
+    private ReplayMarginRejectionRow? ValidateInitialMarginPreview(
+        ReplayOrderIntent intent,
+        double fillPrice,
+        double cash,
+        double positionQuantity)
+    {
+        if (_initialMarginRate <= 0)
+        {
+            return null;
+        }
+
+        var side = ParseSide(intent.Side);
+        if (side == 0)
+        {
+            return null;
+        }
+
+        var signedQuantity = side * intent.Quantity;
+        var commission = intent.Quantity * _commissionPerUnit;
+        var projectedCash = cash - (signedQuantity * fillPrice) - commission;
+        var projectedPosition = positionQuantity + signedQuantity;
         var projectedEquity = projectedCash + (projectedPosition * fillPrice);
         var projectedInitialMargin = Math.Abs(projectedPosition * fillPrice) * _initialMarginRate;
 
@@ -1427,6 +1814,65 @@ public sealed class ReplayExecutionSimulator
                 incrementalShort,
                 -fee,
                 _cash,
+                profile.Source),
+            null);
+    }
+
+    private (ReplayFinancingAppliedRow? FeeApplied, ReplayLocateRejectionRow? Rejected) ValidateLocatePreview(
+        ReplayOrderIntent intent,
+        double fillPrice,
+        ReplayBorrowLocateProfileRow profile,
+        double positionQuantity)
+    {
+        var side = ParseSide(intent.Side);
+        if (side >= 0)
+        {
+            return (null, null);
+        }
+
+        var signedQuantity = side * intent.Quantity;
+        var projected = positionQuantity + signedQuantity;
+        var currentShort = Math.Max(0, -positionQuantity);
+        var projectedShort = Math.Max(0, -projected);
+        var incrementalShort = projectedShort - currentShort;
+
+        if (incrementalShort <= 0)
+        {
+            return (null, null);
+        }
+
+        if (!profile.LocateAvailable)
+        {
+            return (
+                null,
+                new ReplayLocateRejectionRow(
+                    intent.TimestampUtc,
+                    intent.Symbol,
+                    intent.Side,
+                    intent.Quantity,
+                    "LOCATE_UNAVAILABLE",
+                    profile.LocateAvailable,
+                    profile.LocateFeePerShare,
+                    profile.Source));
+        }
+
+        if (profile.LocateFeePerShare <= 0)
+        {
+            return (null, null);
+        }
+
+        var fee = incrementalShort * profile.LocateFeePerShare;
+        return (
+            new ReplayFinancingAppliedRow(
+                intent.TimestampUtc,
+                intent.Symbol,
+                "LOCATE_FEE",
+                positionQuantity,
+                fillPrice,
+                0,
+                incrementalShort,
+                -fee,
+                0,
                 profile.Source),
             null);
     }
