@@ -243,6 +243,9 @@ public sealed class SnapshotRuntime
                 case RunMode.DisplayGroupsUnsubscribe:
                     await RunDisplayGroupsUnsubscribeMode(client, brokerAdapter, runtimeCts.Token);
                     break;
+                case RunMode.StrategyReplay:
+                    await RunStrategyReplayMode(strategyContext, runtimeCts.Token);
+                    break;
             }
 
                     await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, runtimeCts.Token);
@@ -2906,6 +2909,34 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Display groups unsubscribe export: {path}");
     }
 
+    private async Task RunStrategyReplayMode(StrategyRuntimeContext strategyContext, CancellationToken token)
+    {
+        var replayDriver = new StrategyReplayDriver();
+        var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows);
+        var replayClock = new DeterministicReplayClock(slices[0].TimestampUtc);
+
+        Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
+
+        foreach (var slice in slices)
+        {
+            token.ThrowIfCancellationRequested();
+            replayClock.AdvanceTo(slice.TimestampUtc);
+            await NotifyScheduledEventsAsync(strategyContext, replayClock.UtcNow, token);
+            await NotifyStrategyDataSliceAsync(slice, token);
+
+            if (_options.ReplayIntervalSeconds > 0)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(_options.ReplayIntervalSeconds), token);
+            }
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var replayPath = Path.Combine(outputDir, $"strategy_replay_slices_{timestamp}.json");
+        WriteJson(replayPath, slices);
+        Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
+    }
+
     private ScannerSubscription BuildScannerSubscriptionFromOptions()
     {
         return new ScannerSubscription
@@ -3569,9 +3600,14 @@ public sealed class SnapshotRuntime
 
     private async Task NotifyStrategyDataAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
     {
+        await NotifyStrategyDataSliceAsync(BuildStrategyDataSlice(context.Mode), cancellationToken);
+    }
+
+    private async Task NotifyStrategyDataSliceAsync(StrategyDataSlice dataSlice, CancellationToken cancellationToken)
+    {
         try
         {
-            await _strategyRuntime.OnDataAsync(BuildStrategyDataSlice(context.Mode), cancellationToken);
+            await _strategyRuntime.OnDataAsync(dataSlice, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -3980,6 +4016,9 @@ public sealed record AppOptions(
     int DisplayGroupId,
     string DisplayGroupContractInfo,
     int DisplayGroupCaptureSeconds,
+    string ReplayInputPath,
+    int ReplayIntervalSeconds,
+    int ReplayMaxRows,
     bool HeartbeatMonitorEnabled,
     int HeartbeatIntervalSeconds,
     int HeartbeatProbeTimeoutSeconds,
@@ -4110,6 +4149,9 @@ public sealed record AppOptions(
         var displayGroupId = 1;
         var displayGroupContractInfo = "265598@SMART";
         var displayGroupCaptureSeconds = 4;
+        var replayInputPath = string.Empty;
+        var replayIntervalSeconds = 0;
+        var replayMaxRows = 5000;
         var heartbeatMonitorEnabled = true;
         var heartbeatIntervalSeconds = 6;
         var heartbeatProbeTimeoutSeconds = 4;
@@ -4521,6 +4563,17 @@ public sealed record AppOptions(
                     displayGroupCaptureSeconds = dgcs;
                     i++;
                     break;
+                case "--replay-input" when i + 1 < args.Length:
+                    replayInputPath = args[++i];
+                    break;
+                case "--replay-interval-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ris):
+                    replayIntervalSeconds = ris;
+                    i++;
+                    break;
+                case "--replay-max-rows" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rmr):
+                    replayMaxRows = rmr;
+                    i++;
+                    break;
                 case "--heartbeat-monitor" when i + 1 < args.Length:
                     heartbeatMonitorEnabled = bool.TryParse(args[++i], out var hm) && hm;
                     break;
@@ -4681,6 +4734,9 @@ public sealed record AppOptions(
             displayGroupId,
             displayGroupContractInfo,
             displayGroupCaptureSeconds,
+            replayInputPath,
+            replayIntervalSeconds,
+            replayMaxRows,
             heartbeatMonitorEnabled,
             heartbeatIntervalSeconds,
             heartbeatProbeTimeoutSeconds,
@@ -4792,7 +4848,8 @@ public sealed record AppOptions(
             "display-groups-subscribe" => RunMode.DisplayGroupsSubscribe,
             "display-groups-update" => RunMode.DisplayGroupsUpdate,
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe.")
+            "strategy-replay" => RunMode.StrategyReplay,
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
         };
     }
 }
@@ -4861,7 +4918,8 @@ public enum RunMode
     DisplayGroupsQuery,
     DisplayGroupsSubscribe,
     DisplayGroupsUpdate,
-    DisplayGroupsUnsubscribe
+    DisplayGroupsUnsubscribe,
+    StrategyReplay
 }
 
 public sealed record ContractDetailsRow(
