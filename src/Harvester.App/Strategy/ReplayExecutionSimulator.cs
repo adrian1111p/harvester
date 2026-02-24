@@ -10,6 +10,7 @@ public sealed record ReplayOrderIntent(
     double Quantity,
     string OrderType,
     double? LimitPrice,
+    double? StopPrice,
     string TimeInForce,
     DateTime? ExpireAtUtc,
     string Source
@@ -56,8 +57,20 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayMarginEventRow> MarginEvents,
     IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
+    IReadOnlyList<ReplayOrderTriggerRow> Triggers,
     IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayOrderTriggerRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    string OrderType,
+    double StopPrice,
+    double? LimitPrice,
+    DateTime SubmittedAtUtc,
+    string Source
 );
 
 public sealed record ReplayOrderCancellationRow(
@@ -275,6 +288,7 @@ public sealed class ReplayExecutionSimulator
         var marginEvents = new List<ReplayMarginEventRow>();
         var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
         var cashRejections = new List<ReplayCashRejectionRow>();
+        var triggers = new List<ReplayOrderTriggerRow>();
         var cancellations = new List<ReplayOrderCancellationRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
@@ -380,7 +394,18 @@ public sealed class ReplayExecutionSimulator
                 break;
             }
 
-            var fillPrice = ResolveFillPrice(active.Intent, bar, markPrice);
+            if (TryTriggerStopOrder(active, slice.TimestampUtc, bar, markPrice, out var triggerRow))
+            {
+                triggers.Add(triggerRow);
+            }
+
+            if (!CanExecuteOnSlice(active))
+            {
+                continue;
+            }
+
+            var executableIntent = GetExecutableIntent(active, slice.TimestampUtc);
+            var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice);
             if (fillPrice is null)
             {
                 continue;
@@ -392,7 +417,7 @@ public sealed class ReplayExecutionSimulator
                 continue;
             }
 
-            var executableIntent = active.Intent with
+            executableIntent = executableIntent with
             {
                 TimestampUtc = slice.TimestampUtc,
                 Quantity = fillQuantity
@@ -469,7 +494,101 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, cancellations, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, triggers, cancellations, portfolio);
+    }
+
+    private static bool CanExecuteOnSlice(ActiveReplayOrder active)
+    {
+        return !IsStopOrderType(active.Intent.OrderType) || active.IsTriggered;
+    }
+
+    private static ReplayOrderIntent GetExecutableIntent(ActiveReplayOrder active, DateTime timestampUtc)
+    {
+        if (!active.IsTriggered || !IsStopOrderType(active.Intent.OrderType))
+        {
+            return active.Intent with { TimestampUtc = timestampUtc };
+        }
+
+        if (IsStopLimitOrderType(active.Intent.OrderType))
+        {
+            return active.Intent with
+            {
+                TimestampUtc = timestampUtc,
+                OrderType = "LMT"
+            };
+        }
+
+        return active.Intent with
+        {
+            TimestampUtc = timestampUtc,
+            OrderType = "MKT",
+            LimitPrice = null
+        };
+    }
+
+    private static bool TryTriggerStopOrder(
+        ActiveReplayOrder active,
+        DateTime timestampUtc,
+        HistoricalBarRow? bar,
+        double markPrice,
+        out ReplayOrderTriggerRow triggerRow)
+    {
+        triggerRow = null!;
+        if (active.IsTriggered || !IsStopOrderType(active.Intent.OrderType) || !active.Intent.StopPrice.HasValue || active.Intent.StopPrice <= 0)
+        {
+            return false;
+        }
+
+        var side = ParseSide(active.Intent.Side);
+        if (side == 0)
+        {
+            return false;
+        }
+
+        var stop = active.Intent.StopPrice.Value;
+        var isTriggered = bar is not null
+            ? (side > 0 ? bar.High >= stop : bar.Low <= stop)
+            : (side > 0 ? markPrice >= stop : markPrice <= stop);
+
+        if (!isTriggered)
+        {
+            return false;
+        }
+
+        active.IsTriggered = true;
+        active.TriggeredAtUtc = timestampUtc;
+        triggerRow = new ReplayOrderTriggerRow(
+            timestampUtc,
+            active.Intent.Symbol,
+            active.Intent.Side,
+            active.Intent.OrderType,
+            stop,
+            active.Intent.LimitPrice,
+            active.SubmittedAtUtc,
+            active.Intent.Source);
+        return true;
+    }
+
+    private static bool IsStopOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "STP" or "STOP" or "STOPMARKET" or "STPLMT" or "STOPLIMIT";
+    }
+
+    private static bool IsStopLimitOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "STPLMT" or "STOPLIMIT";
     }
 
     private static bool IsOrderExpired(ActiveReplayOrder order, DateTime sliceTimestampUtc)
@@ -613,6 +732,7 @@ public sealed class ReplayExecutionSimulator
             Math.Abs(_positionQuantity),
             "MKT",
             null,
+            null,
             "DAY",
             null,
             "margin");
@@ -754,6 +874,7 @@ public sealed class ReplayExecutionSimulator
             forcedSide,
             Math.Abs(_positionQuantity),
             "MKT",
+            null,
             null,
             "DAY",
             null,
@@ -992,10 +1113,14 @@ public sealed class ReplayExecutionSimulator
             Intent = intent;
             SubmittedAtUtc = submittedAtUtc;
             RemainingQuantity = remainingQuantity;
+            IsTriggered = false;
+            TriggeredAtUtc = null;
         }
 
         public ReplayOrderIntent Intent { get; }
         public DateTime SubmittedAtUtc { get; }
         public double RemainingQuantity { get; set; }
+        public bool IsTriggered { get; set; }
+        public DateTime? TriggeredAtUtc { get; set; }
     }
 }
