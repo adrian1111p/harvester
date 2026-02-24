@@ -16,9 +16,6 @@ public sealed class IbContractNormalizationService
         var normalizedExchange = NormalizeExchange(spec.Exchange);
         var normalizedCurrency = NormalizeCurrency(spec.Currency);
 
-        var recoveredOption = TryRecoverOptionComponents(spec, normalizedSymbol);
-        var recoveredFuture = TryRecoverFutureComponents(spec, normalizedSymbol);
-
         return spec.AssetType switch
         {
             BrokerAssetType.Stock => ContractFactory.Stock(
@@ -27,20 +24,9 @@ public sealed class IbContractNormalizationService
                 currency: normalizedCurrency,
                 primaryExchange: NormalizePrimaryExchange(spec.PrimaryExchange)),
 
-            BrokerAssetType.Option => ContractFactory.Option(
-                recoveredOption.Symbol,
-                recoveredOption.Expiry,
-                recoveredOption.Strike,
-                recoveredOption.Right,
-                exchange: normalizedExchange,
-                currency: normalizedCurrency,
-                multiplier: NormalizeMultiplier(spec.Multiplier)),
+            BrokerAssetType.Option => BuildOptionContract(spec, normalizedSymbol, normalizedExchange, normalizedCurrency),
 
-            BrokerAssetType.Future => ContractFactory.Future(
-                recoveredFuture.Symbol,
-                recoveredFuture.Expiry,
-                exchange: normalizedExchange,
-                currency: normalizedCurrency),
+            BrokerAssetType.Future => BuildFutureContract(spec, normalizedSymbol, normalizedExchange, normalizedCurrency),
 
             BrokerAssetType.Forex => ContractFactory.Forex(normalizedSymbol, exchange: normalizedExchange),
 
@@ -58,6 +44,29 @@ public sealed class IbContractNormalizationService
 
             _ => throw new ArgumentException($"Unsupported broker asset type '{spec.AssetType}'.")
         };
+    }
+
+    private static Contract BuildOptionContract(BrokerContractSpec spec, string normalizedSymbol, string normalizedExchange, string normalizedCurrency)
+    {
+        var recoveredOption = TryRecoverOptionComponents(spec, normalizedSymbol);
+        return ContractFactory.Option(
+            recoveredOption.Symbol,
+            recoveredOption.Expiry,
+            recoveredOption.Strike,
+            recoveredOption.Right,
+            exchange: normalizedExchange,
+            currency: normalizedCurrency,
+            multiplier: NormalizeMultiplier(spec.Multiplier));
+    }
+
+    private static Contract BuildFutureContract(BrokerContractSpec spec, string normalizedSymbol, string normalizedExchange, string normalizedCurrency)
+    {
+        var recoveredFuture = TryRecoverFutureComponents(spec, normalizedSymbol);
+        return ContractFactory.Future(
+            recoveredFuture.Symbol,
+            recoveredFuture.Expiry,
+            exchange: normalizedExchange,
+            currency: normalizedCurrency);
     }
 
     public string NormalizeSecurityType(string secType)
