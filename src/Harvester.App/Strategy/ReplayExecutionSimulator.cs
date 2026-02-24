@@ -63,10 +63,31 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
     IReadOnlyList<ReplayOrderActivationRow> Activations,
+    IReadOnlyList<ReplayOrderUpdateRow> OrderUpdates,
     IReadOnlyList<ReplayTrailingStopUpdateRow> TrailingStopUpdates,
     IReadOnlyList<ReplayOrderTriggerRow> Triggers,
     IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayOrderUpdateRow(
+    DateTime TimestampUtc,
+    string OrderId,
+    string Symbol,
+    string Side,
+    double PreviousQuantity,
+    double UpdatedQuantity,
+    double? PreviousLimitPrice,
+    double? UpdatedLimitPrice,
+    double? PreviousStopPrice,
+    double? UpdatedStopPrice,
+    string PreviousTimeInForce,
+    string UpdatedTimeInForce,
+    DateTime? PreviousExpireAtUtc,
+    DateTime? UpdatedExpireAtUtc,
+    double FilledQuantity,
+    double UpdatedRemainingQuantity,
+    string Source
 );
 
 public sealed record ReplayTrailingStopUpdateRow(
@@ -323,6 +344,7 @@ public sealed class ReplayExecutionSimulator
         var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
         var cashRejections = new List<ReplayCashRejectionRow>();
         var activations = new List<ReplayOrderActivationRow>();
+        var orderUpdates = new List<ReplayOrderUpdateRow>();
         var trailingStopUpdates = new List<ReplayTrailingStopUpdateRow>();
         var triggers = new List<ReplayOrderTriggerRow>();
         var cancellations = new List<ReplayOrderCancellationRow>();
@@ -398,6 +420,12 @@ public sealed class ReplayExecutionSimulator
             };
 
             accepted.Add(normalized);
+
+            if (TryApplyOrderUpdate(normalized, slice.TimestampUtc, orderUpdates, activations))
+            {
+                continue;
+            }
+
             var isActive = string.IsNullOrWhiteSpace(normalized.ParentOrderId)
                 || _filledOrderIds.Contains(normalized.ParentOrderId);
             _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc, normalized.Quantity, isActive));
@@ -549,7 +577,62 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, trailingStopUpdates, triggers, cancellations, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, orderUpdates, trailingStopUpdates, triggers, cancellations, portfolio);
+    }
+
+    private bool TryApplyOrderUpdate(
+        ReplayOrderIntent normalized,
+        DateTime timestampUtc,
+        List<ReplayOrderUpdateRow> orderUpdates,
+        List<ReplayOrderActivationRow> activations)
+    {
+        var active = _activeOrders.FirstOrDefault(x => string.Equals(x.Intent.OrderId, normalized.OrderId, StringComparison.OrdinalIgnoreCase));
+        if (active is null)
+        {
+            return false;
+        }
+
+        var previous = active.Intent;
+        var filledQuantity = Math.Max(0, previous.Quantity - active.RemainingQuantity);
+        var nextRemainingQuantity = Math.Max(0, normalized.Quantity - filledQuantity);
+
+        active.Intent = normalized;
+        active.SubmittedAtUtc = timestampUtc;
+        active.RemainingQuantity = nextRemainingQuantity;
+        active.IsActive = string.IsNullOrWhiteSpace(normalized.ParentOrderId)
+            || _filledOrderIds.Contains(normalized.ParentOrderId);
+        active.IsTriggered = false;
+        active.TriggeredAtUtc = null;
+        active.TrailingAnchorPrice = null;
+        active.CurrentStopPrice = normalized.StopPrice;
+
+        orderUpdates.Add(new ReplayOrderUpdateRow(
+            timestampUtc,
+            normalized.OrderId,
+            normalized.Symbol,
+            normalized.Side,
+            previous.Quantity,
+            normalized.Quantity,
+            previous.LimitPrice,
+            normalized.LimitPrice,
+            previous.StopPrice,
+            normalized.StopPrice,
+            previous.TimeInForce,
+            normalized.TimeInForce,
+            previous.ExpireAtUtc,
+            normalized.ExpireAtUtc,
+            filledQuantity,
+            nextRemainingQuantity,
+            normalized.Source));
+
+        if (nextRemainingQuantity <= 1e-9)
+        {
+            _filledOrderIds.Add(normalized.OrderId);
+            _activeOrders.Remove(active);
+            ActivateChildren(normalized.OrderId, timestampUtc, activations);
+        }
+
+        return true;
     }
 
     private static bool TryUpdateTrailingStop(
@@ -1348,8 +1431,8 @@ public sealed class ReplayExecutionSimulator
             CurrentStopPrice = intent.StopPrice;
         }
 
-        public ReplayOrderIntent Intent { get; }
-        public DateTime SubmittedAtUtc { get; }
+        public ReplayOrderIntent Intent { get; set; }
+        public DateTime SubmittedAtUtc { get; set; }
         public double RemainingQuantity { get; set; }
         public bool IsActive { get; set; }
         public bool IsTriggered { get; set; }
