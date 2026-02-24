@@ -8,6 +8,7 @@ using Harvester.App.IBKR.Risk;
 using Harvester.App.Historical;
 using Harvester.App.Strategy;
 using IBApi;
+using System.Collections.Concurrent;
 
 namespace Harvester.App.IBKR.Runtime;
 
@@ -27,6 +28,7 @@ public sealed class SnapshotRuntime
     private readonly PreTradeControlDsl _preTradeControlDsl = new();
     private readonly PreTradeCostRiskEstimator _preTradeCostEstimator = new();
     private readonly List<PreTradeCostTelemetryRow> _preTradeCostTelemetryRows = [];
+    private readonly ConcurrentQueue<StrategySchedulerEventArtifactRow> _strategySchedulerEvents = new();
     private readonly IStrategyRuntime _strategyRuntime;
     private readonly IStrategyEventScheduler _strategyScheduler;
     private RuntimeLifecycleStage _lifecycleStage = RuntimeLifecycleStage.Startup;
@@ -274,6 +276,7 @@ public sealed class SnapshotRuntime
                     Console.WriteLine("[WARN] Completed with broker clock-skew gate failure.");
                 }
                 ExportAdapterTraceArtifact();
+                ExportStrategySchedulerArtifact();
                 await NotifyStrategyShutdownAsync(strategyContext, 1);
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -281,6 +284,7 @@ public sealed class SnapshotRuntime
             }
 
             ExportAdapterTraceArtifact();
+            ExportStrategySchedulerArtifact();
             await NotifyStrategyShutdownAsync(strategyContext, 0);
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
@@ -290,6 +294,7 @@ public sealed class SnapshotRuntime
         catch (OperationCanceledException) when (_hasConnectivityFailure)
         {
             ExportAdapterTraceArtifact();
+            ExportStrategySchedulerArtifact();
             var cancelledContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", cancelledContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(cancelledContext, 1);
@@ -303,6 +308,7 @@ public sealed class SnapshotRuntime
         catch (TimeoutException ex)
         {
             ExportAdapterTraceArtifact();
+            ExportStrategySchedulerArtifact();
             var timeoutContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", timeoutContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(timeoutContext, 2);
@@ -316,6 +322,7 @@ public sealed class SnapshotRuntime
         catch (Exception ex)
         {
             ExportAdapterTraceArtifact();
+            ExportStrategySchedulerArtifact();
             var exceptionContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", exceptionContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(exceptionContext, 2);
@@ -3548,6 +3555,7 @@ public sealed class SnapshotRuntime
 
     private async Task NotifyStrategyScheduledEventAsync(string eventName, StrategyRuntimeContext context, CancellationToken cancellationToken)
     {
+        _strategySchedulerEvents.Enqueue(new StrategySchedulerEventArtifactRow(DateTime.UtcNow, context.Mode, context.ExchangeCalendar, eventName));
         try
         {
             await _strategyRuntime.OnScheduledEventAsync(eventName, context, cancellationToken);
@@ -3681,6 +3689,24 @@ public sealed class SnapshotRuntime
         var path = Path.Combine(outputDir, $"adapter_trace_{_options.Mode.ToString().ToLowerInvariant()}_{timestamp}.json");
         WriteJson(path, traces);
         Console.WriteLine($"[OK] Adapter trace export: {path} (rows={traces.Length})");
+    }
+
+    private void ExportStrategySchedulerArtifact()
+    {
+        var events = _strategySchedulerEvents
+            .OrderBy(x => x.TimestampUtc)
+            .ToArray();
+
+        if (events.Length == 0)
+        {
+            return;
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"strategy_scheduler_events_{_options.Mode.ToString().ToLowerInvariant()}_{timestamp}.json");
+        WriteJson(path, events);
+        Console.WriteLine($"[OK] Strategy scheduler events export: {path} (rows={events.Length})");
     }
 
     private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
@@ -5028,4 +5054,11 @@ public sealed record AdapterTraceArtifactRow(
     DateTime StartedAtUtc,
     DateTime? EndedAtUtc,
     string? Metadata
+);
+
+public sealed record StrategySchedulerEventArtifactRow(
+    DateTime TimestampUtc,
+    string Mode,
+    string ExchangeCalendar,
+    string EventName
 );

@@ -32,6 +32,12 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
         var sessionWindowsAvailable = _exchangeCalendarService.TryGetSessionWindowUtc(context.ExchangeCalendar, utcNow, out var sessionWindow);
         if (sessionWindowsAvailable && sessionWindow.IsTradingDay)
         {
+            var marketOpenKey = $"{runKey}|market_open";
+            if (utcNow >= sessionWindow.SessionOpenUtc && utcNow < sessionWindow.SessionCloseUtc && _emittedOneShot.TryAdd(marketOpenKey, 1))
+            {
+                events.Add("market_open");
+            }
+
             var beforeOpenKey = $"{runKey}|before_open";
             if (utcNow < sessionWindow.SessionOpenUtc && _emittedOneShot.TryAdd(beforeOpenKey, 1))
             {
@@ -60,6 +66,15 @@ public sealed class DeterministicStrategyEventScheduler : IStrategyEventSchedule
         {
             if (TryParseUtcTime(context.SessionStartUtc, out var sessionStartUtc))
             {
+                var marketOpenKey = $"{runKey}|market_open";
+                var withinSession = !TryParseUtcTime(context.SessionEndUtc, out var sessionEndUtcForOpen)
+                    ? utcNow.TimeOfDay >= sessionStartUtc
+                    : utcNow.TimeOfDay >= sessionStartUtc && utcNow.TimeOfDay < sessionEndUtcForOpen;
+                if (withinSession && _emittedOneShot.TryAdd(marketOpenKey, 1))
+                {
+                    events.Add("market_open");
+                }
+
                 var beforeOpenKey = $"{runKey}|before_open";
                 if (utcNow.TimeOfDay < sessionStartUtc && _emittedOneShot.TryAdd(beforeOpenKey, 1))
                 {
