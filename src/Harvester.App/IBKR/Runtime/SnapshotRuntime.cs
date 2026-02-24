@@ -5,6 +5,7 @@ using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
 using Harvester.App.IBKR.Orders;
 using Harvester.App.IBKR.Risk;
+using Harvester.App.IBKR.Wrapper;
 using Harvester.App.Historical;
 using Harvester.App.Strategy;
 using IBApi;
@@ -102,6 +103,9 @@ public sealed class SnapshotRuntime
                 case RunMode.Orders:
                     await RunOrdersMode(client, brokerAdapter, runtimeCts.Token);
                     break;
+                case RunMode.OrdersAllOpen:
+                    await RunOrdersAllOpenMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
                 case RunMode.Positions:
                     await RunPositionsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
@@ -116,6 +120,9 @@ public sealed class SnapshotRuntime
                     break;
                 case RunMode.OrdersPlaceSim:
                     await RunOrdersPlaceSimMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
+                case RunMode.OrdersCancelSim:
+                    await RunOrdersCancelSimMode(client, brokerAdapter, runtimeCts.Token);
                     break;
                 case RunMode.OrdersWhatIf:
                     await RunOrdersWhatIfMode(client, brokerAdapter, runtimeCts.Token);
@@ -256,7 +263,7 @@ public sealed class SnapshotRuntime
             await monitorTask;
 
             var hasBlockingErrors = _wrapper.ApiErrors
-                .Any(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
+                .Any(ShouldTreatAsBlockingApiError);
             if (hasBlockingErrors || _hasReconciliationQualityFailure || _hasConnectivityFailure || _hasPreTradeHalt || _hasClockSkewFailure)
             {
                 Console.WriteLine("[WARN] Completed with blocking API errors.");
@@ -527,6 +534,58 @@ public sealed class SnapshotRuntime
         return code is 1100 or 1300 or 2110;
     }
 
+    private bool IsSoftenedCancelNotFoundError(IbApiError error)
+    {
+        if (!_options.CancelOrderIdempotent || _options.Mode != RunMode.OrdersCancelSim)
+        {
+            return false;
+        }
+
+        if (error.Code != 10147)
+        {
+            return false;
+        }
+
+        if (_options.CancelOrderId > 0 && error.Id.HasValue && error.Id.Value != _options.CancelOrderId)
+        {
+            return false;
+        }
+
+        return error.Message.Contains("needs to be cancelled is not found", StringComparison.OrdinalIgnoreCase)
+            || error.Message.Contains("not found", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsCancelSuccessConfirmation(IbApiError error)
+    {
+        if (_options.Mode != RunMode.OrdersCancelSim)
+        {
+            return false;
+        }
+
+        if (error.Code != 202)
+        {
+            return false;
+        }
+
+        if (_options.CancelOrderId > 0 && error.Id.HasValue && error.Id.Value != _options.CancelOrderId)
+        {
+            return false;
+        }
+
+        return error.Message.Contains("order canceled", StringComparison.OrdinalIgnoreCase)
+            || error.Message.Contains("order cancelled", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool ShouldTreatAsBlockingApiError(IbApiError error)
+    {
+        if (IsSoftenedCancelNotFoundError(error) || IsCancelSuccessConfirmation(error))
+        {
+            return false;
+        }
+
+        return _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail;
+    }
+
     private async Task RunConnectMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         const int summaryReqId = 9001;
@@ -615,6 +674,76 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
         Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
         EvaluateReconciliationQualityGate(reconciliation.Summary, nameof(RunOrdersMode));
+    }
+
+    private async Task RunOrdersAllOpenMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        brokerAdapter.RequestAllOpenOrders(client);
+        await AwaitTrackedWithTimeout(
+            _wrapper.OpenOrderEndTask,
+            token,
+            stage: "openOrderEnd",
+            requestId: null,
+            requestType: "reqAllOpenOrders",
+            origin: nameof(RunOrdersAllOpenMode));
+
+        brokerAdapter.RequestCompletedOrders(client, apiOnly: true);
+        await AwaitTrackedWithTimeout(
+            _wrapper.CompletedOrdersEndTask,
+            token,
+            stage: "completedOrdersEnd",
+            requestId: null,
+            requestType: "reqCompletedOrders",
+            origin: nameof(RunOrdersAllOpenMode));
+
+        const int executionsReqId = 9201;
+        brokerAdapter.RequestExecutions(client, executionsReqId, new ExecutionFilter());
+        await AwaitTrackedWithTimeout(
+            _wrapper.ExecDetailsEndTask,
+            token,
+            stage: "execDetailsEnd",
+            requestId: executionsReqId,
+            requestType: "reqExecutions",
+            origin: nameof(RunOrdersAllOpenMode));
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var openOrdersPath = Path.Combine(outputDir, $"open_orders_all_{timestamp}.json");
+        var completedOrdersPath = Path.Combine(outputDir, $"completed_orders_{timestamp}.json");
+        var executionsPath = Path.Combine(outputDir, $"executions_{timestamp}.json");
+        var commissionsPath = Path.Combine(outputDir, $"commissions_{timestamp}.json");
+        var canonicalOrderEventsPath = Path.Combine(outputDir, $"order_events_canonical_{timestamp}.json");
+        var reconciledOrdersPath = Path.Combine(outputDir, $"orders_reconciled_{timestamp}.json");
+        var reconciliationDiagnosticsPath = Path.Combine(outputDir, $"orders_reconciliation_diagnostics_{timestamp}.json");
+        var reconciliationSummaryPath = Path.Combine(outputDir, $"orders_reconciliation_summary_{timestamp}.json");
+
+        var reconciliation = OrderReconciliation.Reconcile(
+            _wrapper.OpenOrders.ToArray(),
+            _wrapper.CompletedOrders.ToArray(),
+            _wrapper.Executions.ToArray(),
+            _wrapper.Commissions.ToArray());
+
+        WriteJson(openOrdersPath, _wrapper.OpenOrders.ToArray());
+        WriteJson(completedOrdersPath, _wrapper.CompletedOrders.ToArray());
+        WriteJson(executionsPath, _wrapper.Executions.ToArray());
+        WriteJson(commissionsPath, _wrapper.Commissions.ToArray());
+        WriteJson(canonicalOrderEventsPath, _wrapper.CanonicalOrderEvents.ToArray());
+        WriteJson(reconciledOrdersPath, reconciliation.Ledger);
+        WriteJson(reconciliationDiagnosticsPath, reconciliation.Diagnostics);
+        WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
+        ApplyReconciliationTelemetry(reconciliation.Ledger);
+        ExportPreTradeTelemetry(outputDir, timestamp);
+
+        Console.WriteLine($"[OK] All-open-orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
+        Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
+        Console.WriteLine($"[OK] Executions snapshot: {executionsPath} (rows={_wrapper.Executions.Count})");
+        Console.WriteLine($"[OK] Commissions snapshot: {commissionsPath} (rows={_wrapper.Commissions.Count})");
+        Console.WriteLine($"[OK] Canonical order events: {canonicalOrderEventsPath} (rows={_wrapper.CanonicalOrderEvents.Count})");
+        Console.WriteLine($"[OK] Reconciled orders: {reconciledOrdersPath} (rows={reconciliation.Ledger.Length})");
+        Console.WriteLine($"[OK] Reconciliation diagnostics: {reconciliationDiagnosticsPath} (rows={reconciliation.Diagnostics.Length})");
+        Console.WriteLine($"[OK] Reconciliation summary: {reconciliationSummaryPath}");
+        Console.WriteLine($"[OK] Reconciliation coverage: execution->commission={reconciliation.Summary.ExecutionCommissionCoveragePct:P2} execution->order={reconciliation.Summary.ExecutionOrderMetadataCoveragePct:P2}");
+        EvaluateReconciliationQualityGate(reconciliation.Summary, nameof(RunOrdersAllOpenMode));
     }
 
     private async Task RunPositionsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -903,6 +1032,44 @@ public sealed class SnapshotRuntime
 
         Console.WriteLine($"[OK] Sim placement export: {placementPath}");
         Console.WriteLine($"[OK] Sim status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+    }
+
+    private async Task RunOrdersCancelSimMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        EnsureSteadyStateForOrderRoute(nameof(RunOrdersCancelSimMode));
+
+        if (!_options.EnableLive)
+        {
+            throw new InvalidOperationException("Cancel order blocked: set --enable-live true to allow transmission.");
+        }
+
+        if (_options.CancelOrderId <= 0)
+        {
+            throw new InvalidOperationException("Cancel order blocked: set --cancel-order-id to a positive IBKR order id.");
+        }
+
+        brokerAdapter.CancelOrder(client, _options.CancelOrderId, string.Empty);
+        Console.WriteLine($"[OK] Sim cancel transmitted: orderId={_options.CancelOrderId}");
+
+        await Task.Delay(TimeSpan.FromSeconds(4), token);
+        brokerAdapter.RequestOpenOrders(client);
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var cancelPath = Path.Combine(outputDir, $"sim_order_cancel_{timestamp}.json");
+        var statusPath = Path.Combine(outputDir, $"sim_order_cancel_status_{timestamp}.json");
+
+        var cancellation = new SimOrderCancellationRow(
+            timestamp,
+            _options.CancelOrderId,
+            _options.Account);
+
+        WriteJson(cancelPath, new[] { cancellation });
+        WriteJson(statusPath, _wrapper.OrderStatusRows.ToArray());
+
+        Console.WriteLine($"[OK] Sim cancel export: {cancelPath}");
+        Console.WriteLine($"[OK] Sim cancel status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
     private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan()
@@ -4273,6 +4440,11 @@ public sealed class SnapshotRuntime
         Console.WriteLine("\n=== API Errors ===");
         foreach (var error in _wrapper.ApiErrors)
         {
+            if (IsSoftenedCancelNotFoundError(error) || IsCancelSuccessConfirmation(error))
+            {
+                continue;
+            }
+
             var decision = _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback);
             if (decision.Action == IbErrorAction.Ignore)
             {
@@ -4380,7 +4552,7 @@ public sealed class SnapshotRuntime
         var failedRequestCount = requestRows.Count(r => r.Status == RequestStatus.Failed);
 
         var reconnectTriggerErrorCount = _wrapper.ApiErrors.Count(e => IsReconnectTriggerCode(e.Code));
-        var blockingApiErrorCount = _wrapper.ApiErrors.Count(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
+        var blockingApiErrorCount = _wrapper.ApiErrors.Count(ShouldTreatAsBlockingApiError);
 
         var checks = new[]
         {
@@ -4727,6 +4899,8 @@ public sealed record AppOptions(
     string LiveAction,
     double LiveQuantity,
     double LiveLimitPrice,
+    int CancelOrderId,
+    bool CancelOrderIdempotent,
     double MaxNotional,
     double MaxShares,
     double MaxPrice,
@@ -4895,6 +5069,8 @@ public sealed record AppOptions(
         var liveAction = "BUY";
         var liveQuantity = 1.0;
         var liveLimitPrice = 5.00;
+        var cancelOrderId = 0;
+        var cancelOrderIdempotent = false;
         var maxNotional = 100.00;
         var maxShares = 10.0;
         var maxPrice = 10.0;
@@ -5095,6 +5271,13 @@ public sealed record AppOptions(
                 case "--live-limit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lp):
                     liveLimitPrice = lp;
                     i++;
+                    break;
+                case "--cancel-order-id" when i + 1 < args.Length && int.TryParse(args[i + 1], out var coid):
+                    cancelOrderId = coid;
+                    i++;
+                    break;
+                case "--cancel-idempotent" when i + 1 < args.Length:
+                    cancelOrderIdempotent = bool.TryParse(args[++i], out var cio) && cio;
                     break;
                 case "--max-notional" when i + 1 < args.Length && double.TryParse(args[i + 1], out var mn):
                     maxNotional = mn;
@@ -5637,6 +5820,8 @@ public sealed record AppOptions(
             liveAction,
             liveQuantity,
             liveLimitPrice,
+            cancelOrderId,
+            cancelOrderIdempotent,
             maxNotional,
             maxShares,
             maxPrice,
@@ -5842,11 +6027,13 @@ public sealed record AppOptions(
         {
             "connect" => RunMode.Connect,
             "orders" => RunMode.Orders,
+            "orders-all-open" => RunMode.OrdersAllOpen,
             "positions" => RunMode.Positions,
             "snapshot-all" => RunMode.SnapshotAll,
             "contracts-validate" => RunMode.ContractsValidate,
             "orders-dryrun" => RunMode.OrdersDryRun,
             "orders-place-sim" => RunMode.OrdersPlaceSim,
+            "orders-cancel-sim" => RunMode.OrdersCancelSim,
             "orders-whatif" => RunMode.OrdersWhatIf,
             "top-data" => RunMode.TopData,
             "market-depth" => RunMode.MarketDepth,
@@ -5890,7 +6077,7 @@ public sealed record AppOptions(
             "display-groups-update" => RunMode.DisplayGroupsUpdate,
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
             "strategy-replay" => RunMode.StrategyReplay,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
         };
     }
 }
@@ -5913,11 +6100,13 @@ public enum RunMode
 {
     Connect,
     Orders,
+    OrdersAllOpen,
     Positions,
     SnapshotAll,
     ContractsValidate,
     OrdersDryRun,
     OrdersPlaceSim,
+    OrdersCancelSim,
     OrdersWhatIf,
     TopData,
     MarketDepth,
@@ -6000,6 +6189,12 @@ public sealed record LiveOrderPlacementRow(
     double Notional,
     string Account,
     string OrderRef
+);
+
+public sealed record SimOrderCancellationRow(
+    string TimestampUtc,
+    int OrderId,
+    string Account
 );
 
 internal sealed record LiveOrderPlacementPlan(

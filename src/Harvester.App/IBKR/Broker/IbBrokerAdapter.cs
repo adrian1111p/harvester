@@ -79,6 +79,12 @@ public sealed class IbBrokerAdapter : IBrokerAdapter
         client.reqOpenOrders();
     }
 
+    public void RequestAllOpenOrders(EClientSocket client)
+    {
+        Emit("reqAllOpenOrders", null);
+        client.reqAllOpenOrders();
+    }
+
     public void RequestCurrentTime(EClientSocket client)
     {
         Emit("reqCurrentTime", null);
@@ -119,6 +125,12 @@ public sealed class IbBrokerAdapter : IBrokerAdapter
     {
         Emit("placeOrder", orderId, $"symbol={contract.Symbol} action={order.Action} type={order.OrderType}");
         client.placeOrder(orderId, contract, order);
+    }
+
+    public void CancelOrder(EClientSocket client, int orderId, string manualOrderCancelTime)
+    {
+        Emit("cancelOrder", orderId);
+        client.cancelOrder(orderId);
     }
 
     public void RequestMarketDataType(EClientSocket client, int marketDataType)

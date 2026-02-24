@@ -31,6 +31,7 @@ public interface IBrokerAdapter
         OrderState orderState);
 
     void RequestOpenOrders(EClientSocket client);
+    void RequestAllOpenOrders(EClientSocket client);
     void RequestCurrentTime(EClientSocket client);
     void RequestCompletedOrders(EClientSocket client, bool apiOnly);
     void RequestExecutions(EClientSocket client, int requestId, ExecutionFilter filter);
@@ -38,6 +39,7 @@ public interface IBrokerAdapter
     void RequestOptionChainParameters(EClientSocket client, int requestId, string underlyingSymbol, string futFopExchange, string underlyingSecType, int underlyingConId);
     void ExerciseOptions(EClientSocket client, int requestId, Contract contract, int exerciseAction, int exerciseQuantity, string account, int overrideOption);
     void PlaceOrder(EClientSocket client, int orderId, Contract contract, Order order);
+    void CancelOrder(EClientSocket client, int orderId, string manualOrderCancelTime);
     void RequestMarketDataType(EClientSocket client, int marketDataType);
     void RequestMarketData(EClientSocket client, int requestId, Contract contract, string genericTickList = "");
     void CancelMarketData(EClientSocket client, int requestId);
