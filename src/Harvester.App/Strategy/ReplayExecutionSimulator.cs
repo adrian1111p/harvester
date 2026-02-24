@@ -478,6 +478,11 @@ public sealed class ReplayExecutionSimulator
                 triggers.Add(triggerRow);
             }
 
+            if (TryTriggerTouchedOrder(active, slice.TimestampUtc, bar, markPrice, out var touchedTriggerRow))
+            {
+                triggers.Add(touchedTriggerRow);
+            }
+
             if (!CanExecuteOnSlice(active))
             {
                 continue;
@@ -782,14 +787,33 @@ public sealed class ReplayExecutionSimulator
 
     private static bool CanExecuteOnSlice(ActiveReplayOrder active)
     {
-        return !IsStopOrderType(active.Intent.OrderType) || active.IsTriggered;
+        return (!IsStopOrderType(active.Intent.OrderType) && !IsTouchedOrderType(active.Intent.OrderType)) || active.IsTriggered;
     }
 
     private static ReplayOrderIntent GetExecutableIntent(ActiveReplayOrder active, DateTime timestampUtc)
     {
-        if (!active.IsTriggered || !IsStopOrderType(active.Intent.OrderType))
+        if (!active.IsTriggered || (!IsStopOrderType(active.Intent.OrderType) && !IsTouchedOrderType(active.Intent.OrderType)))
         {
             return active.Intent with { TimestampUtc = timestampUtc };
+        }
+
+        if (IsTouchedOrderType(active.Intent.OrderType))
+        {
+            if (active.Intent.LimitPrice.HasValue && active.Intent.LimitPrice.Value > 0)
+            {
+                return active.Intent with
+                {
+                    TimestampUtc = timestampUtc,
+                    OrderType = "LMT"
+                };
+            }
+
+            return active.Intent with
+            {
+                TimestampUtc = timestampUtc,
+                OrderType = "MKT",
+                LimitPrice = null
+            };
         }
 
         if (IsStopLimitOrderType(active.Intent.OrderType))
@@ -853,6 +877,50 @@ public sealed class ReplayExecutionSimulator
         return true;
     }
 
+    private static bool TryTriggerTouchedOrder(
+        ActiveReplayOrder active,
+        DateTime timestampUtc,
+        HistoricalBarRow? bar,
+        double markPrice,
+        out ReplayOrderTriggerRow triggerRow)
+    {
+        triggerRow = null!;
+        var touchPrice = active.Intent.StopPrice;
+        if (active.IsTriggered || !IsTouchedOrderType(active.Intent.OrderType) || !touchPrice.HasValue || touchPrice <= 0)
+        {
+            return false;
+        }
+
+        var side = ParseSide(active.Intent.Side);
+        if (side == 0)
+        {
+            return false;
+        }
+
+        var touch = touchPrice.Value;
+        var isTriggered = bar is not null
+            ? (side > 0 ? bar.Low <= touch : bar.High >= touch)
+            : (side > 0 ? markPrice <= touch : markPrice >= touch);
+
+        if (!isTriggered)
+        {
+            return false;
+        }
+
+        active.IsTriggered = true;
+        active.TriggeredAtUtc = timestampUtc;
+        triggerRow = new ReplayOrderTriggerRow(
+            timestampUtc,
+            active.Intent.Symbol,
+            active.Intent.Side,
+            active.Intent.OrderType,
+            touch,
+            active.Intent.LimitPrice,
+            active.SubmittedAtUtc,
+            active.Intent.Source);
+        return true;
+    }
+
     private static bool IsStopOrderType(string orderType)
     {
         if (string.IsNullOrWhiteSpace(orderType))
@@ -874,6 +942,17 @@ public sealed class ReplayExecutionSimulator
 
         var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
         return normalized is "STPLMT" or "STOPLIMIT" or "TRAILLMT" or "TRAILLIMIT";
+    }
+
+    private static bool IsTouchedOrderType(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "LIT" or "LIMITIFTOUCHED";
     }
 
     private static bool IsTrailingStopOrderType(string orderType)
