@@ -280,6 +280,7 @@ public sealed class SnapshotRuntime
                 }
                 ExportAdapterTraceArtifact();
                 ExportStrategySchedulerArtifact();
+                ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
                 await NotifyStrategyShutdownAsync(strategyContext, 1);
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -288,6 +289,7 @@ public sealed class SnapshotRuntime
 
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
+            ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 0);
             await NotifyStrategyShutdownAsync(strategyContext, 0);
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
@@ -298,6 +300,7 @@ public sealed class SnapshotRuntime
         {
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
+            ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
             var cancelledContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", cancelledContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(cancelledContext, 1);
@@ -312,6 +315,7 @@ public sealed class SnapshotRuntime
         {
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
+            ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
             var timeoutContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", timeoutContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(timeoutContext, 2);
@@ -326,6 +330,7 @@ public sealed class SnapshotRuntime
         {
             ExportAdapterTraceArtifact();
             ExportStrategySchedulerArtifact();
+            ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
             var exceptionContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", exceptionContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(exceptionContext, 2);
@@ -4051,6 +4056,85 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy scheduler events export: {path} (rows={events.Length})");
     }
 
+    private void ExportResilienceDrillAcceptanceArtifact(IbkrSession session, DateTime runStartedUtc, int exitCode)
+    {
+        var sessionTransitions = session.StateTransitions.ToArray();
+        var reconnectAttemptCount = sessionTransitions.Count(t => t.To == IbConnectionState.Reconnecting);
+        var reconnectRecoveryCount = sessionTransitions.Count(t => t.From == IbConnectionState.Reconnecting && t.To == IbConnectionState.Connected);
+        var degradedCount = sessionTransitions.Count(t => t.To == IbConnectionState.Degraded);
+        var haltingCount = sessionTransitions.Count(t => t.To == IbConnectionState.Halting);
+
+        var requestRows = _requestRegistry.Snapshot();
+        var timedOutRequestCount = requestRows.Count(r => r.Status == RequestStatus.TimedOut);
+        var failedRequestCount = requestRows.Count(r => r.Status == RequestStatus.Failed);
+
+        var reconnectTriggerErrorCount = _wrapper.ApiErrors.Count(e => IsReconnectTriggerCode(e.Code));
+        var blockingApiErrorCount = _wrapper.ApiErrors.Count(e => _errorPolicy.Evaluate(e, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail);
+
+        var checks = new[]
+        {
+            new ResilienceAcceptanceCheckRow(
+                "connectivity-halt",
+                !_hasConnectivityFailure,
+                _hasConnectivityFailure ? "connectivity halt escalation triggered" : "no connectivity halt escalation"),
+            new ResilienceAcceptanceCheckRow(
+                "reconciliation-gate",
+                !_hasReconciliationQualityFailure,
+                _hasReconciliationQualityFailure ? "reconciliation quality gate failed" : "reconciliation quality gate passed or not triggered"),
+            new ResilienceAcceptanceCheckRow(
+                "clock-skew-gate",
+                !_hasClockSkewFailure,
+                _hasClockSkewFailure ? "clock-skew gate failed" : "clock-skew gate passed"),
+            new ResilienceAcceptanceCheckRow(
+                "pretrade-halt",
+                !_hasPreTradeHalt,
+                _hasPreTradeHalt ? "pre-trade HALT action triggered" : "no pre-trade HALT action"),
+            new ResilienceAcceptanceCheckRow(
+                "reconnect-recovery",
+                reconnectAttemptCount == 0 || reconnectRecoveryCount > 0 || _hasConnectivityFailure,
+                reconnectAttemptCount == 0
+                    ? "no reconnect attempts required"
+                    : $"attempts={reconnectAttemptCount} recoveries={reconnectRecoveryCount} connectivityFailure={_hasConnectivityFailure}"),
+            new ResilienceAcceptanceCheckRow(
+                "runtime-exit-code",
+                exitCode == 0,
+                $"exitCode={exitCode}")
+        };
+
+        var artifact = new ResilienceDrillAcceptanceRow(
+            DateTime.UtcNow,
+            _options.Mode.ToString(),
+            runStartedUtc,
+            DateTime.UtcNow,
+            exitCode,
+            exitCode == 0,
+            _options.HeartbeatMonitorEnabled,
+            Math.Max(2, _options.HeartbeatIntervalSeconds),
+            Math.Max(2, _options.HeartbeatProbeTimeoutSeconds),
+            Math.Max(1, _options.ReconnectMaxAttempts),
+            Math.Max(1, _options.ReconnectBackoffSeconds),
+            reconnectAttemptCount,
+            reconnectRecoveryCount,
+            degradedCount,
+            haltingCount,
+            reconnectTriggerErrorCount,
+            blockingApiErrorCount,
+            timedOutRequestCount,
+            failedRequestCount,
+            _hasConnectivityFailure,
+            _hasReconciliationQualityFailure,
+            _hasClockSkewFailure,
+            _hasPreTradeHalt,
+            _lifecycleStage.ToString(),
+            checks);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var path = Path.Combine(outputDir, $"resilience_drill_acceptance_{_options.Mode.ToString().ToLowerInvariant()}_{timestamp}.json");
+        WriteJson(path, new[] { artifact });
+        Console.WriteLine($"[OK] Resilience drill acceptance export: {path}");
+    }
+
     private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
     {
         if (_options.ReconciliationGateAction == ReconciliationGateAction.Off)
@@ -5611,4 +5695,38 @@ public sealed record ReplayCostDeltaArtifactRow(
     double? RealizedSlippage,
     double? SlippageDelta,
     string Source
+);
+
+public sealed record ResilienceAcceptanceCheckRow(
+    string CheckName,
+    bool Passed,
+    string Details
+);
+
+public sealed record ResilienceDrillAcceptanceRow(
+    DateTime TimestampUtc,
+    string Mode,
+    DateTime RunStartedUtc,
+    DateTime RunCompletedUtc,
+    int ExitCode,
+    bool Passed,
+    bool HeartbeatMonitorEnabled,
+    int HeartbeatIntervalSeconds,
+    int HeartbeatProbeTimeoutSeconds,
+    int ReconnectMaxAttempts,
+    int ReconnectBackoffSeconds,
+    int ReconnectAttemptCount,
+    int ReconnectRecoveryCount,
+    int DegradedTransitionCount,
+    int HaltingTransitionCount,
+    int ReconnectTriggerErrorCount,
+    int BlockingApiErrorCount,
+    int TimedOutRequestCount,
+    int FailedRequestCount,
+    bool ConnectivityFailure,
+    bool ReconciliationGateFailure,
+    bool ClockSkewGateFailure,
+    bool PreTradeHalt,
+    string FinalLifecycleStage,
+    IReadOnlyList<ResilienceAcceptanceCheckRow> Checks
 );
