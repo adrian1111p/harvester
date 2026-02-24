@@ -61,7 +61,7 @@ public sealed class StrategyReplayDriver
         var topTick = new TopTickRow(
             row.TimestampUtc,
             800000 + index,
-            "replay",
+            row.Symbol,
             4,
             row.Close,
             (int)Math.Max(0, Math.Min(int.MaxValue, row.Volume)),

@@ -41,6 +41,7 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayOrderIntent> Orders,
     IReadOnlyList<ReplayFillRow> Fills,
     IReadOnlyList<ReplayCorporateActionAppliedRow> AppliedCorporateActions,
+    IReadOnlyList<ReplayDelistAppliedRow> AppliedDelists,
     ReplayPortfolioRow Portfolio
 );
 
@@ -53,6 +54,17 @@ public sealed record ReplayCorporateActionAppliedRow(
     double CashDelta,
     double PositionQuantity,
     double AveragePrice,
+    string Source
+);
+
+public sealed record ReplayDelistAppliedRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    bool IsTerminal,
+    double PositionQuantityBefore,
+    double PositionQuantityAfter,
+    double FillPrice,
+    double CashAfter,
     string Source
 );
 
@@ -106,7 +118,11 @@ public sealed class ReplayExecutionSimulator
             .ToArray();
     }
 
-    public ReplaySliceSimulationResult ProcessSlice(StrategyDataSlice slice, string defaultSymbol, IReadOnlyList<ReplayOrderIntent> intents)
+    public ReplaySliceSimulationResult ProcessSlice(
+        StrategyDataSlice slice,
+        string defaultSymbol,
+        IReadOnlyList<ReplayOrderIntent> intents,
+        IReadOnlyList<ReplayDelistEventRow> dueDelistEvents)
     {
         var symbol = string.IsNullOrWhiteSpace(defaultSymbol)
             ? (slice.TopTicks.FirstOrDefault()?.Value ?? "N/A")
@@ -115,11 +131,49 @@ public sealed class ReplayExecutionSimulator
         var fills = new List<ReplayFillRow>();
         var accepted = new List<ReplayOrderIntent>();
         var appliedActions = ApplyCorporateActions(slice.TimestampUtc, symbol);
+        var appliedDelists = new List<ReplayDelistAppliedRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
             ? bar.Close
             : (slice.TopTicks.FirstOrDefault()?.Price ?? 0);
+
+        if (dueDelistEvents.Count > 0)
+        {
+            foreach (var delist in dueDelistEvents)
+            {
+                if (!delist.IsTerminal)
+                {
+                    appliedDelists.Add(new ReplayDelistAppliedRow(
+                        delist.EffectiveTimestampUtc,
+                        delist.Symbol,
+                        false,
+                        _positionQuantity,
+                        _positionQuantity,
+                        markPrice,
+                        _cash,
+                        delist.Source));
+                    continue;
+                }
+
+                var forced = ApplyTerminalDelistLiquidation(slice.TimestampUtc, symbol, markPrice, delist.Source);
+                if (forced is not null)
+                {
+                    accepted.Add(forced.Value.Order);
+                    fills.Add(forced.Value.Fill);
+                }
+
+                appliedDelists.Add(new ReplayDelistAppliedRow(
+                    delist.EffectiveTimestampUtc,
+                    delist.Symbol,
+                    true,
+                    forced?.PositionQuantityBefore ?? _positionQuantity,
+                    _positionQuantity,
+                    markPrice,
+                    _cash,
+                    delist.Source));
+            }
+        }
 
         foreach (var intent in intents)
         {
@@ -163,7 +217,33 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, portfolio);
+    }
+
+    private (ReplayOrderIntent Order, ReplayFillRow Fill, double PositionQuantityBefore)? ApplyTerminalDelistLiquidation(
+        DateTime timestampUtc,
+        string symbol,
+        double markPrice,
+        string source)
+    {
+        if (_positionQuantity == 0 || markPrice <= 0)
+        {
+            return null;
+        }
+
+        var quantityBefore = _positionQuantity;
+        var forcedSide = _positionQuantity > 0 ? "SELL" : "BUY";
+        var forcedOrder = new ReplayOrderIntent(
+            timestampUtc,
+            symbol,
+            forcedSide,
+            Math.Abs(_positionQuantity),
+            "MKT",
+            null,
+            string.IsNullOrWhiteSpace(source) ? "delist" : source);
+
+        var fill = ApplyFill(forcedOrder, markPrice);
+        return (forcedOrder, fill, quantityBefore);
     }
 
     private IReadOnlyList<ReplayCorporateActionAppliedRow> ApplyCorporateActions(DateTime timestampUtc, string symbol)

@@ -2914,6 +2914,9 @@ public sealed class SnapshotRuntime
         var replayDriver = new StrategyReplayDriver();
         var replayNormalizationMode = ReplayCorporateActionsEngine.ParseNormalizationMode(_options.ReplayPriceNormalization);
         var replayCorporateActions = ReplayCorporateActionsEngine.LoadCorporateActions(_options.ReplayCorporateActionsInputPath, _options.ReplayMaxRows);
+        var replaySymbolMappings = ReplaySymbolEventsEngine.LoadSymbolMappings(_options.ReplaySymbolMappingsInputPath, _options.ReplayMaxRows);
+        var replayDelistEvents = ReplaySymbolEventsEngine.LoadDelistEvents(_options.ReplayDelistEventsInputPath, _options.ReplayMaxRows);
+        var replaySymbolTimeline = new ReplaySymbolTimeline(strategyContext.Symbol, replaySymbolMappings, replayDelistEvents);
         var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows, replayCorporateActions, replayNormalizationMode);
         var staticReplayOrders = ReplayExecutionSimulator.LoadOrderIntents(_options.ReplayOrdersInputPath, _options.ReplayMaxRows);
         var staticReplayCursor = 0;
@@ -2927,6 +2930,8 @@ public sealed class SnapshotRuntime
         var replayOrderRows = new List<ReplayOrderIntent>();
         var replayFillRows = new List<ReplayFillRow>();
         var replayCorporateActionAppliedRows = new List<ReplayCorporateActionAppliedRow>();
+        var replayDelistAppliedRows = new List<ReplayDelistAppliedRow>();
+        var replaySymbolEventRows = new List<ReplaySymbolEventArtifactRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
@@ -2938,6 +2943,14 @@ public sealed class SnapshotRuntime
         {
             Console.WriteLine($"[INFO] strategy-replay loaded corporate actions={replayCorporateActions.Count} source={Path.GetFullPath(_options.ReplayCorporateActionsInputPath)} mode={_options.ReplayPriceNormalization}");
         }
+        if (replaySymbolMappings.Count > 0)
+        {
+            Console.WriteLine($"[INFO] strategy-replay loaded symbol mappings={replaySymbolMappings.Count} source={Path.GetFullPath(_options.ReplaySymbolMappingsInputPath)}");
+        }
+        if (replayDelistEvents.Count > 0)
+        {
+            Console.WriteLine($"[INFO] strategy-replay loaded delist events={replayDelistEvents.Count} source={Path.GetFullPath(_options.ReplayDelistEventsInputPath)}");
+        }
 
         foreach (var slice in slices)
         {
@@ -2946,10 +2959,18 @@ public sealed class SnapshotRuntime
             await NotifyScheduledEventsAsync(strategyContext, replayClock.UtcNow, token);
             await NotifyStrategyDataSliceAsync(slice, token);
 
+            var timelineStep = replaySymbolTimeline.Apply(slice.TimestampUtc);
+            replaySymbolEventRows.AddRange(timelineStep.SymbolEvents);
+            var activeSymbol = timelineStep.CurrentSymbol;
+
             var dueOrders = new List<ReplayOrderIntent>();
             while (staticReplayCursor < staticReplayOrders.Count && staticReplayOrders[staticReplayCursor].TimestampUtc <= slice.TimestampUtc)
             {
-                dueOrders.Add(staticReplayOrders[staticReplayCursor]);
+                var externalOrder = staticReplayOrders[staticReplayCursor];
+                dueOrders.Add(externalOrder with
+                {
+                    Symbol = string.IsNullOrWhiteSpace(externalOrder.Symbol) ? activeSymbol : externalOrder.Symbol.ToUpperInvariant()
+                });
                 staticReplayCursor++;
             }
 
@@ -2960,7 +2981,7 @@ public sealed class SnapshotRuntime
                     .Select(x => x with
                     {
                         TimestampUtc = x.TimestampUtc == default ? slice.TimestampUtc : x.TimestampUtc,
-                        Symbol = string.IsNullOrWhiteSpace(x.Symbol) ? strategyContext.Symbol : x.Symbol,
+                        Symbol = string.IsNullOrWhiteSpace(x.Symbol) ? activeSymbol : x.Symbol,
                         Source = string.IsNullOrWhiteSpace(x.Source) ? "strategy" : x.Source
                     })
                     .Where(x => x.TimestampUtc <= slice.TimestampUtc)
@@ -2968,10 +2989,11 @@ public sealed class SnapshotRuntime
                 dueOrders.AddRange(strategyOrders);
             }
 
-            var simulation = replaySimulator.ProcessSlice(slice, strategyContext.Symbol, dueOrders);
+            var simulation = replaySimulator.ProcessSlice(slice, activeSymbol, dueOrders, timelineStep.DueDelistEvents);
             replayOrderRows.AddRange(simulation.Orders);
             replayFillRows.AddRange(simulation.Fills);
             replayCorporateActionAppliedRows.AddRange(simulation.AppliedCorporateActions);
+            replayDelistAppliedRows.AddRange(simulation.AppliedDelists);
             replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
@@ -2986,6 +3008,8 @@ public sealed class SnapshotRuntime
         var replayOrdersPath = Path.Combine(outputDir, $"strategy_replay_orders_{timestamp}.json");
         var replayFillsPath = Path.Combine(outputDir, $"strategy_replay_fills_{timestamp}.json");
         var replayCorporateActionsAppliedPath = Path.Combine(outputDir, $"strategy_replay_corporate_actions_applied_{timestamp}.json");
+        var replaySymbolEventsPath = Path.Combine(outputDir, $"strategy_replay_symbol_events_{timestamp}.json");
+        var replayDelistAppliedPath = Path.Combine(outputDir, $"strategy_replay_delist_applied_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -2998,6 +3022,8 @@ public sealed class SnapshotRuntime
         WriteJson(replayOrdersPath, replayOrderRows);
         WriteJson(replayFillsPath, replayFillRows);
         WriteJson(replayCorporateActionsAppliedPath, replayCorporateActionAppliedRows);
+        WriteJson(replaySymbolEventsPath, replaySymbolEventRows);
+        WriteJson(replayDelistAppliedPath, replayDelistAppliedRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3006,6 +3032,8 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
         Console.WriteLine($"[OK] Strategy replay applied corporate actions export: {replayCorporateActionsAppliedPath} (rows={replayCorporateActionAppliedRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay symbol events export: {replaySymbolEventsPath} (rows={replaySymbolEventRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay applied delist export: {replayDelistAppliedPath} (rows={replayDelistAppliedRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4094,6 +4122,8 @@ public sealed record AppOptions(
     string ReplayInputPath,
     string ReplayOrdersInputPath,
     string ReplayCorporateActionsInputPath,
+    string ReplaySymbolMappingsInputPath,
+    string ReplayDelistEventsInputPath,
     string ReplayPriceNormalization,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
@@ -4233,6 +4263,8 @@ public sealed record AppOptions(
         var replayInputPath = string.Empty;
         var replayOrdersInputPath = string.Empty;
         var replayCorporateActionsInputPath = string.Empty;
+        var replaySymbolMappingsInputPath = string.Empty;
+        var replayDelistEventsInputPath = string.Empty;
         var replayPriceNormalization = "raw";
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
@@ -4659,6 +4691,12 @@ public sealed record AppOptions(
                 case "--replay-corporate-actions-input" when i + 1 < args.Length:
                     replayCorporateActionsInputPath = args[++i];
                     break;
+                case "--replay-symbol-mappings-input" when i + 1 < args.Length:
+                    replaySymbolMappingsInputPath = args[++i];
+                    break;
+                case "--replay-delist-events-input" when i + 1 < args.Length:
+                    replayDelistEventsInputPath = args[++i];
+                    break;
                 case "--replay-price-normalization" when i + 1 < args.Length:
                     replayPriceNormalization = args[++i];
                     break;
@@ -4845,6 +4883,8 @@ public sealed record AppOptions(
             replayInputPath,
             replayOrdersInputPath,
             replayCorporateActionsInputPath,
+            replaySymbolMappingsInputPath,
+            replayDelistEventsInputPath,
             replayPriceNormalization,
             replayIntervalSeconds,
             replayMaxRows,
