@@ -2928,7 +2928,9 @@ public sealed class SnapshotRuntime
             _options.ReplayCommissionPerUnit,
             _options.ReplaySlippageBps,
             replayCorporateActions,
-            replayNormalizationMode);
+            replayNormalizationMode,
+            _options.ReplayInitialMarginRate,
+            _options.ReplayMaintenanceMarginRate);
         var replayOrderRows = new List<ReplayOrderIntent>();
         var replayFillRows = new List<ReplayFillRow>();
         var replayCorporateActionAppliedRows = new List<ReplayCorporateActionAppliedRow>();
@@ -2937,6 +2939,8 @@ public sealed class SnapshotRuntime
         var replayBorrowLocateEventRows = new List<ReplayBorrowLocateEventArtifactRow>();
         var replayFinancingAppliedRows = new List<ReplayFinancingAppliedRow>();
         var replayLocateRejectionRows = new List<ReplayLocateRejectionRow>();
+        var replayMarginRejectionRows = new List<ReplayMarginRejectionRow>();
+        var replayMarginEventRows = new List<ReplayMarginEventRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
@@ -3008,6 +3012,8 @@ public sealed class SnapshotRuntime
             replayDelistAppliedRows.AddRange(simulation.AppliedDelists);
             replayFinancingAppliedRows.AddRange(simulation.AppliedFinancing);
             replayLocateRejectionRows.AddRange(simulation.LocateRejections);
+            replayMarginRejectionRows.AddRange(simulation.MarginRejections);
+            replayMarginEventRows.AddRange(simulation.MarginEvents);
             replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
@@ -3027,6 +3033,8 @@ public sealed class SnapshotRuntime
         var replayBorrowLocateEventsPath = Path.Combine(outputDir, $"strategy_replay_borrow_locate_events_{timestamp}.json");
         var replayFinancingAppliedPath = Path.Combine(outputDir, $"strategy_replay_financing_applied_{timestamp}.json");
         var replayLocateRejectionsPath = Path.Combine(outputDir, $"strategy_replay_locate_rejections_{timestamp}.json");
+        var replayMarginRejectionsPath = Path.Combine(outputDir, $"strategy_replay_margin_rejections_{timestamp}.json");
+        var replayMarginEventsPath = Path.Combine(outputDir, $"strategy_replay_margin_events_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -3044,6 +3052,8 @@ public sealed class SnapshotRuntime
         WriteJson(replayBorrowLocateEventsPath, replayBorrowLocateEventRows);
         WriteJson(replayFinancingAppliedPath, replayFinancingAppliedRows);
         WriteJson(replayLocateRejectionsPath, replayLocateRejectionRows);
+        WriteJson(replayMarginRejectionsPath, replayMarginRejectionRows);
+        WriteJson(replayMarginEventsPath, replayMarginEventRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3057,6 +3067,8 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay borrow/locate events export: {replayBorrowLocateEventsPath} (rows={replayBorrowLocateEventRows.Count})");
         Console.WriteLine($"[OK] Strategy replay financing applied export: {replayFinancingAppliedPath} (rows={replayFinancingAppliedRows.Count})");
         Console.WriteLine($"[OK] Strategy replay locate rejections export: {replayLocateRejectionsPath} (rows={replayLocateRejectionRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay margin rejections export: {replayMarginRejectionsPath} (rows={replayMarginRejectionRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay margin events export: {replayMarginEventsPath} (rows={replayMarginEventRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4154,6 +4166,8 @@ public sealed record AppOptions(
     double ReplayInitialCash,
     double ReplayCommissionPerUnit,
     double ReplaySlippageBps,
+    double ReplayInitialMarginRate,
+    double ReplayMaintenanceMarginRate,
     bool HeartbeatMonitorEnabled,
     int HeartbeatIntervalSeconds,
     int HeartbeatProbeTimeoutSeconds,
@@ -4296,6 +4310,8 @@ public sealed record AppOptions(
         var replayInitialCash = 100000.0;
         var replayCommissionPerUnit = preTradeCommissionPerUnit;
         var replaySlippageBps = preTradeSlippageBps;
+        var replayInitialMarginRate = 0.50;
+        var replayMaintenanceMarginRate = 0.30;
         var heartbeatMonitorEnabled = true;
         var heartbeatIntervalSeconds = 6;
         var heartbeatProbeTimeoutSeconds = 4;
@@ -4748,6 +4764,14 @@ public sealed record AppOptions(
                     replaySlippageBps = rsb;
                     i++;
                     break;
+                case "--replay-initial-margin-rate" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rimr):
+                    replayInitialMarginRate = Math.Max(0, rimr);
+                    i++;
+                    break;
+                case "--replay-maintenance-margin-rate" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rmmr):
+                    replayMaintenanceMarginRate = Math.Max(0, rmmr);
+                    i++;
+                    break;
                 case "--heartbeat-monitor" when i + 1 < args.Length:
                     heartbeatMonitorEnabled = bool.TryParse(args[++i], out var hm) && hm;
                     break;
@@ -4920,6 +4944,8 @@ public sealed record AppOptions(
             replayInitialCash,
             replayCommissionPerUnit,
             replaySlippageBps,
+            replayInitialMarginRate,
+            replayMaintenanceMarginRate,
             heartbeatMonitorEnabled,
             heartbeatIntervalSeconds,
             heartbeatProbeTimeoutSeconds,

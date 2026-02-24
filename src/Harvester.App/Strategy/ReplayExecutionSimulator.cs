@@ -44,6 +44,8 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayDelistAppliedRow> AppliedDelists,
     IReadOnlyList<ReplayFinancingAppliedRow> AppliedFinancing,
     IReadOnlyList<ReplayLocateRejectionRow> LocateRejections,
+    IReadOnlyList<ReplayMarginRejectionRow> MarginRejections,
+    IReadOnlyList<ReplayMarginEventRow> MarginEvents,
     ReplayPortfolioRow Portfolio
 );
 
@@ -94,6 +96,30 @@ public sealed record ReplayLocateRejectionRow(
     string Source
 );
 
+public sealed record ReplayMarginRejectionRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    double Quantity,
+    double FillPrice,
+    double ProjectedEquity,
+    double ProjectedInitialMargin,
+    string Reason,
+    string Source
+);
+
+public sealed record ReplayMarginEventRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string EventType,
+    double Equity,
+    double MaintenanceRequirement,
+    double PositionQuantity,
+    double MarketPrice,
+    double CashAfter,
+    string Source
+);
+
 public sealed class ReplayExecutionSimulator
 {
     private readonly double _commissionPerUnit;
@@ -105,6 +131,8 @@ public sealed class ReplayExecutionSimulator
     private readonly IReadOnlyList<ReplayCorporateActionRow> _corporateActions;
     private int _corporateActionCursor;
     private readonly ReplayPriceNormalizationMode _normalizationMode;
+    private readonly double _initialMarginRate;
+    private readonly double _maintenanceMarginRate;
     private DateTime? _lastFinancingTimestampUtc;
 
     public ReplayExecutionSimulator(
@@ -112,7 +140,9 @@ public sealed class ReplayExecutionSimulator
         double commissionPerUnit,
         double slippageBps,
         IReadOnlyList<ReplayCorporateActionRow> corporateActions,
-        ReplayPriceNormalizationMode normalizationMode)
+        ReplayPriceNormalizationMode normalizationMode,
+        double initialMarginRate,
+        double maintenanceMarginRate)
     {
         _cash = initialCash;
         _commissionPerUnit = Math.Max(0, commissionPerUnit);
@@ -121,6 +151,8 @@ public sealed class ReplayExecutionSimulator
             .OrderBy(x => x.EffectiveTimestampUtc)
             .ToArray();
         _normalizationMode = normalizationMode;
+        _initialMarginRate = Math.Max(0, initialMarginRate);
+        _maintenanceMarginRate = Math.Max(0, maintenanceMarginRate);
         _corporateActionCursor = 0;
         _lastFinancingTimestampUtc = null;
     }
@@ -163,6 +195,8 @@ public sealed class ReplayExecutionSimulator
         var appliedDelists = new List<ReplayDelistAppliedRow>();
         var appliedFinancing = new List<ReplayFinancingAppliedRow>();
         var locateRejections = new List<ReplayLocateRejectionRow>();
+        var marginRejections = new List<ReplayMarginRejectionRow>();
+        var marginEvents = new List<ReplayMarginEventRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
@@ -245,9 +279,27 @@ public sealed class ReplayExecutionSimulator
                 appliedFinancing.Add(locateValidation.FeeApplied);
             }
 
+            var marginValidation = ValidateInitialMargin(normalized, fillPrice.Value);
+            if (marginValidation is not null)
+            {
+                marginRejections.Add(marginValidation);
+                continue;
+            }
+
             accepted.Add(normalized);
             var fill = ApplyFill(normalized, fillPrice.Value);
             fills.Add(fill);
+        }
+
+        var maintenanceEvent = ApplyMaintenanceMarginGuard(slice.TimestampUtc, symbol, markPrice);
+        if (maintenanceEvent is not null)
+        {
+            marginEvents.Add(maintenanceEvent.Value.Event);
+            if (maintenanceEvent.Value.ForcedOrder is not null)
+            {
+                accepted.Add(maintenanceEvent.Value.ForcedOrder.Value.Order);
+                fills.Add(maintenanceEvent.Value.ForcedOrder.Value.Fill);
+            }
         }
 
         _lastFinancingTimestampUtc = slice.TimestampUtc;
@@ -268,7 +320,87 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, portfolio);
+    }
+
+    private ReplayMarginRejectionRow? ValidateInitialMargin(ReplayOrderIntent intent, double fillPrice)
+    {
+        if (_initialMarginRate <= 0)
+        {
+            return null;
+        }
+
+        var side = ParseSide(intent.Side);
+        if (side == 0)
+        {
+            return null;
+        }
+
+        var signedQuantity = side * intent.Quantity;
+        var commission = intent.Quantity * _commissionPerUnit;
+        var projectedCash = _cash - (signedQuantity * fillPrice) - commission;
+        var projectedPosition = _positionQuantity + signedQuantity;
+        var projectedEquity = projectedCash + (projectedPosition * fillPrice);
+        var projectedInitialMargin = Math.Abs(projectedPosition * fillPrice) * _initialMarginRate;
+
+        if (projectedEquity + 1e-9 >= projectedInitialMargin)
+        {
+            return null;
+        }
+
+        return new ReplayMarginRejectionRow(
+            intent.TimestampUtc,
+            intent.Symbol,
+            intent.Side,
+            intent.Quantity,
+            fillPrice,
+            projectedEquity,
+            projectedInitialMargin,
+            "INITIAL_MARGIN_BREACH",
+            intent.Source);
+    }
+
+    private (ReplayMarginEventRow Event, (ReplayOrderIntent Order, ReplayFillRow Fill)? ForcedOrder)? ApplyMaintenanceMarginGuard(
+        DateTime timestampUtc,
+        string symbol,
+        double markPrice)
+    {
+        if (_maintenanceMarginRate <= 0 || _positionQuantity == 0 || markPrice <= 0)
+        {
+            return null;
+        }
+
+        var equity = _cash + (_positionQuantity * markPrice);
+        var maintenanceRequirement = Math.Abs(_positionQuantity * markPrice) * _maintenanceMarginRate;
+        if (equity + 1e-9 >= maintenanceRequirement)
+        {
+            return null;
+        }
+
+        var positionBefore = _positionQuantity;
+        var forcedSide = _positionQuantity > 0 ? "SELL" : "BUY";
+        var forcedOrder = new ReplayOrderIntent(
+            timestampUtc,
+            symbol,
+            forcedSide,
+            Math.Abs(_positionQuantity),
+            "MKT",
+            null,
+            "margin");
+        var forcedFill = ApplyFill(forcedOrder, markPrice);
+
+        var eventRow = new ReplayMarginEventRow(
+            timestampUtc,
+            symbol,
+            "MAINTENANCE_MARGIN_LIQUIDATION",
+            equity,
+            maintenanceRequirement,
+            positionBefore,
+            markPrice,
+            _cash,
+            "margin");
+
+        return (eventRow, (forcedOrder, forcedFill));
     }
 
     private ReplayFinancingAppliedRow? ApplyBorrowFinancing(
