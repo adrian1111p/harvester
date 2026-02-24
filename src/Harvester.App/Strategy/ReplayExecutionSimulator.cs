@@ -40,7 +40,20 @@ public sealed record ReplayPortfolioRow(
 public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayOrderIntent> Orders,
     IReadOnlyList<ReplayFillRow> Fills,
+    IReadOnlyList<ReplayCorporateActionAppliedRow> AppliedCorporateActions,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayCorporateActionAppliedRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string ActionType,
+    double SplitRatio,
+    double CashAmount,
+    double CashDelta,
+    double PositionQuantity,
+    double AveragePrice,
+    string Source
 );
 
 public sealed class ReplayExecutionSimulator
@@ -51,12 +64,25 @@ public sealed class ReplayExecutionSimulator
     private double _positionQuantity;
     private double _averagePrice;
     private double _realizedPnl;
+    private readonly IReadOnlyList<ReplayCorporateActionRow> _corporateActions;
+    private int _corporateActionCursor;
+    private readonly ReplayPriceNormalizationMode _normalizationMode;
 
-    public ReplayExecutionSimulator(double initialCash, double commissionPerUnit, double slippageBps)
+    public ReplayExecutionSimulator(
+        double initialCash,
+        double commissionPerUnit,
+        double slippageBps,
+        IReadOnlyList<ReplayCorporateActionRow> corporateActions,
+        ReplayPriceNormalizationMode normalizationMode)
     {
         _cash = initialCash;
         _commissionPerUnit = Math.Max(0, commissionPerUnit);
         _slippageBps = Math.Max(0, slippageBps);
+        _corporateActions = corporateActions
+            .OrderBy(x => x.EffectiveTimestampUtc)
+            .ToArray();
+        _normalizationMode = normalizationMode;
+        _corporateActionCursor = 0;
     }
 
     public static IReadOnlyList<ReplayOrderIntent> LoadOrderIntents(string inputPath, int maxRows)
@@ -88,6 +114,7 @@ public sealed class ReplayExecutionSimulator
 
         var fills = new List<ReplayFillRow>();
         var accepted = new List<ReplayOrderIntent>();
+        var appliedActions = ApplyCorporateActions(slice.TimestampUtc, symbol);
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
@@ -136,7 +163,51 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, portfolio);
+    }
+
+    private IReadOnlyList<ReplayCorporateActionAppliedRow> ApplyCorporateActions(DateTime timestampUtc, string symbol)
+    {
+        var applied = new List<ReplayCorporateActionAppliedRow>();
+
+        while (_corporateActionCursor < _corporateActions.Count && _corporateActions[_corporateActionCursor].EffectiveTimestampUtc <= timestampUtc)
+        {
+            var action = _corporateActions[_corporateActionCursor];
+            _corporateActionCursor++;
+
+            if (!string.Equals(action.Symbol, symbol, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var cashDelta = 0.0;
+            if (action.ActionType == "SPLIT" && action.SplitRatio > 0)
+            {
+                _positionQuantity *= action.SplitRatio;
+                if (_averagePrice > 0)
+                {
+                    _averagePrice /= action.SplitRatio;
+                }
+            }
+            else if (action.ActionType == "DIVIDEND" && action.CashAmount > 0 && _normalizationMode == ReplayPriceNormalizationMode.TotalReturn)
+            {
+                cashDelta = _positionQuantity * action.CashAmount;
+                _cash += cashDelta;
+            }
+
+            applied.Add(new ReplayCorporateActionAppliedRow(
+                action.EffectiveTimestampUtc,
+                action.Symbol,
+                action.ActionType,
+                action.SplitRatio,
+                action.CashAmount,
+                cashDelta,
+                _positionQuantity,
+                _averagePrice,
+                action.Source));
+        }
+
+        return applied;
     }
 
     private double? ResolveFillPrice(ReplayOrderIntent intent, HistoricalBarRow? bar, double markPrice)

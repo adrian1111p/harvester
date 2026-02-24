@@ -2912,22 +2912,31 @@ public sealed class SnapshotRuntime
     private async Task RunStrategyReplayMode(StrategyRuntimeContext strategyContext, CancellationToken token)
     {
         var replayDriver = new StrategyReplayDriver();
-        var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows);
+        var replayNormalizationMode = ReplayCorporateActionsEngine.ParseNormalizationMode(_options.ReplayPriceNormalization);
+        var replayCorporateActions = ReplayCorporateActionsEngine.LoadCorporateActions(_options.ReplayCorporateActionsInputPath, _options.ReplayMaxRows);
+        var slices = replayDriver.LoadSlices(_options.ReplayInputPath, _options.ReplayMaxRows, replayCorporateActions, replayNormalizationMode);
         var staticReplayOrders = ReplayExecutionSimulator.LoadOrderIntents(_options.ReplayOrdersInputPath, _options.ReplayMaxRows);
         var staticReplayCursor = 0;
         var replayClock = new DeterministicReplayClock(slices[0].TimestampUtc);
         var replaySimulator = new ReplayExecutionSimulator(
             _options.ReplayInitialCash,
             _options.ReplayCommissionPerUnit,
-            _options.ReplaySlippageBps);
+            _options.ReplaySlippageBps,
+            replayCorporateActions,
+            replayNormalizationMode);
         var replayOrderRows = new List<ReplayOrderIntent>();
         var replayFillRows = new List<ReplayFillRow>();
+        var replayCorporateActionAppliedRows = new List<ReplayCorporateActionAppliedRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
 
         Console.WriteLine($"[INFO] strategy-replay loaded rows={slices.Count} source={Path.GetFullPath(_options.ReplayInputPath)}");
         if (staticReplayOrders.Count > 0)
         {
             Console.WriteLine($"[INFO] strategy-replay loaded external orders={staticReplayOrders.Count} source={Path.GetFullPath(_options.ReplayOrdersInputPath)}");
+        }
+        if (replayCorporateActions.Count > 0)
+        {
+            Console.WriteLine($"[INFO] strategy-replay loaded corporate actions={replayCorporateActions.Count} source={Path.GetFullPath(_options.ReplayCorporateActionsInputPath)} mode={_options.ReplayPriceNormalization}");
         }
 
         foreach (var slice in slices)
@@ -2962,6 +2971,7 @@ public sealed class SnapshotRuntime
             var simulation = replaySimulator.ProcessSlice(slice, strategyContext.Symbol, dueOrders);
             replayOrderRows.AddRange(simulation.Orders);
             replayFillRows.AddRange(simulation.Fills);
+            replayCorporateActionAppliedRows.AddRange(simulation.AppliedCorporateActions);
             replayPortfolioRows.Add(simulation.Portfolio);
 
             if (_options.ReplayIntervalSeconds > 0)
@@ -2975,6 +2985,7 @@ public sealed class SnapshotRuntime
         var replayPath = Path.Combine(outputDir, $"strategy_replay_slices_{timestamp}.json");
         var replayOrdersPath = Path.Combine(outputDir, $"strategy_replay_orders_{timestamp}.json");
         var replayFillsPath = Path.Combine(outputDir, $"strategy_replay_fills_{timestamp}.json");
+        var replayCorporateActionsAppliedPath = Path.Combine(outputDir, $"strategy_replay_corporate_actions_applied_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -2986,6 +2997,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayPath, slices);
         WriteJson(replayOrdersPath, replayOrderRows);
         WriteJson(replayFillsPath, replayFillRows);
+        WriteJson(replayCorporateActionsAppliedPath, replayCorporateActionAppliedRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -2993,6 +3005,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay applied corporate actions export: {replayCorporateActionsAppliedPath} (rows={replayCorporateActionAppliedRows.Count})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4080,6 +4093,8 @@ public sealed record AppOptions(
     int DisplayGroupCaptureSeconds,
     string ReplayInputPath,
     string ReplayOrdersInputPath,
+    string ReplayCorporateActionsInputPath,
+    string ReplayPriceNormalization,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
     double ReplayInitialCash,
@@ -4217,6 +4232,8 @@ public sealed record AppOptions(
         var displayGroupCaptureSeconds = 4;
         var replayInputPath = string.Empty;
         var replayOrdersInputPath = string.Empty;
+        var replayCorporateActionsInputPath = string.Empty;
+        var replayPriceNormalization = "raw";
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
         var replayInitialCash = 100000.0;
@@ -4639,6 +4656,12 @@ public sealed record AppOptions(
                 case "--replay-orders-input" when i + 1 < args.Length:
                     replayOrdersInputPath = args[++i];
                     break;
+                case "--replay-corporate-actions-input" when i + 1 < args.Length:
+                    replayCorporateActionsInputPath = args[++i];
+                    break;
+                case "--replay-price-normalization" when i + 1 < args.Length:
+                    replayPriceNormalization = args[++i];
+                    break;
                 case "--replay-interval-seconds" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ris):
                     replayIntervalSeconds = ris;
                     i++;
@@ -4821,6 +4844,8 @@ public sealed record AppOptions(
             displayGroupCaptureSeconds,
             replayInputPath,
             replayOrdersInputPath,
+            replayCorporateActionsInputPath,
+            replayPriceNormalization,
             replayIntervalSeconds,
             replayMaxRows,
             replayInitialCash,

@@ -15,7 +15,11 @@ public sealed record StrategyReplayInputRow(
 
 public sealed class StrategyReplayDriver
 {
-    public IReadOnlyList<StrategyDataSlice> LoadSlices(string inputPath, int maxRows)
+    public IReadOnlyList<StrategyDataSlice> LoadSlices(
+        string inputPath,
+        int maxRows,
+        IReadOnlyList<ReplayCorporateActionRow> corporateActions,
+        ReplayPriceNormalizationMode normalizationMode)
     {
         if (string.IsNullOrWhiteSpace(inputPath))
         {
@@ -45,7 +49,9 @@ public sealed class StrategyReplayDriver
             throw new InvalidOperationException("Replay input did not contain valid TimestampUtc rows.");
         }
 
-        return ordered
+        var normalized = ReplayCorporateActionsEngine.NormalizeRows(ordered, corporateActions, normalizationMode);
+
+        return normalized
             .Select((row, index) => BuildSlice(row, index))
             .ToArray();
     }
