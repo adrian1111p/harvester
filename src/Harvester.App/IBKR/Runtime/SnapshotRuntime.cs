@@ -282,6 +282,7 @@ public sealed class SnapshotRuntime
                 ExportStrategySchedulerArtifact();
                 ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
                 ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 1);
+                ExportPromotionReadinessArtifact(runStartedUtc, 1);
                 await NotifyStrategyShutdownAsync(strategyContext, 1);
                 TransitionLifecycle(RuntimeLifecycleStage.Halted, "blocking error or gate failure");
                 PersistRuntimeState(runtimeStateStore, session, 1, runStartedUtc);
@@ -292,6 +293,7 @@ public sealed class SnapshotRuntime
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 0);
             ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 0);
+            ExportPromotionReadinessArtifact(runStartedUtc, 0);
             await NotifyStrategyShutdownAsync(strategyContext, 0);
             TransitionLifecycle(RuntimeLifecycleStage.Shutdown, "completed without blocking errors");
             Console.WriteLine("[PASS] Completed successfully.");
@@ -304,6 +306,7 @@ public sealed class SnapshotRuntime
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 1);
             ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 1);
+            ExportPromotionReadinessArtifact(runStartedUtc, 1);
             var cancelledContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", cancelledContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(cancelledContext, 1);
@@ -320,6 +323,7 @@ public sealed class SnapshotRuntime
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
             ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 2);
+            ExportPromotionReadinessArtifact(runStartedUtc, 2);
             var timeoutContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", timeoutContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(timeoutContext, 2);
@@ -336,6 +340,7 @@ public sealed class SnapshotRuntime
             ExportStrategySchedulerArtifact();
             ExportResilienceDrillAcceptanceArtifact(session, runStartedUtc, 2);
             ExportLeanZiplineParityChecklistArtifact(runStartedUtc, 2);
+            ExportPromotionReadinessArtifact(runStartedUtc, 2);
             var exceptionContext = BuildFallbackStrategyContext(runStartedUtc);
             await NotifyStrategyScheduledEventAsync("mode-failed", exceptionContext, CancellationToken.None);
             await NotifyStrategyShutdownAsync(exceptionContext, 2);
@@ -827,9 +832,10 @@ public sealed class SnapshotRuntime
     private async Task RunOrdersPlaceSimMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
-        ValidateLiveSafetyInputs();
+        var livePlan = ResolveLiveOrderPlacementPlan();
+        ValidateLiveSafetyInputs(livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, livePlan.Symbol);
 
-        var notional = _options.LiveQuantity * _options.LiveLimitPrice;
+        var notional = livePlan.Quantity * livePlan.LimitPrice;
         if (notional > _options.MaxNotional)
         {
             throw new InvalidOperationException($"Live order blocked: notional {notional:F2} exceeds max-notional {_options.MaxNotional:F2}.");
@@ -842,32 +848,32 @@ public sealed class SnapshotRuntime
 
         EvaluatePreTradeControls(
             route: nameof(RunOrdersPlaceSimMode),
-            symbol: _options.LiveSymbol,
-            action: _options.LiveAction,
-            quantity: _options.LiveQuantity,
-            limitPrice: _options.LiveLimitPrice,
+            symbol: livePlan.Symbol,
+            action: livePlan.Action,
+            quantity: livePlan.Quantity,
+            limitPrice: livePlan.LimitPrice,
             notional: notional);
 
         var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
             BrokerAssetType.Stock,
-            _options.LiveSymbol,
+            livePlan.Symbol,
             "SMART",
             "USD",
             _options.PrimaryExchange));
         var order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
-            _options.LiveAction,
+            livePlan.Action,
             "LMT",
-            _options.LiveQuantity,
-            LimitPrice: _options.LiveLimitPrice));
+            livePlan.Quantity,
+            LimitPrice: livePlan.LimitPrice));
         var nextOrderId = await _wrapper.NextValidIdTask;
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_SIM_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
-        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunOrdersPlaceSimMode), _options.LiveSymbol, _options.LiveAction, _options.LiveQuantity, _options.LiveLimitPrice, order.OrderRef);
+        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunOrdersPlaceSimMode), livePlan.Symbol, livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, order.OrderRef);
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         MarkOrderTransmitted();
-        Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={_options.LiveSymbol} action={_options.LiveAction} qty={_options.LiveQuantity} lmt={_options.LiveLimitPrice}");
+        Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={livePlan.Symbol} action={livePlan.Action} qty={livePlan.Quantity} lmt={livePlan.LimitPrice} source={livePlan.Source}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
         brokerAdapter.RequestOpenOrders(client);
@@ -881,10 +887,10 @@ public sealed class SnapshotRuntime
         var placement = new LiveOrderPlacementRow(
             timestamp,
             order.OrderId,
-            _options.LiveSymbol,
-            _options.LiveAction,
-            _options.LiveQuantity,
-            _options.LiveLimitPrice,
+            livePlan.Symbol,
+            livePlan.Action,
+            livePlan.Quantity,
+            livePlan.LimitPrice,
             notional,
             _options.Account,
             order.OrderRef
@@ -897,6 +903,132 @@ public sealed class SnapshotRuntime
 
         Console.WriteLine($"[OK] Sim placement export: {placementPath}");
         Console.WriteLine($"[OK] Sim status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+    }
+
+    private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan()
+    {
+        var symbol = _options.LiveSymbol;
+        var action = _options.LiveAction;
+        var quantity = _options.LiveQuantity;
+        var limitPrice = _options.LiveLimitPrice;
+        var source = "manual";
+
+        if (string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath))
+        {
+            return new LiveOrderPlacementPlan(symbol, action, quantity, limitPrice, source);
+        }
+
+        var fullPath = Path.GetFullPath(_options.LiveScannerCandidatesInputPath);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException($"Live scanner candidates input not found: {fullPath}");
+        }
+
+        if (_options.LiveScannerKillSwitchMaxFileAgeMinutes > 0)
+        {
+            var ageMinutes = (DateTime.UtcNow - File.GetLastWriteTimeUtc(fullPath)).TotalMinutes;
+            if (ageMinutes > _options.LiveScannerKillSwitchMaxFileAgeMinutes)
+            {
+                _hasPreTradeHalt = true;
+                throw new InvalidOperationException(
+                    $"Live handoff blocked by kill-switch: scanner candidates file is stale ({ageMinutes:F1}m > {_options.LiveScannerKillSwitchMaxFileAgeMinutes}m).");
+            }
+        }
+
+        var rows = JsonSerializer.Deserialize<LiveScannerCandidateRow[]>(File.ReadAllText(fullPath), new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        }) ?? [];
+
+        var selected = rows
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+            .Where(x => x.Eligible is not false)
+            .Where(x => x.WeightedScore >= _options.LiveScannerMinScore)
+            .Select(x => new LiveScannerCandidateRow
+            {
+                Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                WeightedScore = x.WeightedScore,
+                Eligible = x.Eligible,
+                AverageRank = x.AverageRank
+            })
+            .Where(x => _options.AllowedSymbols.Any(s => string.Equals(s, x.Symbol, StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .Take(Math.Max(1, _options.LiveScannerTopN))
+            .ToArray();
+
+        if (selected.Length == 0)
+        {
+            throw new InvalidOperationException("Live handoff blocked: no eligible scanner candidates matched allow-list and score threshold.");
+        }
+
+        if (selected.Length < Math.Max(1, _options.LiveScannerKillSwitchMinCandidates))
+        {
+            _hasPreTradeHalt = true;
+            throw new InvalidOperationException(
+                $"Live handoff blocked by kill-switch: only {selected.Length} eligible candidate(s), below minimum {_options.LiveScannerKillSwitchMinCandidates}.");
+        }
+
+        var chosen = selected[0];
+        symbol = chosen.Symbol;
+        source = "scanner-candidate";
+
+        if (_options.LiveAllocationBudget > 0)
+        {
+            var targetNotional = ResolveTargetNotional(_options.LiveAllocationMode, _options.LiveAllocationBudget, chosen.WeightedScore, selected);
+
+            if (_options.LiveScannerKillSwitchMaxBudgetConcentrationPct > 0)
+            {
+                var concentration = (_options.LiveAllocationBudget <= 0)
+                    ? 0
+                    : (targetNotional / _options.LiveAllocationBudget) * 100.0;
+                if (concentration > _options.LiveScannerKillSwitchMaxBudgetConcentrationPct)
+                {
+                    _hasPreTradeHalt = true;
+                    throw new InvalidOperationException(
+                        $"Live handoff blocked by kill-switch: concentration {concentration:F1}% exceeds {_options.LiveScannerKillSwitchMaxBudgetConcentrationPct:F1}%.");
+                }
+            }
+
+            if (targetNotional > 0)
+            {
+                if (limitPrice <= 0)
+                {
+                    throw new InvalidOperationException("Live handoff blocked: --live-limit must be > 0 when live allocation budget sizing is enabled.");
+                }
+
+                quantity = Math.Floor(targetNotional / limitPrice);
+                if (quantity <= 0)
+                {
+                    quantity = 1;
+                }
+            }
+        }
+
+        return new LiveOrderPlacementPlan(symbol, action, quantity, limitPrice, source);
+    }
+
+    private static double ResolveTargetNotional(string mode, double budget, double selectedScore, IReadOnlyList<LiveScannerCandidateRow> selected)
+    {
+        var normalizedMode = string.IsNullOrWhiteSpace(mode) ? "manual" : mode.Trim().ToLowerInvariant();
+        return normalizedMode switch
+        {
+            "equal" => budget / Math.Max(1, selected.Count),
+            "score" => ResolveScoreWeightedNotional(budget, selectedScore, selected),
+            _ => budget
+        };
+    }
+
+    private static double ResolveScoreWeightedNotional(double budget, double selectedScore, IReadOnlyList<LiveScannerCandidateRow> selected)
+    {
+        var totalScore = selected.Sum(x => Math.Max(0, x.WeightedScore));
+        if (totalScore <= 0)
+        {
+            return budget / Math.Max(1, selected.Count);
+        }
+
+        var share = Math.Max(0, selectedScore) / totalScore;
+        return budget * share;
     }
 
     private async Task RunOrdersWhatIfMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -2681,6 +2813,7 @@ public sealed class SnapshotRuntime
 
         var runRows = new List<ScannerWorkbenchRunRow>();
         var scoreRows = new List<ScannerWorkbenchScoreRow>();
+        var candidateObservationRows = new List<ScannerWorkbenchCandidateObservationRow>();
         var baseReqId = 9980;
 
         for (var codeIndex = 0; codeIndex < scanCodes.Length; codeIndex++)
@@ -2708,6 +2841,31 @@ public sealed class SnapshotRuntime
                     .Where(x => x.RequestId == reqId)
                     .OrderBy(x => x.TimestampUtc)
                     .ToArray();
+
+                foreach (var scannerRow in rowsForReq)
+                {
+                    var normalizedSymbol = (scannerRow.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+                    if (string.IsNullOrWhiteSpace(normalizedSymbol))
+                    {
+                        continue;
+                    }
+
+                    candidateObservationRows.Add(new ScannerWorkbenchCandidateObservationRow(
+                        scannerRow.TimestampUtc,
+                        reqId,
+                        scanCode,
+                        runIndex,
+                        normalizedSymbol,
+                        scannerRow.ConId,
+                        scannerRow.Rank,
+                        scannerRow.Exchange,
+                        scannerRow.PrimaryExchange,
+                        scannerRow.Currency,
+                        scannerRow.Distance,
+                        scannerRow.Benchmark,
+                        scannerRow.Projection
+                    ));
+                }
 
                 var newErrors = _wrapper.Errors.Skip(errorCountBefore).ToArray();
                 var reqErrors = newErrors.Where(x => x.Contains($"id={reqId}", StringComparison.OrdinalIgnoreCase)).ToArray();
@@ -2783,17 +2941,128 @@ public sealed class SnapshotRuntime
             .ThenByDescending(x => x.WeightedScore)
             .ThenByDescending(x => x.CoverageScore)
             .ToArray();
+        var candidateRows = BuildScannerWorkbenchCandidates(candidateObservationRows, scanCodes.Length, runs);
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
         var runsPath = Path.Combine(outputDir, $"scanner_workbench_runs_{timestamp}.json");
         var rankingPath = Path.Combine(outputDir, $"scanner_workbench_ranking_{timestamp}.json");
+        var candidatesPath = Path.Combine(outputDir, $"scanner_workbench_candidates_{timestamp}.json");
 
         WriteJson(runsPath, runRows);
         WriteJson(rankingPath, ranked);
+        WriteJson(candidatesPath, candidateRows);
 
         Console.WriteLine($"[OK] Scanner workbench runs export: {runsPath} (rows={runRows.Count})");
         Console.WriteLine($"[OK] Scanner workbench ranking export: {rankingPath} (rows={ranked.Length})");
+        Console.WriteLine($"[OK] Scanner workbench candidates export: {candidatesPath} (rows={candidateRows.Length})");
+    }
+
+    private ScannerWorkbenchCandidateRow[] BuildScannerWorkbenchCandidates(
+        IReadOnlyList<ScannerWorkbenchCandidateObservationRow> observationRows,
+        int totalScanCodes,
+        int totalRuns)
+    {
+        if (observationRows.Count == 0)
+        {
+            return [];
+        }
+
+        var requiredObservations = Math.Max(1, (int)Math.Ceiling(totalRuns * 0.5));
+
+        return observationRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+            .GroupBy(x => x.Symbol.Trim().ToUpperInvariant())
+            .Select(group =>
+            {
+                var entries = group.ToArray();
+                var observationCount = entries.Length;
+                var distinctScanCodes = entries
+                    .Select(x => x.ScanCode)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Count();
+                var averageRank = entries.Average(x => x.Rank);
+                var bestRank = entries.Min(x => x.Rank);
+
+                var coverageScore = totalScanCodes <= 0
+                    ? 0
+                    : Math.Clamp((distinctScanCodes * 100.0) / totalScanCodes, 0, 100);
+                var consistencyBase = Math.Max(1, totalRuns * Math.Max(1, distinctScanCodes));
+                var consistencyScore = Math.Clamp((observationCount * 100.0) / consistencyBase, 0, 100);
+                var rankScore = _options.ScannerRows <= 1
+                    ? 100
+                    : Math.Clamp((1 - ((averageRank - 1) / (_options.ScannerRows - 1))) * 100, 0, 100);
+
+                var projectionValues = entries
+                    .Select(x => TryParseScannerMetric(x.Projection))
+                    .Where(x => x is not null)
+                    .Select(x => x!.Value)
+                    .ToArray();
+
+                var averageProjection = projectionValues.Length == 0
+                    ? (double?)null
+                    : projectionValues.Average();
+                var signalScore = averageProjection is null
+                    ? 50
+                    : Math.Clamp(50 + (averageProjection.Value * 5), 0, 100);
+
+                var weightedScore = (rankScore * 0.45) + (consistencyScore * 0.20) + (coverageScore * 0.20) + (signalScore * 0.15);
+
+                var rejectReason = string.Empty;
+                if (observationCount < requiredObservations)
+                {
+                    rejectReason = "insufficient-observations";
+                }
+
+                var eligible = string.IsNullOrWhiteSpace(rejectReason);
+                var exchange = entries
+                    .Select(x => x.PrimaryExchange)
+                    .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))
+                    ?? entries.Select(x => x.Exchange).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))
+                    ?? string.Empty;
+                var currency = entries
+                    .Select(x => x.Currency)
+                    .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))
+                    ?? string.Empty;
+
+                return new ScannerWorkbenchCandidateRow(
+                    group.Key,
+                    entries.Select(x => x.ConId).FirstOrDefault(x => x > 0),
+                    exchange,
+                    currency,
+                    observationCount,
+                    distinctScanCodes,
+                    Math.Round(averageRank, 3),
+                    bestRank,
+                    averageProjection is null ? null : Math.Round(averageProjection.Value, 4),
+                    Math.Round(rankScore, 3),
+                    Math.Round(consistencyScore, 3),
+                    Math.Round(coverageScore, 3),
+                    Math.Round(signalScore, 3),
+                    Math.Round(weightedScore, 3),
+                    eligible,
+                    rejectReason
+                );
+            })
+            .OrderByDescending(x => x.Eligible)
+            .ThenByDescending(x => x.WeightedScore)
+            .ThenByDescending(x => x.CoverageScore)
+            .ThenBy(x => x.AverageRank)
+            .ToArray();
+    }
+
+    private static double? TryParseScannerMetric(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = value.Trim().Replace("%", string.Empty);
+        return double.TryParse(normalized, out var parsed)
+            ? parsed
+            : null;
     }
 
     private async Task RunDisplayGroupsQueryMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -3085,6 +3354,7 @@ public sealed class SnapshotRuntime
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
         var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
+        var replayValidationSummaryPath = Path.Combine(outputDir, $"strategy_replay_validation_summary_{timestamp}.json");
 
         var replayFeeBreakdownRows = replayFillRows
             .Select(fill =>
@@ -3186,6 +3456,35 @@ public sealed class SnapshotRuntime
 
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
+        var strategySourceCounts = replayOrderRows
+            .GroupBy(x => string.IsNullOrWhiteSpace(x.Source) ? "unknown" : x.Source.Trim(), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+        var replayValidationSummary = new[]
+        {
+            new ReplayValidationSummaryRow(
+                DateTime.UtcNow,
+                _strategyRuntime.GetType().Name,
+                strategyContext.Symbol,
+                slices.Count,
+                replayOrderRows.Count,
+                replayFillRows.Count,
+                replayLocateRejectionRows.Count,
+                replayMarginRejectionRows.Count,
+                replayCashRejectionRows.Count,
+                replayOrderCancellationRows.Count,
+                strategySourceCounts,
+                performance.Summary.TotalReturn,
+                performance.Summary.MaxDrawdown,
+                performance.Summary.SharpeLike,
+                performance.Summary.WinRate,
+                performance.Summary.FillCount,
+                _options.ReplayScannerCandidatesInputPath,
+                _options.ReplayScannerTopN,
+                _options.ReplayScannerMinScore,
+                _options.ReplayScannerOrderQuantity,
+                _options.ReplayScannerOrderType,
+                _options.ReplayScannerOrderTimeInForce)
+        };
 
         WriteJson(replayPath, slices);
         WriteJson(replayOrdersPath, replayOrderRows);
@@ -3213,6 +3512,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
         WriteJson(replaySummaryPath, new[] { performance.Summary });
+        WriteJson(replayValidationSummaryPath, replayValidationSummary);
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
@@ -3239,6 +3539,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
         Console.WriteLine($"[OK] Strategy replay performance summary export: {replaySummaryPath}");
+        Console.WriteLine($"[OK] Strategy replay validation summary export: {replayValidationSummaryPath}");
     }
 
     private ScannerSubscription BuildScannerSubscriptionFromOptions()
@@ -3493,28 +3794,28 @@ public sealed class SnapshotRuntime
         };
     }
 
-    private void ValidateLiveSafetyInputs()
+    private void ValidateLiveSafetyInputs(string action, double quantity, double limitPrice, string symbol)
     {
-        var normalizedAction = _options.LiveAction.ToUpperInvariant();
+        var normalizedAction = action.ToUpperInvariant();
         if (normalizedAction is not ("BUY" or "SELL"))
         {
             throw new InvalidOperationException("Live order blocked: --live-action must be BUY or SELL.");
         }
 
-        if (_options.LiveQuantity <= 0 || _options.LiveQuantity > _options.MaxShares)
+        if (quantity <= 0 || quantity > _options.MaxShares)
         {
             throw new InvalidOperationException($"Live order blocked: qty must be >0 and <= max-shares ({_options.MaxShares}).");
         }
 
-        if (_options.LiveLimitPrice <= 0 || _options.LiveLimitPrice > _options.MaxPrice)
+        if (limitPrice <= 0 || limitPrice > _options.MaxPrice)
         {
             throw new InvalidOperationException($"Live order blocked: limit must be >0 and <= max-price ({_options.MaxPrice}).");
         }
 
-        var symbolAllowed = _options.AllowedSymbols.Any(s => string.Equals(s, _options.LiveSymbol, StringComparison.OrdinalIgnoreCase));
+        var symbolAllowed = _options.AllowedSymbols.Any(s => string.Equals(s, symbol, StringComparison.OrdinalIgnoreCase));
         if (!symbolAllowed)
         {
-            throw new InvalidOperationException($"Live order blocked: symbol '{_options.LiveSymbol}' is not in allow-list.");
+            throw new InvalidOperationException($"Live order blocked: symbol '{symbol}' is not in allow-list.");
         }
     }
 
@@ -4187,6 +4488,77 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] LEAN/zipline parity checklist export: {path}");
     }
 
+    private void ExportPromotionReadinessArtifact(DateTime runStartedUtc, int exitCode)
+    {
+        var outputDir = EnsureOutputDir();
+        var hasReplayValidationSummary = Directory.GetFiles(outputDir, "strategy_replay_validation_summary_*.json").Length > 0;
+
+        var hasLiveScannerInput = string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath)
+            || File.Exists(Path.GetFullPath(_options.LiveScannerCandidatesInputPath));
+        var killSwitchConfigured = _options.LiveScannerKillSwitchMinCandidates >= 1
+            && _options.LiveScannerKillSwitchMaxFileAgeMinutes >= 0
+            && _options.LiveScannerKillSwitchMaxBudgetConcentrationPct is >= 0 and <= 100;
+        var liveGuardrailsConfigured = _options.MaxNotional > 0
+            && _options.MaxShares > 0
+            && _options.MaxPrice > 0
+            && _options.AllowedSymbols.Length > 0;
+
+        var checks = new[]
+        {
+            new PromotionReadinessCheckRow(
+                "runtime-exit-code",
+                exitCode == 0,
+                $"exitCode={exitCode}"),
+            new PromotionReadinessCheckRow(
+                "replay-validation-summary",
+                hasReplayValidationSummary,
+                hasReplayValidationSummary
+                    ? "strategy_replay_validation_summary artifact found"
+                    : "run strategy-replay to generate strategy_replay_validation_summary_*.json for A/B comparison"),
+            new PromotionReadinessCheckRow(
+                "live-guardrails-configured",
+                liveGuardrailsConfigured,
+                $"maxNotional={_options.MaxNotional} maxShares={_options.MaxShares} maxPrice={_options.MaxPrice} allowedSymbols={_options.AllowedSymbols.Length}"),
+            new PromotionReadinessCheckRow(
+                "live-scanner-input",
+                hasLiveScannerInput,
+                string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath)
+                    ? "manual symbol mode"
+                    : $"path={_options.LiveScannerCandidatesInputPath}"),
+            new PromotionReadinessCheckRow(
+                "live-killswitch-configured",
+                killSwitchConfigured,
+                $"maxFileAgeMin={_options.LiveScannerKillSwitchMaxFileAgeMinutes} minCandidates={_options.LiveScannerKillSwitchMinCandidates} maxBudgetConcentrationPct={_options.LiveScannerKillSwitchMaxBudgetConcentrationPct}")
+        };
+
+        var paperReady = checks
+            .Where(x => x.CheckName is "runtime-exit-code" or "replay-validation-summary")
+            .All(x => x.Passed);
+        var liveReady = checks.All(x => x.Passed) && !_hasPreTradeHalt && !_hasConnectivityFailure && !_hasClockSkewFailure;
+
+        var nextStage = liveReady
+            ? "ready-for-live"
+            : paperReady
+                ? "ready-for-paper"
+                : "fix-gates-and-rerun";
+
+        var artifact = new PromotionReadinessRow(
+            DateTime.UtcNow,
+            _options.Mode.ToString(),
+            runStartedUtc,
+            DateTime.UtcNow,
+            exitCode,
+            paperReady,
+            liveReady,
+            nextStage,
+            checks);
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var path = Path.Combine(outputDir, $"promotion_readiness_{_options.Mode.ToString().ToLowerInvariant()}_{timestamp}.json");
+        WriteJson(path, new[] { artifact });
+        Console.WriteLine($"[OK] Promotion readiness export: {path}");
+    }
+
     private void EvaluateReconciliationQualityGate(ReconciliationSummaryRow summary, string context)
     {
         if (_options.ReconciliationGateAction == ReconciliationGateAction.Off)
@@ -4360,6 +4732,14 @@ public sealed record AppOptions(
     double MaxPrice,
     string[] AllowedSymbols
     ,
+    string LiveScannerCandidatesInputPath,
+    int LiveScannerTopN,
+    double LiveScannerMinScore,
+    string LiveAllocationMode,
+    double LiveAllocationBudget,
+    int LiveScannerKillSwitchMaxFileAgeMinutes,
+    int LiveScannerKillSwitchMinCandidates,
+    double LiveScannerKillSwitchMaxBudgetConcentrationPct,
     string WhatIfTemplate,
     int MarketDataType,
     int CaptureSeconds,
@@ -4463,6 +4843,12 @@ public sealed record AppOptions(
     string ReplaySymbolMappingsInputPath,
     string ReplayDelistEventsInputPath,
     string ReplayBorrowLocateInputPath,
+    string ReplayScannerCandidatesInputPath,
+    int ReplayScannerTopN,
+    double ReplayScannerMinScore,
+    double ReplayScannerOrderQuantity,
+    string ReplayScannerOrderType,
+    string ReplayScannerOrderTimeInForce,
     string ReplayPriceNormalization,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
@@ -4513,6 +4899,14 @@ public sealed record AppOptions(
         var maxShares = 10.0;
         var maxPrice = 10.0;
         var allowedSymbols = new[] { "SIRI", "SOFI", "F", "PLTR" };
+        var liveScannerCandidatesInputPath = string.Empty;
+        var liveScannerTopN = 5;
+        var liveScannerMinScore = 60.0;
+        var liveAllocationMode = "manual";
+        var liveAllocationBudget = 0.0;
+        var liveScannerKillSwitchMaxFileAgeMinutes = 30;
+        var liveScannerKillSwitchMinCandidates = 1;
+        var liveScannerKillSwitchMaxBudgetConcentrationPct = 100.0;
         var whatIfTemplate = "lmt";
         var marketDataType = 3;
         var captureSeconds = 12;
@@ -4616,6 +5010,12 @@ public sealed record AppOptions(
         var replaySymbolMappingsInputPath = string.Empty;
         var replayDelistEventsInputPath = string.Empty;
         var replayBorrowLocateInputPath = string.Empty;
+        var replayScannerCandidatesInputPath = string.Empty;
+        var replayScannerTopN = 5;
+        var replayScannerMinScore = 60.0;
+        var replayScannerOrderQuantity = 1.0;
+        var replayScannerOrderType = "MKT";
+        var replayScannerOrderTimeInForce = "DAY";
         var replayPriceNormalization = "raw";
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
@@ -4713,6 +5113,36 @@ public sealed record AppOptions(
                         .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                         .Select(x => x.ToUpperInvariant())
                         .ToArray();
+                    break;
+                case "--live-scanner-candidates-input" when i + 1 < args.Length:
+                    liveScannerCandidatesInputPath = args[++i];
+                    break;
+                case "--live-scanner-top-n" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lstn):
+                    liveScannerTopN = Math.Max(1, lstn);
+                    i++;
+                    break;
+                case "--live-scanner-min-score" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lsms):
+                    liveScannerMinScore = lsms;
+                    i++;
+                    break;
+                case "--live-allocation-mode" when i + 1 < args.Length:
+                    liveAllocationMode = args[++i].ToLowerInvariant();
+                    break;
+                case "--live-allocation-budget" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lab):
+                    liveAllocationBudget = Math.Max(0, lab);
+                    i++;
+                    break;
+                case "--live-killswitch-max-file-age-minutes" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lsf):
+                    liveScannerKillSwitchMaxFileAgeMinutes = Math.Max(0, lsf);
+                    i++;
+                    break;
+                case "--live-killswitch-min-candidates" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lsmc):
+                    liveScannerKillSwitchMinCandidates = Math.Max(1, lsmc);
+                    i++;
+                    break;
+                case "--live-killswitch-max-budget-concentration-pct" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lsbc):
+                    liveScannerKillSwitchMaxBudgetConcentrationPct = Math.Clamp(lsbc, 0, 100);
+                    i++;
                     break;
                 case "--whatif-template" when i + 1 < args.Length:
                     whatIfTemplate = args[++i].ToLowerInvariant();
@@ -5062,6 +5492,27 @@ public sealed record AppOptions(
                 case "--replay-borrow-locate-input" when i + 1 < args.Length:
                     replayBorrowLocateInputPath = args[++i];
                     break;
+                case "--replay-scanner-candidates-input" when i + 1 < args.Length:
+                    replayScannerCandidatesInputPath = args[++i];
+                    break;
+                case "--replay-scanner-top-n" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rsn):
+                    replayScannerTopN = Math.Max(1, rsn);
+                    i++;
+                    break;
+                case "--replay-scanner-min-score" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rsms):
+                    replayScannerMinScore = rsms;
+                    i++;
+                    break;
+                case "--replay-scanner-order-qty" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rsoq):
+                    replayScannerOrderQuantity = Math.Max(0, rsoq);
+                    i++;
+                    break;
+                case "--replay-scanner-order-type" when i + 1 < args.Length:
+                    replayScannerOrderType = args[++i].ToUpperInvariant();
+                    break;
+                case "--replay-scanner-order-tif" when i + 1 < args.Length:
+                    replayScannerOrderTimeInForce = args[++i].ToUpperInvariant();
+                    break;
                 case "--replay-price-normalization" when i + 1 < args.Length:
                     replayPriceNormalization = args[++i];
                     break;
@@ -5190,6 +5641,14 @@ public sealed record AppOptions(
             maxShares,
             maxPrice,
             allowedSymbols,
+            liveScannerCandidatesInputPath,
+            liveScannerTopN,
+            liveScannerMinScore,
+            liveAllocationMode,
+            liveAllocationBudget,
+            liveScannerKillSwitchMaxFileAgeMinutes,
+            liveScannerKillSwitchMinCandidates,
+            liveScannerKillSwitchMaxBudgetConcentrationPct,
             whatIfTemplate,
             marketDataType,
             captureSeconds,
@@ -5293,6 +5752,12 @@ public sealed record AppOptions(
             replaySymbolMappingsInputPath,
             replayDelistEventsInputPath,
             replayBorrowLocateInputPath,
+            replayScannerCandidatesInputPath,
+            replayScannerTopN,
+            replayScannerMinScore,
+            replayScannerOrderQuantity,
+            replayScannerOrderType,
+            replayScannerOrderTimeInForce,
             replayPriceNormalization,
             replayIntervalSeconds,
             replayMaxRows,
@@ -5537,6 +6002,22 @@ public sealed record LiveOrderPlacementRow(
     string OrderRef
 );
 
+internal sealed record LiveOrderPlacementPlan(
+    string Symbol,
+    string Action,
+    double Quantity,
+    double LimitPrice,
+    string Source
+);
+
+internal sealed class LiveScannerCandidateRow
+{
+    public string Symbol { get; set; } = string.Empty;
+    public double WeightedScore { get; set; }
+    public bool? Eligible { get; set; }
+    public double AverageRank { get; set; }
+}
+
 public sealed record ManagedAccountRow(
     DateTime TimestampUtc,
     string AccountId
@@ -5679,6 +6160,41 @@ public sealed record ScannerWorkbenchScoreRow(
     bool HardFail
 );
 
+public sealed record ScannerWorkbenchCandidateObservationRow(
+    DateTime TimestampUtc,
+    int RequestId,
+    string ScanCode,
+    int RunIndex,
+    string Symbol,
+    int ConId,
+    int Rank,
+    string Exchange,
+    string PrimaryExchange,
+    string Currency,
+    string Distance,
+    string Benchmark,
+    string Projection
+);
+
+public sealed record ScannerWorkbenchCandidateRow(
+    string Symbol,
+    int ConId,
+    string Exchange,
+    string Currency,
+    int ObservationCount,
+    int DistinctScanCodes,
+    double AverageRank,
+    int BestRank,
+    double? AverageProjection,
+    double RankScore,
+    double ConsistencyScore,
+    double CoverageScore,
+    double SignalScore,
+    double WeightedScore,
+    bool Eligible,
+    string RejectReason
+);
+
 public sealed record DisplayGroupActionRow(
     DateTime TimestampUtc,
     int RequestId,
@@ -5747,6 +6263,49 @@ public sealed record ReplayCostDeltaArtifactRow(
     double? RealizedSlippage,
     double? SlippageDelta,
     string Source
+);
+
+public sealed record ReplayValidationSummaryRow(
+    DateTime TimestampUtc,
+    string StrategyRuntime,
+    string Symbol,
+    int SliceCount,
+    int OrderCount,
+    int FillCount,
+    int LocateRejectionCount,
+    int MarginRejectionCount,
+    int CashRejectionCount,
+    int CancellationCount,
+    IReadOnlyDictionary<string, int> OrderSourceCounts,
+    double TotalReturn,
+    double MaxDrawdown,
+    double SharpeLike,
+    double WinRate,
+    int SummaryFillCount,
+    string ScannerCandidatesInputPath,
+    int ScannerTopN,
+    double ScannerMinScore,
+    double ScannerOrderQuantity,
+    string ScannerOrderType,
+    string ScannerOrderTimeInForce
+);
+
+public sealed record PromotionReadinessCheckRow(
+    string CheckName,
+    bool Passed,
+    string Details
+);
+
+public sealed record PromotionReadinessRow(
+    DateTime TimestampUtc,
+    string Mode,
+    DateTime RunStartedUtc,
+    DateTime RunCompletedUtc,
+    int ExitCode,
+    bool PaperReady,
+    bool LiveReady,
+    string NextStage,
+    IReadOnlyList<PromotionReadinessCheckRow> Checks
 );
 
 public sealed record ResilienceAcceptanceCheckRow(
