@@ -18,7 +18,8 @@ public sealed record ReplayOrderIntent(
     string Source,
     string OrderId = "",
     string ParentOrderId = "",
-    string OcoGroup = ""
+    string OcoGroup = "",
+    string ComboGroupId = ""
 );
 
 public sealed record ReplayFillRow(
@@ -64,10 +65,22 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
     IReadOnlyList<ReplayOrderActivationRow> Activations,
     IReadOnlyList<ReplayOrderUpdateRow> OrderUpdates,
+    IReadOnlyList<ReplayComboLifecycleRow> ComboEvents,
     IReadOnlyList<ReplayTrailingStopUpdateRow> TrailingStopUpdates,
     IReadOnlyList<ReplayOrderTriggerRow> Triggers,
     IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayComboLifecycleRow(
+    DateTime TimestampUtc,
+    string ComboGroupId,
+    string EventType,
+    string OrderId,
+    string Symbol,
+    string Side,
+    string Reason,
+    string Source
 );
 
 public sealed record ReplayOrderUpdateRow(
@@ -350,6 +363,7 @@ public sealed class ReplayExecutionSimulator
         var cashRejections = new List<ReplayCashRejectionRow>();
         var activations = new List<ReplayOrderActivationRow>();
         var orderUpdates = new List<ReplayOrderUpdateRow>();
+        var comboEvents = new List<ReplayComboLifecycleRow>();
         var trailingStopUpdates = new List<ReplayTrailingStopUpdateRow>();
         var triggers = new List<ReplayOrderTriggerRow>();
         var cancellations = new List<ReplayOrderCancellationRow>();
@@ -425,6 +439,7 @@ public sealed class ReplayExecutionSimulator
                 OrderId = ResolveOrderId(intent.OrderId),
                 ParentOrderId = string.IsNullOrWhiteSpace(intent.ParentOrderId) ? string.Empty : intent.ParentOrderId.Trim(),
                 OcoGroup = string.IsNullOrWhiteSpace(intent.OcoGroup) ? string.Empty : intent.OcoGroup.Trim(),
+                ComboGroupId = string.IsNullOrWhiteSpace(intent.ComboGroupId) ? string.Empty : intent.ComboGroupId.Trim(),
                 Source = string.IsNullOrWhiteSpace(intent.Source) ? "strategy" : intent.Source
             };
 
@@ -456,6 +471,7 @@ public sealed class ReplayExecutionSimulator
                     active.Intent.ExpireAtUtc,
                     cancelReason,
                     active.Intent.Source));
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, cancelReason);
                 _activeOrders.RemoveAt(index);
                 continue;
             }
@@ -503,6 +519,9 @@ public sealed class ReplayExecutionSimulator
             {
                 if (IsImmediateOrCancelTimeInForce(active.Intent.TimeInForce))
                 {
+                    var immediateReason = IsFillOrKillTimeInForce(active.Intent.TimeInForce)
+                        ? "FOK_NOT_FILLED_IMMEDIATE"
+                        : "IOC_NOT_FILLED_IMMEDIATE";
                     cancellations.Add(new ReplayOrderCancellationRow(
                         slice.TimestampUtc,
                         active.Intent.Symbol,
@@ -512,10 +531,9 @@ public sealed class ReplayExecutionSimulator
                         active.Intent.TimeInForce,
                         active.SubmittedAtUtc,
                         active.Intent.ExpireAtUtc,
-                        IsFillOrKillTimeInForce(active.Intent.TimeInForce)
-                            ? "FOK_NOT_FILLED_IMMEDIATE"
-                            : "IOC_NOT_FILLED_IMMEDIATE",
+                        immediateReason,
                         active.Intent.Source));
+                    CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, immediateReason);
                     _activeOrders.Remove(active);
                 }
 
@@ -536,6 +554,7 @@ public sealed class ReplayExecutionSimulator
                     active.Intent.ExpireAtUtc,
                     "FOK_NOT_FULLY_FILLABLE",
                     active.Intent.Source));
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, "FOK_NOT_FULLY_FILLABLE");
                 _activeOrders.Remove(active);
                 continue;
             }
@@ -556,6 +575,7 @@ public sealed class ReplayExecutionSimulator
             if (locateValidation.Rejected is not null)
             {
                 locateRejections.Add(locateValidation.Rejected);
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, locateValidation.Rejected.Reason);
                 _activeOrders.Remove(active);
                 continue;
             }
@@ -564,6 +584,7 @@ public sealed class ReplayExecutionSimulator
             if (cashValidation is not null)
             {
                 cashRejections.Add(cashValidation);
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, cashValidation.Reason);
                 _activeOrders.Remove(active);
                 continue;
             }
@@ -577,6 +598,7 @@ public sealed class ReplayExecutionSimulator
             if (marginValidation is not null)
             {
                 marginRejections.Add(marginValidation);
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, marginValidation.Reason);
                 _activeOrders.Remove(active);
                 continue;
             }
@@ -594,6 +616,9 @@ public sealed class ReplayExecutionSimulator
             }
             else if (IsImmediateOrCancelTimeInForce(active.Intent.TimeInForce))
             {
+                var remainderReason = IsFillOrKillTimeInForce(active.Intent.TimeInForce)
+                    ? "FOK_PARTIAL_REMAINDER_CANCELLED"
+                    : "IOC_REMAINDER_CANCELLED";
                 cancellations.Add(new ReplayOrderCancellationRow(
                     slice.TimestampUtc,
                     active.Intent.Symbol,
@@ -603,10 +628,9 @@ public sealed class ReplayExecutionSimulator
                     active.Intent.TimeInForce,
                     active.SubmittedAtUtc,
                     active.Intent.ExpireAtUtc,
-                    IsFillOrKillTimeInForce(active.Intent.TimeInForce)
-                        ? "FOK_PARTIAL_REMAINDER_CANCELLED"
-                        : "IOC_REMAINDER_CANCELLED",
+                    remainderReason,
                     active.Intent.Source));
+                CancelComboSiblings(active, slice.TimestampUtc, cancellations, comboEvents, remainderReason);
                 _activeOrders.Remove(active);
             }
 
@@ -645,7 +669,68 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, orderUpdates, trailingStopUpdates, triggers, cancellations, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, orderUpdates, comboEvents, trailingStopUpdates, triggers, cancellations, portfolio);
+    }
+
+    private void CancelComboSiblings(
+        ActiveReplayOrder anchor,
+        DateTime timestampUtc,
+        List<ReplayOrderCancellationRow> cancellations,
+        List<ReplayComboLifecycleRow> comboEvents,
+        string reason)
+    {
+        if (string.IsNullOrWhiteSpace(anchor.Intent.ComboGroupId))
+        {
+            return;
+        }
+
+        var siblings = _activeOrders
+            .Where(x => !ReferenceEquals(x, anchor))
+            .Where(x => x.RemainingQuantity > 1e-9)
+            .Where(x => string.Equals(x.Intent.ComboGroupId, anchor.Intent.ComboGroupId, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        if (siblings.Length == 0)
+        {
+            return;
+        }
+
+        comboEvents.Add(new ReplayComboLifecycleRow(
+            timestampUtc,
+            anchor.Intent.ComboGroupId,
+            "GROUP_CANCELLED",
+            anchor.Intent.OrderId,
+            anchor.Intent.Symbol,
+            anchor.Intent.Side,
+            reason,
+            anchor.Intent.Source));
+
+        foreach (var sibling in siblings)
+        {
+            cancellations.Add(new ReplayOrderCancellationRow(
+                timestampUtc,
+                sibling.Intent.Symbol,
+                sibling.Intent.Side,
+                sibling.RemainingQuantity,
+                sibling.Intent.OrderType,
+                sibling.Intent.TimeInForce,
+                sibling.SubmittedAtUtc,
+                sibling.Intent.ExpireAtUtc,
+                "COMBO_SIBLING_CANCELLED",
+                sibling.Intent.Source));
+
+            comboEvents.Add(new ReplayComboLifecycleRow(
+                timestampUtc,
+                sibling.Intent.ComboGroupId,
+                "LEG_CANCELLED",
+                sibling.Intent.OrderId,
+                sibling.Intent.Symbol,
+                sibling.Intent.Side,
+                reason,
+                sibling.Intent.Source));
+
+            _activeOrders.Remove(sibling);
+        }
     }
 
     private bool TryApplyOrderUpdate(
