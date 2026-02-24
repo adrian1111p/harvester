@@ -13,7 +13,10 @@ public sealed record ReplayOrderIntent(
     double? StopPrice,
     string TimeInForce,
     DateTime? ExpireAtUtc,
-    string Source
+    string Source,
+    string OrderId = "",
+    string ParentOrderId = "",
+    string OcoGroup = ""
 );
 
 public sealed record ReplayFillRow(
@@ -57,9 +60,21 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayMarginEventRow> MarginEvents,
     IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
+    IReadOnlyList<ReplayOrderActivationRow> Activations,
     IReadOnlyList<ReplayOrderTriggerRow> Triggers,
     IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayOrderActivationRow(
+    DateTime TimestampUtc,
+    string OrderId,
+    string ParentOrderId,
+    string Symbol,
+    string Side,
+    double Quantity,
+    string ActivationReason,
+    string Source
 );
 
 public sealed record ReplayOrderTriggerRow(
@@ -203,6 +218,8 @@ public sealed class ReplayExecutionSimulator
     private double _settledCash;
     private readonly List<PendingSettlement> _pendingSettlements;
     private readonly List<ActiveReplayOrder> _activeOrders;
+    private readonly HashSet<string> _filledOrderIds;
+    private int _generatedOrderIdSeed;
     private DateTime? _lastFinancingTimestampUtc;
 
     public ReplayExecutionSimulator(
@@ -242,6 +259,8 @@ public sealed class ReplayExecutionSimulator
         _enforceSettledCash = enforceSettledCash;
         _pendingSettlements = [];
         _activeOrders = [];
+        _filledOrderIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _generatedOrderIdSeed = 0;
         _corporateActionCursor = 0;
         _lastFinancingTimestampUtc = null;
     }
@@ -288,6 +307,7 @@ public sealed class ReplayExecutionSimulator
         var marginEvents = new List<ReplayMarginEventRow>();
         var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
         var cashRejections = new List<ReplayCashRejectionRow>();
+        var activations = new List<ReplayOrderActivationRow>();
         var triggers = new List<ReplayOrderTriggerRow>();
         var cancellations = new List<ReplayOrderCancellationRow>();
 
@@ -355,11 +375,16 @@ public sealed class ReplayExecutionSimulator
                 Side = intent.Side.ToUpperInvariant(),
                 OrderType = intent.OrderType.ToUpperInvariant(),
                 TimeInForce = string.IsNullOrWhiteSpace(intent.TimeInForce) ? "DAY" : intent.TimeInForce.ToUpperInvariant(),
+                OrderId = ResolveOrderId(intent.OrderId),
+                ParentOrderId = string.IsNullOrWhiteSpace(intent.ParentOrderId) ? string.Empty : intent.ParentOrderId.Trim(),
+                OcoGroup = string.IsNullOrWhiteSpace(intent.OcoGroup) ? string.Empty : intent.OcoGroup.Trim(),
                 Source = string.IsNullOrWhiteSpace(intent.Source) ? "strategy" : intent.Source
             };
 
             accepted.Add(normalized);
-            _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc, normalized.Quantity));
+            var isActive = string.IsNullOrWhiteSpace(normalized.ParentOrderId)
+                || _filledOrderIds.Contains(normalized.ParentOrderId);
+            _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc, normalized.Quantity, isActive));
         }
 
         for (var index = _activeOrders.Count - 1; index >= 0; index--)
@@ -392,6 +417,11 @@ public sealed class ReplayExecutionSimulator
             if (availableSliceQuantity <= 0)
             {
                 break;
+            }
+
+            if (!_activeOrders.Contains(active) || !active.IsActive)
+            {
+                continue;
             }
 
             if (TryTriggerStopOrder(active, slice.TimestampUtc, bar, markPrice, out var triggerRow))
@@ -459,8 +489,12 @@ public sealed class ReplayExecutionSimulator
 
             if (active.RemainingQuantity <= 1e-9)
             {
+                _filledOrderIds.Add(active.Intent.OrderId);
                 _activeOrders.Remove(active);
+                ActivateChildren(active.Intent.OrderId, slice.TimestampUtc, activations);
             }
+
+            CancelOcoSiblings(active, slice.TimestampUtc, cancellations);
         }
 
         var maintenanceEvent = ApplyMaintenanceMarginGuard(slice.TimestampUtc, symbol, markPrice);
@@ -494,7 +528,59 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, triggers, cancellations, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, activations, triggers, cancellations, portfolio);
+    }
+
+    private void ActivateChildren(string filledOrderId, DateTime timestampUtc, List<ReplayOrderActivationRow> activations)
+    {
+        if (string.IsNullOrWhiteSpace(filledOrderId))
+        {
+            return;
+        }
+
+        foreach (var child in _activeOrders.Where(x => !x.IsActive && string.Equals(x.Intent.ParentOrderId, filledOrderId, StringComparison.OrdinalIgnoreCase)).ToArray())
+        {
+            child.IsActive = true;
+            activations.Add(new ReplayOrderActivationRow(
+                timestampUtc,
+                child.Intent.OrderId,
+                child.Intent.ParentOrderId,
+                child.Intent.Symbol,
+                child.Intent.Side,
+                child.RemainingQuantity,
+                "PARENT_FILLED",
+                child.Intent.Source));
+        }
+    }
+
+    private void CancelOcoSiblings(ActiveReplayOrder filledOrder, DateTime timestampUtc, List<ReplayOrderCancellationRow> cancellations)
+    {
+        if (string.IsNullOrWhiteSpace(filledOrder.Intent.OcoGroup))
+        {
+            return;
+        }
+
+        var siblings = _activeOrders
+            .Where(x => !ReferenceEquals(x, filledOrder))
+            .Where(x => x.RemainingQuantity > 1e-9)
+            .Where(x => string.Equals(x.Intent.OcoGroup, filledOrder.Intent.OcoGroup, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        foreach (var sibling in siblings)
+        {
+            cancellations.Add(new ReplayOrderCancellationRow(
+                timestampUtc,
+                sibling.Intent.Symbol,
+                sibling.Intent.Side,
+                sibling.RemainingQuantity,
+                sibling.Intent.OrderType,
+                sibling.Intent.TimeInForce,
+                sibling.SubmittedAtUtc,
+                sibling.Intent.ExpireAtUtc,
+                "OCO_SIBLING_FILLED",
+                sibling.Intent.Source));
+            _activeOrders.Remove(sibling);
+        }
     }
 
     private static bool CanExecuteOnSlice(ActiveReplayOrder active)
@@ -1089,6 +1175,17 @@ public sealed class ReplayExecutionSimulator
         return unsettled;
     }
 
+    private string ResolveOrderId(string orderId)
+    {
+        if (!string.IsNullOrWhiteSpace(orderId))
+        {
+            return orderId.Trim();
+        }
+
+        _generatedOrderIdSeed++;
+        return $"replay-{_generatedOrderIdSeed}";
+    }
+
     private static int ParseSide(string side)
     {
         return side.ToUpperInvariant() switch
@@ -1108,11 +1205,12 @@ public sealed class ReplayExecutionSimulator
 
     private sealed class ActiveReplayOrder
     {
-        public ActiveReplayOrder(ReplayOrderIntent intent, DateTime submittedAtUtc, double remainingQuantity)
+        public ActiveReplayOrder(ReplayOrderIntent intent, DateTime submittedAtUtc, double remainingQuantity, bool isActive)
         {
             Intent = intent;
             SubmittedAtUtc = submittedAtUtc;
             RemainingQuantity = remainingQuantity;
+            IsActive = isActive;
             IsTriggered = false;
             TriggeredAtUtc = null;
         }
@@ -1120,6 +1218,7 @@ public sealed class ReplayExecutionSimulator
         public ReplayOrderIntent Intent { get; }
         public DateTime SubmittedAtUtc { get; }
         public double RemainingQuantity { get; set; }
+        public bool IsActive { get; set; }
         public bool IsTriggered { get; set; }
         public DateTime? TriggeredAtUtc { get; set; }
     }

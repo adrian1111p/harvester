@@ -2951,6 +2951,7 @@ public sealed class SnapshotRuntime
         var replayMarginEventRows = new List<ReplayMarginEventRow>();
         var replayCashSettlementRows = new List<ReplayCashSettlementRow>();
         var replayCashRejectionRows = new List<ReplayCashRejectionRow>();
+        var replayOrderActivationRows = new List<ReplayOrderActivationRow>();
         var replayOrderTriggerRows = new List<ReplayOrderTriggerRow>();
         var replayOrderCancellationRows = new List<ReplayOrderCancellationRow>();
         var replayPortfolioRows = new List<ReplayPortfolioRow>();
@@ -3028,6 +3029,7 @@ public sealed class SnapshotRuntime
             replayMarginEventRows.AddRange(simulation.MarginEvents);
             replayCashSettlementRows.AddRange(simulation.CashSettlements);
             replayCashRejectionRows.AddRange(simulation.CashRejections);
+            replayOrderActivationRows.AddRange(simulation.Activations);
             replayOrderTriggerRows.AddRange(simulation.Triggers);
             replayOrderCancellationRows.AddRange(simulation.Cancellations);
             replayPortfolioRows.Add(simulation.Portfolio);
@@ -3053,6 +3055,7 @@ public sealed class SnapshotRuntime
         var replayMarginEventsPath = Path.Combine(outputDir, $"strategy_replay_margin_events_{timestamp}.json");
         var replayCashSettlementsPath = Path.Combine(outputDir, $"strategy_replay_cash_settlements_{timestamp}.json");
         var replayCashRejectionsPath = Path.Combine(outputDir, $"strategy_replay_cash_rejections_{timestamp}.json");
+        var replayOrderActivationsPath = Path.Combine(outputDir, $"strategy_replay_order_activations_{timestamp}.json");
         var replayOrderTriggersPath = Path.Combine(outputDir, $"strategy_replay_order_triggers_{timestamp}.json");
         var replayOrderCancellationsPath = Path.Combine(outputDir, $"strategy_replay_order_cancellations_{timestamp}.json");
         var replayFeeBreakdownPath = Path.Combine(outputDir, $"strategy_replay_fee_breakdown_{timestamp}.json");
@@ -3123,6 +3126,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayMarginEventsPath, replayMarginEventRows);
         WriteJson(replayCashSettlementsPath, replayCashSettlementRows);
         WriteJson(replayCashRejectionsPath, replayCashRejectionRows);
+        WriteJson(replayOrderActivationsPath, replayOrderActivationRows);
         WriteJson(replayOrderTriggersPath, replayOrderTriggerRows);
         WriteJson(replayOrderCancellationsPath, replayOrderCancellationRows);
         WriteJson(replayFeeBreakdownPath, replayFeeBreakdownRows);
@@ -3144,6 +3148,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay margin events export: {replayMarginEventsPath} (rows={replayMarginEventRows.Count})");
         Console.WriteLine($"[OK] Strategy replay cash settlements export: {replayCashSettlementsPath} (rows={replayCashSettlementRows.Count})");
         Console.WriteLine($"[OK] Strategy replay cash rejections export: {replayCashRejectionsPath} (rows={replayCashRejectionRows.Count})");
+        Console.WriteLine($"[OK] Strategy replay order activations export: {replayOrderActivationsPath} (rows={replayOrderActivationRows.Count})");
         Console.WriteLine($"[OK] Strategy replay order triggers export: {replayOrderTriggersPath} (rows={replayOrderTriggerRows.Count})");
         Console.WriteLine($"[OK] Strategy replay order cancellations export: {replayOrderCancellationsPath} (rows={replayOrderCancellationRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fee breakdown export: {replayFeeBreakdownPath} (rows={replayFeeBreakdownRows.Length})");
