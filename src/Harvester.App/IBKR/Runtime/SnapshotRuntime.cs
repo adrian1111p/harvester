@@ -2935,6 +2935,8 @@ public sealed class SnapshotRuntime
             _options.ReplayTafFeePerShare,
             _options.ReplayTafFeeCapPerOrder,
             _options.ReplayExchangeFeePerShare,
+            _options.ReplayMaxFillParticipationRate,
+            _options.ReplayEnforceQueuePriority,
             _options.ReplaySettlementLagDays,
             _options.ReplayEnforceSettledCash);
         var replayOrderRows = new List<ReplayOrderIntent>();
@@ -3051,6 +3053,7 @@ public sealed class SnapshotRuntime
         var replayCashRejectionsPath = Path.Combine(outputDir, $"strategy_replay_cash_rejections_{timestamp}.json");
         var replayOrderCancellationsPath = Path.Combine(outputDir, $"strategy_replay_order_cancellations_{timestamp}.json");
         var replayFeeBreakdownPath = Path.Combine(outputDir, $"strategy_replay_fee_breakdown_{timestamp}.json");
+        var replayPartialFillEventsPath = Path.Combine(outputDir, $"strategy_replay_partial_fill_events_{timestamp}.json");
         var replayPortfolioPath = Path.Combine(outputDir, $"strategy_replay_portfolio_{timestamp}.json");
         var replayBenchmarkPath = Path.Combine(outputDir, $"strategy_replay_benchmark_{timestamp}.json");
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
@@ -3086,6 +3089,21 @@ public sealed class SnapshotRuntime
             })
             .ToArray();
 
+        var replayPartialFillRows = replayFillRows
+            .Where(fill => fill.IsPartial)
+            .Select(fill => new ReplayPartialFillArtifactRow(
+                fill.TimestampUtc,
+                fill.Symbol,
+                fill.Side,
+                fill.SubmittedAtUtc,
+                fill.OrderType,
+                fill.RequestedQuantity,
+                fill.Quantity,
+                fill.RemainingQuantity,
+                fill.FillPrice,
+                fill.Source))
+            .ToArray();
+
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
 
@@ -3104,6 +3122,7 @@ public sealed class SnapshotRuntime
         WriteJson(replayCashRejectionsPath, replayCashRejectionRows);
         WriteJson(replayOrderCancellationsPath, replayOrderCancellationRows);
         WriteJson(replayFeeBreakdownPath, replayFeeBreakdownRows);
+        WriteJson(replayPartialFillEventsPath, replayPartialFillRows);
         WriteJson(replayPortfolioPath, replayPortfolioRows);
         WriteJson(replayBenchmarkPath, performance.Benchmark);
         WriteJson(replayPacketsPath, performance.Packets);
@@ -3123,6 +3142,7 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay cash rejections export: {replayCashRejectionsPath} (rows={replayCashRejectionRows.Count})");
         Console.WriteLine($"[OK] Strategy replay order cancellations export: {replayOrderCancellationsPath} (rows={replayOrderCancellationRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fee breakdown export: {replayFeeBreakdownPath} (rows={replayFeeBreakdownRows.Length})");
+        Console.WriteLine($"[OK] Strategy replay partial fill events export: {replayPartialFillEventsPath} (rows={replayPartialFillRows.Length})");
         Console.WriteLine($"[OK] Strategy replay portfolio export: {replayPortfolioPath} (rows={replayPortfolioRows.Count})");
         Console.WriteLine($"[OK] Strategy replay benchmark export: {replayBenchmarkPath} (rows={performance.Benchmark.Count})");
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
@@ -4226,6 +4246,8 @@ public sealed record AppOptions(
     double ReplayTafFeePerShare,
     double ReplayTafFeeCapPerOrder,
     double ReplayExchangeFeePerShare,
+    double ReplayMaxFillParticipationRate,
+    bool ReplayEnforceQueuePriority,
     int ReplaySettlementLagDays,
     bool ReplayEnforceSettledCash,
     bool HeartbeatMonitorEnabled,
@@ -4376,6 +4398,8 @@ public sealed record AppOptions(
         var replayTafFeePerShare = 0.0;
         var replayTafFeeCapPerOrder = 0.0;
         var replayExchangeFeePerShare = 0.0;
+        var replayMaxFillParticipationRate = 1.0;
+        var replayEnforceQueuePriority = true;
         var replaySettlementLagDays = 2;
         var replayEnforceSettledCash = true;
         var heartbeatMonitorEnabled = true;
@@ -4854,6 +4878,13 @@ public sealed record AppOptions(
                     replayExchangeFeePerShare = Math.Max(0, refs);
                     i++;
                     break;
+                case "--replay-max-fill-participation" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rmfp):
+                    replayMaxFillParticipationRate = Math.Clamp(rmfp, 0, 1);
+                    i++;
+                    break;
+                case "--replay-enforce-queue-priority" when i + 1 < args.Length:
+                    replayEnforceQueuePriority = bool.TryParse(args[++i], out var reqp) && reqp;
+                    break;
                 case "--replay-settlement-lag-days" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rsld):
                     replaySettlementLagDays = Math.Max(0, rsld);
                     i++;
@@ -5039,6 +5070,8 @@ public sealed record AppOptions(
             replayTafFeePerShare,
             replayTafFeeCapPerOrder,
             replayExchangeFeePerShare,
+            replayMaxFillParticipationRate,
+            replayEnforceQueuePriority,
             replaySettlementLagDays,
             replayEnforceSettledCash,
             heartbeatMonitorEnabled,
@@ -5444,5 +5477,18 @@ public sealed record ReplayFeeBreakdownArtifactRow(
     double TafFee,
     double ExchangeFee,
     double TotalFees,
+    string Source
+);
+
+public sealed record ReplayPartialFillArtifactRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    DateTime SubmittedAtUtc,
+    string OrderType,
+    double RequestedQuantity,
+    double FilledQuantity,
+    double RemainingQuantity,
+    double FillPrice,
     string Source
 );

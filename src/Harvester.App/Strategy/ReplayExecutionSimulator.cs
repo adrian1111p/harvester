@@ -20,6 +20,10 @@ public sealed record ReplayFillRow(
     string Symbol,
     string Side,
     double Quantity,
+    double RequestedQuantity,
+    double RemainingQuantity,
+    bool IsPartial,
+    DateTime SubmittedAtUtc,
     string OrderType,
     double FillPrice,
     double Commission,
@@ -179,6 +183,8 @@ public sealed class ReplayExecutionSimulator
     private readonly double _tafFeePerShare;
     private readonly double _tafFeeCapPerOrder;
     private readonly double _exchangeFeePerShare;
+    private readonly double _maxFillParticipationRate;
+    private readonly bool _enforceQueuePriority;
     private readonly int _settlementLagDays;
     private readonly bool _enforceSettledCash;
     private double _settledCash;
@@ -198,6 +204,8 @@ public sealed class ReplayExecutionSimulator
         double tafFeePerShare,
         double tafFeeCapPerOrder,
         double exchangeFeePerShare,
+        double maxFillParticipationRate,
+        bool enforceQueuePriority,
         int settlementLagDays,
         bool enforceSettledCash)
     {
@@ -215,6 +223,8 @@ public sealed class ReplayExecutionSimulator
         _tafFeePerShare = Math.Max(0, tafFeePerShare);
         _tafFeeCapPerOrder = Math.Max(0, tafFeeCapPerOrder);
         _exchangeFeePerShare = Math.Max(0, exchangeFeePerShare);
+        _maxFillParticipationRate = Math.Clamp(maxFillParticipationRate, 0, 1);
+        _enforceQueuePriority = enforceQueuePriority;
         _settlementLagDays = Math.Max(0, settlementLagDays);
         _enforceSettledCash = enforceSettledCash;
         _pendingSettlements = [];
@@ -271,6 +281,9 @@ public sealed class ReplayExecutionSimulator
         var markPrice = bar is not null
             ? bar.Close
             : (slice.TopTicks.FirstOrDefault()?.Price ?? 0);
+        var availableSliceQuantity = bar is null
+            ? double.MaxValue
+            : Math.Max(0, (double)bar.Volume * _maxFillParticipationRate);
 
         var borrowCharge = ApplyBorrowFinancing(slice.TimestampUtc, symbol, markPrice, borrowLocateProfile);
         if (borrowCharge is not null)
@@ -332,7 +345,7 @@ public sealed class ReplayExecutionSimulator
             };
 
             accepted.Add(normalized);
-            _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc));
+            _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc, normalized.Quantity));
         }
 
         for (var index = _activeOrders.Count - 1; index >= 0; index--)
@@ -344,7 +357,7 @@ public sealed class ReplayExecutionSimulator
                     slice.TimestampUtc,
                     active.Intent.Symbol,
                     active.Intent.Side,
-                    active.Intent.Quantity,
+                    active.RemainingQuantity,
                     active.Intent.OrderType,
                     active.Intent.TimeInForce,
                     active.SubmittedAtUtc,
@@ -354,6 +367,18 @@ public sealed class ReplayExecutionSimulator
                 _activeOrders.RemoveAt(index);
                 continue;
             }
+        }
+
+        var orderedActiveOrders = _enforceQueuePriority
+            ? _activeOrders.OrderBy(x => x.SubmittedAtUtc).ToArray()
+            : _activeOrders.ToArray();
+
+        foreach (var active in orderedActiveOrders)
+        {
+            if (availableSliceQuantity <= 0)
+            {
+                break;
+            }
 
             var fillPrice = ResolveFillPrice(active.Intent, bar, markPrice);
             if (fillPrice is null)
@@ -361,19 +386,31 @@ public sealed class ReplayExecutionSimulator
                 continue;
             }
 
-            var locateValidation = ValidateLocateAndApplyFee(active.Intent, fillPrice.Value, borrowLocateProfile);
-            if (locateValidation.Rejected is not null)
+            var fillQuantity = Math.Min(active.RemainingQuantity, availableSliceQuantity);
+            if (fillQuantity <= 0)
             {
-                locateRejections.Add(locateValidation.Rejected);
-                _activeOrders.RemoveAt(index);
                 continue;
             }
 
-            var cashValidation = ValidateSettledCash(active.Intent, fillPrice.Value);
+            var executableIntent = active.Intent with
+            {
+                TimestampUtc = slice.TimestampUtc,
+                Quantity = fillQuantity
+            };
+
+            var locateValidation = ValidateLocateAndApplyFee(executableIntent, fillPrice.Value, borrowLocateProfile);
+            if (locateValidation.Rejected is not null)
+            {
+                locateRejections.Add(locateValidation.Rejected);
+                _activeOrders.Remove(active);
+                continue;
+            }
+
+            var cashValidation = ValidateSettledCash(executableIntent, fillPrice.Value);
             if (cashValidation is not null)
             {
                 cashRejections.Add(cashValidation);
-                _activeOrders.RemoveAt(index);
+                _activeOrders.Remove(active);
                 continue;
             }
 
@@ -382,17 +419,23 @@ public sealed class ReplayExecutionSimulator
                 appliedFinancing.Add(locateValidation.FeeApplied);
             }
 
-            var marginValidation = ValidateInitialMargin(active.Intent, fillPrice.Value);
+            var marginValidation = ValidateInitialMargin(executableIntent, fillPrice.Value);
             if (marginValidation is not null)
             {
                 marginRejections.Add(marginValidation);
-                _activeOrders.RemoveAt(index);
+                _activeOrders.Remove(active);
                 continue;
             }
 
-            var fill = ApplyFill(active.Intent, fillPrice.Value);
+            var fill = ApplyFill(executableIntent, fillPrice.Value, active.SubmittedAtUtc, active.Intent.Quantity, active.RemainingQuantity - fillQuantity);
             fills.Add(fill);
-            _activeOrders.RemoveAt(index);
+            active.RemainingQuantity -= fillQuantity;
+            availableSliceQuantity -= fillQuantity;
+
+            if (active.RemainingQuantity <= 1e-9)
+            {
+                _activeOrders.Remove(active);
+            }
         }
 
         var maintenanceEvent = ApplyMaintenanceMarginGuard(slice.TimestampUtc, symbol, markPrice);
@@ -573,7 +616,7 @@ public sealed class ReplayExecutionSimulator
             "DAY",
             null,
             "margin");
-        var forcedFill = ApplyFill(forcedOrder, markPrice);
+        var forcedFill = ApplyFill(forcedOrder, markPrice, timestampUtc, forcedOrder.Quantity, 0);
 
         var eventRow = new ReplayMarginEventRow(
             timestampUtc,
@@ -716,7 +759,7 @@ public sealed class ReplayExecutionSimulator
             null,
             string.IsNullOrWhiteSpace(source) ? "delist" : source);
 
-        var fill = ApplyFill(forcedOrder, markPrice);
+        var fill = ApplyFill(forcedOrder, markPrice, timestampUtc, forcedOrder.Quantity, 0);
         return (forcedOrder, fill, quantityBefore);
     }
 
@@ -802,7 +845,12 @@ public sealed class ReplayExecutionSimulator
         return markPrice * slippageFactor;
     }
 
-    private ReplayFillRow ApplyFill(ReplayOrderIntent intent, double fillPrice)
+    private ReplayFillRow ApplyFill(
+        ReplayOrderIntent intent,
+        double fillPrice,
+        DateTime submittedAtUtc,
+        double requestedQuantity,
+        double remainingQuantity)
     {
         var side = ParseSide(intent.Side);
         var signedQuantity = side * intent.Quantity;
@@ -859,6 +907,10 @@ public sealed class ReplayExecutionSimulator
             intent.Symbol,
             intent.Side,
             intent.Quantity,
+            requestedQuantity,
+            remainingQuantity,
+            remainingQuantity > 1e-9,
+            submittedAtUtc,
             intent.OrderType,
             fillPrice,
             commission,
@@ -933,8 +985,17 @@ public sealed class ReplayExecutionSimulator
         string Source
     );
 
-    private sealed record ActiveReplayOrder(
-        ReplayOrderIntent Intent,
-        DateTime SubmittedAtUtc
-    );
+    private sealed class ActiveReplayOrder
+    {
+        public ActiveReplayOrder(ReplayOrderIntent intent, DateTime submittedAtUtc, double remainingQuantity)
+        {
+            Intent = intent;
+            SubmittedAtUtc = submittedAtUtc;
+            RemainingQuantity = remainingQuantity;
+        }
+
+        public ReplayOrderIntent Intent { get; }
+        public DateTime SubmittedAtUtc { get; }
+        public double RemainingQuantity { get; set; }
+    }
 }
