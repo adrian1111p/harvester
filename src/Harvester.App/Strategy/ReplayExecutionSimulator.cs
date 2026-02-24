@@ -10,6 +10,8 @@ public sealed record ReplayOrderIntent(
     double Quantity,
     string OrderType,
     double? LimitPrice,
+    string TimeInForce,
+    DateTime? ExpireAtUtc,
     string Source
 );
 
@@ -50,7 +52,21 @@ public sealed record ReplaySliceSimulationResult(
     IReadOnlyList<ReplayMarginEventRow> MarginEvents,
     IReadOnlyList<ReplayCashSettlementRow> CashSettlements,
     IReadOnlyList<ReplayCashRejectionRow> CashRejections,
+    IReadOnlyList<ReplayOrderCancellationRow> Cancellations,
     ReplayPortfolioRow Portfolio
+);
+
+public sealed record ReplayOrderCancellationRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    double Quantity,
+    string OrderType,
+    string TimeInForce,
+    DateTime SubmittedAtUtc,
+    DateTime? ExpireAtUtc,
+    string CancelReason,
+    string Source
 );
 
 public sealed record ReplayCorporateActionAppliedRow(
@@ -167,6 +183,7 @@ public sealed class ReplayExecutionSimulator
     private readonly bool _enforceSettledCash;
     private double _settledCash;
     private readonly List<PendingSettlement> _pendingSettlements;
+    private readonly List<ActiveReplayOrder> _activeOrders;
     private DateTime? _lastFinancingTimestampUtc;
 
     public ReplayExecutionSimulator(
@@ -201,6 +218,7 @@ public sealed class ReplayExecutionSimulator
         _settlementLagDays = Math.Max(0, settlementLagDays);
         _enforceSettledCash = enforceSettledCash;
         _pendingSettlements = [];
+        _activeOrders = [];
         _corporateActionCursor = 0;
         _lastFinancingTimestampUtc = null;
     }
@@ -247,6 +265,7 @@ public sealed class ReplayExecutionSimulator
         var marginEvents = new List<ReplayMarginEventRow>();
         var cashSettlements = ApplyDueSettlements(slice.TimestampUtc, symbol);
         var cashRejections = new List<ReplayCashRejectionRow>();
+        var cancellations = new List<ReplayOrderCancellationRow>();
 
         var bar = slice.HistoricalBars.FirstOrDefault();
         var markPrice = bar is not null
@@ -308,26 +327,53 @@ public sealed class ReplayExecutionSimulator
                 TimestampUtc = intent.TimestampUtc == default ? slice.TimestampUtc : intent.TimestampUtc,
                 Side = intent.Side.ToUpperInvariant(),
                 OrderType = intent.OrderType.ToUpperInvariant(),
+                TimeInForce = string.IsNullOrWhiteSpace(intent.TimeInForce) ? "DAY" : intent.TimeInForce.ToUpperInvariant(),
                 Source = string.IsNullOrWhiteSpace(intent.Source) ? "strategy" : intent.Source
             };
 
-            var fillPrice = ResolveFillPrice(normalized, bar, markPrice);
+            accepted.Add(normalized);
+            _activeOrders.Add(new ActiveReplayOrder(normalized, normalized.TimestampUtc));
+        }
+
+        for (var index = _activeOrders.Count - 1; index >= 0; index--)
+        {
+            var active = _activeOrders[index];
+            if (IsOrderExpired(active, slice.TimestampUtc))
+            {
+                cancellations.Add(new ReplayOrderCancellationRow(
+                    slice.TimestampUtc,
+                    active.Intent.Symbol,
+                    active.Intent.Side,
+                    active.Intent.Quantity,
+                    active.Intent.OrderType,
+                    active.Intent.TimeInForce,
+                    active.SubmittedAtUtc,
+                    active.Intent.ExpireAtUtc,
+                    "EXPIRED",
+                    active.Intent.Source));
+                _activeOrders.RemoveAt(index);
+                continue;
+            }
+
+            var fillPrice = ResolveFillPrice(active.Intent, bar, markPrice);
             if (fillPrice is null)
             {
                 continue;
             }
 
-            var locateValidation = ValidateLocateAndApplyFee(normalized, fillPrice.Value, borrowLocateProfile);
+            var locateValidation = ValidateLocateAndApplyFee(active.Intent, fillPrice.Value, borrowLocateProfile);
             if (locateValidation.Rejected is not null)
             {
                 locateRejections.Add(locateValidation.Rejected);
+                _activeOrders.RemoveAt(index);
                 continue;
             }
 
-            var cashValidation = ValidateSettledCash(normalized, fillPrice.Value);
+            var cashValidation = ValidateSettledCash(active.Intent, fillPrice.Value);
             if (cashValidation is not null)
             {
                 cashRejections.Add(cashValidation);
+                _activeOrders.RemoveAt(index);
                 continue;
             }
 
@@ -336,16 +382,17 @@ public sealed class ReplayExecutionSimulator
                 appliedFinancing.Add(locateValidation.FeeApplied);
             }
 
-            var marginValidation = ValidateInitialMargin(normalized, fillPrice.Value);
+            var marginValidation = ValidateInitialMargin(active.Intent, fillPrice.Value);
             if (marginValidation is not null)
             {
                 marginRejections.Add(marginValidation);
+                _activeOrders.RemoveAt(index);
                 continue;
             }
 
-            accepted.Add(normalized);
-            var fill = ApplyFill(normalized, fillPrice.Value);
+            var fill = ApplyFill(active.Intent, fillPrice.Value);
             fills.Add(fill);
+            _activeOrders.RemoveAt(index);
         }
 
         var maintenanceEvent = ApplyMaintenanceMarginGuard(slice.TimestampUtc, symbol, markPrice);
@@ -379,7 +426,23 @@ public sealed class ReplayExecutionSimulator
             unrealizedPnl,
             equity);
 
-        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, portfolio);
+        return new ReplaySliceSimulationResult(accepted, fills, appliedActions, appliedDelists, appliedFinancing, locateRejections, marginRejections, marginEvents, cashSettlements, cashRejections, cancellations, portfolio);
+    }
+
+    private static bool IsOrderExpired(ActiveReplayOrder order, DateTime sliceTimestampUtc)
+    {
+        if (order.Intent.ExpireAtUtc.HasValue && order.Intent.ExpireAtUtc.Value <= sliceTimestampUtc)
+        {
+            return true;
+        }
+
+        var tif = string.IsNullOrWhiteSpace(order.Intent.TimeInForce) ? "DAY" : order.Intent.TimeInForce;
+        if (string.Equals(tif, "GTC", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return order.SubmittedAtUtc.Date < sliceTimestampUtc.Date;
     }
 
     private IReadOnlyList<ReplayCashSettlementRow> ApplyDueSettlements(DateTime timestampUtc, string symbol)
@@ -506,6 +569,8 @@ public sealed class ReplayExecutionSimulator
             forcedSide,
             Math.Abs(_positionQuantity),
             "MKT",
+            null,
+            "DAY",
             null,
             "margin");
         var forcedFill = ApplyFill(forcedOrder, markPrice);
@@ -646,6 +711,8 @@ public sealed class ReplayExecutionSimulator
             forcedSide,
             Math.Abs(_positionQuantity),
             "MKT",
+            null,
+            "DAY",
             null,
             string.IsNullOrWhiteSpace(source) ? "delist" : source);
 
@@ -864,5 +931,10 @@ public sealed class ReplayExecutionSimulator
         string Symbol,
         double Amount,
         string Source
+    );
+
+    private sealed record ActiveReplayOrder(
+        ReplayOrderIntent Intent,
+        DateTime SubmittedAtUtc
     );
 }
