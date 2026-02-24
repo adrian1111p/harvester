@@ -501,6 +501,42 @@ public sealed class ReplayExecutionSimulator
             var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice, isSessionOpenSlice);
             if (fillPrice is null)
             {
+                if (IsImmediateOrCancelTimeInForce(active.Intent.TimeInForce))
+                {
+                    cancellations.Add(new ReplayOrderCancellationRow(
+                        slice.TimestampUtc,
+                        active.Intent.Symbol,
+                        active.Intent.Side,
+                        active.RemainingQuantity,
+                        active.Intent.OrderType,
+                        active.Intent.TimeInForce,
+                        active.SubmittedAtUtc,
+                        active.Intent.ExpireAtUtc,
+                        IsFillOrKillTimeInForce(active.Intent.TimeInForce)
+                            ? "FOK_NOT_FILLED_IMMEDIATE"
+                            : "IOC_NOT_FILLED_IMMEDIATE",
+                        active.Intent.Source));
+                    _activeOrders.Remove(active);
+                }
+
+                continue;
+            }
+
+            if (IsFillOrKillTimeInForce(active.Intent.TimeInForce)
+                && (availableSliceQuantity + 1e-9) < active.RemainingQuantity)
+            {
+                cancellations.Add(new ReplayOrderCancellationRow(
+                    slice.TimestampUtc,
+                    active.Intent.Symbol,
+                    active.Intent.Side,
+                    active.RemainingQuantity,
+                    active.Intent.OrderType,
+                    active.Intent.TimeInForce,
+                    active.SubmittedAtUtc,
+                    active.Intent.ExpireAtUtc,
+                    "FOK_NOT_FULLY_FILLABLE",
+                    active.Intent.Source));
+                _activeOrders.Remove(active);
                 continue;
             }
 
@@ -555,6 +591,23 @@ public sealed class ReplayExecutionSimulator
                 _filledOrderIds.Add(active.Intent.OrderId);
                 _activeOrders.Remove(active);
                 ActivateChildren(active.Intent.OrderId, slice.TimestampUtc, activations);
+            }
+            else if (IsImmediateOrCancelTimeInForce(active.Intent.TimeInForce))
+            {
+                cancellations.Add(new ReplayOrderCancellationRow(
+                    slice.TimestampUtc,
+                    active.Intent.Symbol,
+                    active.Intent.Side,
+                    active.RemainingQuantity,
+                    active.Intent.OrderType,
+                    active.Intent.TimeInForce,
+                    active.SubmittedAtUtc,
+                    active.Intent.ExpireAtUtc,
+                    IsFillOrKillTimeInForce(active.Intent.TimeInForce)
+                        ? "FOK_PARTIAL_REMAINDER_CANCELLED"
+                        : "IOC_REMAINDER_CANCELLED",
+                    active.Intent.Source));
+                _activeOrders.Remove(active);
             }
 
             CancelOcoSiblings(active, slice.TimestampUtc, cancellations);
@@ -1019,6 +1072,28 @@ public sealed class ReplayExecutionSimulator
         }
 
         return false;
+    }
+
+    private static bool IsImmediateOrCancelTimeInForce(string tif)
+    {
+        if (string.IsNullOrWhiteSpace(tif))
+        {
+            return false;
+        }
+
+        var normalized = tif.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "IOC" or "FOK";
+    }
+
+    private static bool IsFillOrKillTimeInForce(string tif)
+    {
+        if (string.IsNullOrWhiteSpace(tif))
+        {
+            return false;
+        }
+
+        var normalized = tif.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized == "FOK";
     }
 
     private IReadOnlyList<ReplayCashSettlementRow> ApplyDueSettlements(DateTime timestampUtc, string symbol)
