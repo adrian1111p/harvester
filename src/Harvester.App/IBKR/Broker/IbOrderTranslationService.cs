@@ -10,6 +10,39 @@ public sealed class IbOrderTranslationService
         var action = NormalizeAction(intent.Action);
         var type = NormalizeType(intent.Type);
 
+        if (type == "COMBO LEG LMT")
+        {
+            if (intent.ComboLegLimitPrices is null || intent.ComboLegLimitPrices.Count == 0)
+            {
+                throw new ArgumentException("Combo leg limit prices are required for COMBO LEG LMT orders.");
+            }
+
+            var legLimits = intent.ComboLegLimitPrices
+                .Select(price =>
+                {
+                    if (price <= 0)
+                    {
+                        throw new ArgumentException("Combo leg limit prices must be > 0.");
+                    }
+
+                    return new OrderComboLeg { Price = price };
+                })
+                .ToList();
+
+            var comboLegOrder = OrderFactory.Limit(
+                action,
+                intent.Quantity,
+                intent.LimitPrice ?? throw new ArgumentException("Aggregate limit price required for COMBO LEG LMT order."),
+                intent.TimeInForce);
+            comboLegOrder.OrderComboLegs = legLimits;
+            comboLegOrder.WhatIf = intent.WhatIf;
+            comboLegOrder.Transmit = intent.Transmit;
+            comboLegOrder.OrderRef = intent.OrderRef ?? string.Empty;
+
+            ApplyRoutingFields(comboLegOrder, intent);
+            return comboLegOrder;
+        }
+
         var order = type switch
         {
             "MKT" => OrderFactory.Market(action, intent.Quantity, intent.TimeInForce),
@@ -27,6 +60,14 @@ public sealed class IbOrderTranslationService
         order.WhatIf = intent.WhatIf;
         order.Transmit = intent.Transmit;
         order.OrderRef = intent.OrderRef ?? string.Empty;
+
+        ApplyRoutingFields(order, intent);
+
+        return order;
+    }
+
+    private static void ApplyRoutingFields(Order order, BrokerOrderIntent intent)
+    {
 
         if (!string.IsNullOrWhiteSpace(intent.Account))
         {
@@ -52,8 +93,6 @@ public sealed class IbOrderTranslationService
         {
             order.FaPercentage = intent.FaPercentage;
         }
-
-        return order;
     }
 
     public CanonicalOrderEvent FromOrderStatus(
@@ -119,6 +158,23 @@ public sealed class IbOrderTranslationService
     private static string NormalizeType(string type)
     {
         var normalized = (type ?? string.Empty).Trim().ToUpperInvariant();
+        var collapsed = normalized.Replace("_", " ", StringComparison.Ordinal).Replace("  ", " ", StringComparison.Ordinal).Trim();
+
+        if (collapsed is "COMBO MKT" or "COMBO MARKET")
+        {
+            return "MKT";
+        }
+
+        if (collapsed is "COMBO LMT" or "COMBO LIMIT")
+        {
+            return "LMT";
+        }
+
+        if (collapsed is "COMBO LEG LMT" or "COMBO LEG LIMIT")
+        {
+            return "COMBO LEG LMT";
+        }
+
         return normalized switch
         {
             "MKT" => "MKT",

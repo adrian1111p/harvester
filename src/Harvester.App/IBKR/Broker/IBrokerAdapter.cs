@@ -146,7 +146,8 @@ public sealed record BrokerOrderIntent(
     string? FaGroup = null,
     string? FaProfile = null,
     string? FaMethod = null,
-    string? FaPercentage = null
+    string? FaPercentage = null,
+    IReadOnlyList<double>? ComboLegLimitPrices = null
 );
 
 public sealed record CanonicalOrderEvent(
