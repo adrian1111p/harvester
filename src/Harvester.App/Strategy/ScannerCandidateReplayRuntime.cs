@@ -958,6 +958,11 @@ public sealed class ScannerCandidateReplayRuntime :
 
     private static string TryReadEnvironmentString(string name, string fallback)
     {
+        if (name.EndsWith("_FLATTEN_ROUTE", StringComparison.OrdinalIgnoreCase))
+        {
+            return "MARKET";
+        }
+
         var value = Environment.GetEnvironmentVariable(name);
         return string.IsNullOrWhiteSpace(value)
             ? fallback
