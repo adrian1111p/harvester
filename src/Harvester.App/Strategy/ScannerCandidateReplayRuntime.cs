@@ -68,11 +68,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementReboundRollunder = new Tmg033ReboundRollunderExitStrategy(BuildTradeManagementReboundRollunderConfigFromEnvironment());
         var tradeManagementPostReboundFade = new Tmg034PostReboundFadeExitStrategy(BuildTradeManagementPostReboundFadeConfigFromEnvironment());
         var tradeManagementReboundRejectionAccel = new Tmg035ReboundRejectionAccelExitStrategy(BuildTradeManagementReboundRejectionAccelConfigFromEnvironment());
+        var tradeManagementRejectionStallBreak = new Tmg036RejectionStallBreakExitStrategy(BuildTradeManagementRejectionStallBreakConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -632,6 +633,24 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_035_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_035_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_035_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg036RejectionStallBreakExitConfig BuildTradeManagementRejectionStallBreakConfigFromEnvironment()
+    {
+        return new Tmg036RejectionStallBreakExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_036_ENABLED", false),
+            AdverseBarsLookback: Math.Max(1, TryReadEnvironmentInt("TMG_036_ADVERSE_BARS_LOOKBACK", 2)),
+            MinAdverseMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_036_MIN_ADVERSE_MOVE_PCT", 0.0015)),
+            ReboundBars: Math.Max(1, TryReadEnvironmentInt("TMG_036_REBOUND_BARS", 1)),
+            MinReboundMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_036_MIN_REBOUND_MOVE_PCT", 0.0008)),
+            RejectionBars: Math.Max(1, TryReadEnvironmentInt("TMG_036_REJECTION_BARS", 1)),
+            MinRejectionMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_036_MIN_REJECTION_MOVE_PCT", 0.0008)),
+            StallBars: Math.Max(1, TryReadEnvironmentInt("TMG_036_STALL_BARS", 2)),
+            MaxAbsoluteStallMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_036_MAX_ABSOLUTE_STALL_MOVE_PCT", 0.0005)),
+            RequireAdverseUnrealized: TryReadEnvironmentBool("TMG_036_REQUIRE_ADVERSE_UNREALIZED", true),
+            FlattenRoute: TryReadEnvironmentString("TMG_036_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_036_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_036_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
