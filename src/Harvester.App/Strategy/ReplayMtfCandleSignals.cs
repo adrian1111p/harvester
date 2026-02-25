@@ -1,3 +1,5 @@
+using Harvester.App.IBKR.Runtime;
+
 namespace Harvester.App.Strategy;
 
 public sealed record ReplayMtfSignalSnapshot(
@@ -68,6 +70,66 @@ public sealed class ReplayMtfCandleSignalEngine : IReplayMtfSignalSource
                 High = Math.Max(current.High, markPrice),
                 Low = Math.Min(current.Low, markPrice),
                 Close = markPrice,
+                Samples = current.Samples + 1
+            };
+        }
+
+        state.LastSnapshot = BuildSnapshot(tsUtc, state.LastCompletedByTimeframe);
+    }
+
+    public void UpdateFromHistoricalBar(string symbol, HistoricalBarRow bar)
+    {
+        if (string.IsNullOrWhiteSpace(symbol) || bar.TimestampUtc == default || bar.Close <= 0)
+        {
+            return;
+        }
+
+        var normalizedSymbol = symbol.Trim().ToUpperInvariant();
+        if (!_stateBySymbol.TryGetValue(normalizedSymbol, out var state))
+        {
+            state = new SymbolState();
+            _stateBySymbol[normalizedSymbol] = state;
+        }
+
+        var tsUtc = DateTime.SpecifyKind(bar.TimestampUtc, DateTimeKind.Utc);
+        var open = bar.Open > 0 ? bar.Open : bar.Close;
+        var high = bar.High > 0 ? bar.High : bar.Close;
+        var low = bar.Low > 0 ? bar.Low : bar.Close;
+        var close = bar.Close;
+
+        foreach (var timeframeSeconds in TimeframesSeconds)
+        {
+            var bucketStartUtc = AlignToBucketStart(tsUtc, timeframeSeconds);
+            if (!state.CurrentByTimeframe.TryGetValue(timeframeSeconds, out var current))
+            {
+                state.CurrentByTimeframe[timeframeSeconds] = new CandleState(
+                    BucketStartUtc: bucketStartUtc,
+                    Open: open,
+                    High: high,
+                    Low: low,
+                    Close: close,
+                    Samples: 1);
+                continue;
+            }
+
+            if (bucketStartUtc != current.BucketStartUtc)
+            {
+                state.LastCompletedByTimeframe[timeframeSeconds] = current;
+                state.CurrentByTimeframe[timeframeSeconds] = new CandleState(
+                    BucketStartUtc: bucketStartUtc,
+                    Open: open,
+                    High: high,
+                    Low: low,
+                    Close: close,
+                    Samples: 1);
+                continue;
+            }
+
+            state.CurrentByTimeframe[timeframeSeconds] = current with
+            {
+                High = Math.Max(current.High, high),
+                Low = Math.Min(current.Low, low),
+                Close = close,
                 Samples = current.Samples + 1
             };
         }

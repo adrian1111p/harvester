@@ -3977,6 +3977,8 @@ public sealed class SnapshotRuntime
         var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
         var replayValidationSummaryPath = Path.Combine(outputDir, $"strategy_replay_validation_summary_{timestamp}.json");
         var replayScannerSelectionPath = Path.Combine(outputDir, $"strategy_replay_scanner_symbol_selection_{timestamp}.json");
+        var replayHistoricalCandlesPath = Path.Combine(outputDir, $"strategy_replay_historical_candles_{timestamp}.json");
+        var replayScannerHistoricalEvaluationPath = Path.Combine(outputDir, $"strategy_replay_scanner_historical_evaluation_{timestamp}.json");
         var replayLimitOrderCaseMatrixPath = Path.Combine(outputDir, $"strategy_replay_limit_order_case_matrix_{timestamp}.json");
         var replaySelfLearningSamplesPath = Path.Combine(outputDir, $"strategy_replay_self_learning_samples_{timestamp}.json");
         var replaySelfLearningPredictionsPath = Path.Combine(outputDir, $"strategy_replay_self_learning_predictions_{timestamp}.json");
@@ -4040,6 +4042,8 @@ public sealed class SnapshotRuntime
             {
                 var symbol = slice.TopTicks.FirstOrDefault()?.Value
                     ?? strategyContext.Symbol;
+                symbol = slice.TopTicks.FirstOrDefault()?.Kind
+                    ?? symbol;
                 var close = slice.HistoricalBars.FirstOrDefault()?.Close
                     ?? slice.TopTicks.FirstOrDefault()?.Price
                     ?? 0.0;
@@ -4136,6 +4140,8 @@ public sealed class SnapshotRuntime
                 _options.ReplayScannerLimitOffsetBps)
         };
 
+            var replayHistoricalCandles = ReplayHistoricalCandlestickCharts.BuildFromSlices(slices);
+
             var replayLimitOrderCaseMatrixRows = BuildReplayLimitOrderCaseMatrixRows();
 
         WriteJson(replayPath, slices);
@@ -4165,9 +4171,13 @@ public sealed class SnapshotRuntime
         WriteJson(replayPacketsPath, performance.Packets);
         WriteJson(replaySummaryPath, new[] { performance.Summary });
         WriteJson(replayValidationSummaryPath, replayValidationSummary);
+        WriteJson(replayHistoricalCandlesPath, replayHistoricalCandles);
         if (_strategyRuntime is IReplayScannerSelectionSource scannerSelectionSource)
         {
-            WriteJson(replayScannerSelectionPath, new[] { scannerSelectionSource.GetScannerSelectionSnapshot() });
+            var selectionSnapshot = scannerSelectionSource.GetScannerSelectionSnapshot();
+            WriteJson(replayScannerSelectionPath, new[] { selectionSnapshot });
+            var scannerHistoricalEvaluation = ReplayHistoricalCandlestickCharts.BuildScannerEvaluations(replayHistoricalCandles, selectionSnapshot);
+            WriteJson(replayScannerHistoricalEvaluationPath, scannerHistoricalEvaluation);
         }
         WriteJson(replayLimitOrderCaseMatrixPath, replayLimitOrderCaseMatrixRows);
         WriteJson(replaySelfLearningSamplesPath, selfLearning.Samples);
@@ -4205,9 +4215,11 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
         Console.WriteLine($"[OK] Strategy replay performance summary export: {replaySummaryPath}");
         Console.WriteLine($"[OK] Strategy replay validation summary export: {replayValidationSummaryPath}");
+        Console.WriteLine($"[OK] Strategy replay historical candles export: {replayHistoricalCandlesPath} (rows={replayHistoricalCandles.Count})");
         if (_strategyRuntime is IReplayScannerSelectionSource)
         {
             Console.WriteLine($"[OK] Strategy replay scanner symbol selection export: {replayScannerSelectionPath}");
+            Console.WriteLine($"[OK] Strategy replay scanner historical evaluation export: {replayScannerHistoricalEvaluationPath}");
         }
         Console.WriteLine($"[OK] Strategy replay limit-order case matrix export: {replayLimitOrderCaseMatrixPath} (rows={replayLimitOrderCaseMatrixRows.Length})");
         Console.WriteLine($"[OK] Strategy replay self-learning samples export: {replaySelfLearningSamplesPath} (rows={selfLearning.Samples.Count})");

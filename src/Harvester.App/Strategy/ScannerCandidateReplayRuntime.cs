@@ -152,7 +152,17 @@ public sealed class ScannerCandidateReplayRuntime :
             askPrice = markPrice;
         }
 
-        _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, markPrice);
+        if (dataSlice.HistoricalBars.Count > 0)
+        {
+            foreach (var historicalBar in dataSlice.HistoricalBars)
+            {
+                _mtfSignalEngine.UpdateFromHistoricalBar(symbol, historicalBar);
+            }
+        }
+        else
+        {
+            _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, markPrice);
+        }
 
         var dayTradingContext = new ReplayDayTradingContext(
             TimestampUtc: dataSlice.TimestampUtc,
