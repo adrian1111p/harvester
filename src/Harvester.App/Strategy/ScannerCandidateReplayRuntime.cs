@@ -43,11 +43,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementVwapReversion = new Tmg008SessionVwapReversionExitStrategy(BuildTradeManagementVwapReversionConfigFromEnvironment());
         var tradeManagementSpreadGuard = new Tmg009LiquiditySpreadExitStrategy(BuildTradeManagementSpreadGuardConfigFromEnvironment());
         var tradeManagementEventRisk = new Tmg010EventRiskCooldownGuardStrategy(BuildTradeManagementEventRiskConfigFromEnvironment());
+        var tradeManagementStallExit = new Tmg011StallExitGuardStrategy(BuildTradeManagementStallExitConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -291,6 +292,17 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_010_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_010_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_010_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg011StallExitConfig BuildTradeManagementStallExitConfigFromEnvironment()
+    {
+        return new Tmg011StallExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_011_ENABLED", false),
+            MinHoldingBars: Math.Max(0, TryReadEnvironmentInt("TMG_011_MIN_HOLDING_BARS", 10)),
+            MaxAbsoluteMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_011_MAX_ABSOLUTE_MOVE_PCT", 0.0015)),
+            FlattenRoute: TryReadEnvironmentString("TMG_011_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_011_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_011_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
