@@ -85,11 +85,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown = new Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfigFromEnvironment());
         var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm = new Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirmConfigFromEnvironment());
         var tradeManagementMtfCandleReversal = new Tmg048MtfCandleReversalExitStrategy(_mtfSignalEngine, BuildTradeManagementMtfCandleReversalConfigFromEnvironment());
+        var tradeManagementMtfRegimeAtr = new Tmg049MtfRegimeAtrExitStrategy(_mtfSignalEngine, BuildTradeManagementMtfRegimeAtrConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm, tradeManagementMtfCandleReversal],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm, tradeManagementMtfCandleReversal, tradeManagementMtfRegimeAtr],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -921,6 +922,19 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_048_FLATTEN_ROUTE", "MARKET"),
             FlattenTif: TryReadEnvironmentString("TMG_048_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_048_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg049MtfRegimeAtrExitConfig BuildTradeManagementMtfRegimeAtrConfigFromEnvironment()
+    {
+        return new Tmg049MtfRegimeAtrExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_049_ENABLED", false),
+            RequireAllTimeframes: TryReadEnvironmentBool("TMG_049_REQUIRE_ALL_TIMEFRAMES", true),
+            AtrLookbackBars: Math.Max(1, TryReadEnvironmentInt("TMG_049_ATR_LOOKBACK_BARS", 14)),
+            AtrStopMultiple: Math.Max(0.0, TryReadEnvironmentDouble("TMG_049_ATR_STOP_MULTIPLE", 2.0)),
+            RegimeExitRequiresOppositeAlignment: TryReadEnvironmentBool("TMG_049_REGIME_EXIT_REQUIRES_OPPOSITE_ALIGNMENT", true),
+            FlattenRoute: TryReadEnvironmentString("TMG_049_FLATTEN_ROUTE", "MARKET"),
+            FlattenTif: TryReadEnvironmentString("TMG_049_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_049_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
