@@ -45,11 +45,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementEventRisk = new Tmg010EventRiskCooldownGuardStrategy(BuildTradeManagementEventRiskConfigFromEnvironment());
         var tradeManagementStallExit = new Tmg011StallExitGuardStrategy(BuildTradeManagementStallExitConfigFromEnvironment());
         var tradeManagementPnlCapExit = new Tmg012PnlCapExitStrategy(BuildTradeManagementPnlCapExitConfigFromEnvironment());
+        var tradeManagementSpreadPersistence = new Tmg013SpreadPersistenceExitStrategy(BuildTradeManagementSpreadPersistenceConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -315,6 +316,17 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_012_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_012_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_012_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg013SpreadPersistenceExitConfig BuildTradeManagementSpreadPersistenceConfigFromEnvironment()
+    {
+        return new Tmg013SpreadPersistenceExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_013_ENABLED", false),
+            SpreadTriggerPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_013_SPREAD_TRIGGER_PCT", 0.004)),
+            MinConsecutiveBars: Math.Max(1, TryReadEnvironmentInt("TMG_013_MIN_CONSECUTIVE_BARS", 3)),
+            FlattenRoute: TryReadEnvironmentString("TMG_013_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_013_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_013_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
