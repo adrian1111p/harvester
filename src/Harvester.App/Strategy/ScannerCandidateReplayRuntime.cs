@@ -34,11 +34,12 @@ public sealed class ScannerCandidateReplayRuntime :
             timeInForce,
             limitOffsetBps);
         var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
+        var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -158,6 +159,15 @@ public sealed class ScannerCandidateReplayRuntime :
             StopLossPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_STOP_LOSS_PCT", 0.003)),
             TakeProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_TAKE_PROFIT_PCT", 0.006)),
             TimeInForce: TryReadEnvironmentString("TMG_001_TIF", "DAY").ToUpperInvariant());
+    }
+
+    private static Tmg002BreakEvenConfig BuildTradeManagementBreakEvenConfigFromEnvironment()
+    {
+        return new Tmg002BreakEvenConfig(
+            Enabled: TryReadEnvironmentBool("TMG_002_ENABLED", false),
+            TriggerProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_002_TRIGGER_PROFIT_PCT", 0.003)),
+            StopOffsetPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_002_STOP_OFFSET_PCT", 0.0)),
+            TimeInForce: TryReadEnvironmentString("TMG_002_TIF", "DAY").ToUpperInvariant());
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
