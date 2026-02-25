@@ -60,11 +60,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementRollingVolatilityFloor = new Tmg025RollingVolatilityFloorExitStrategy(BuildTradeManagementRollingVolatilityFloorConfigFromEnvironment());
         var tradeManagementChopAdverse = new Tmg026ChopAdverseExitStrategy(BuildTradeManagementChopAdverseConfigFromEnvironment());
         var tradeManagementTrendExhaustion = new Tmg027TrendExhaustionExitStrategy(BuildTradeManagementTrendExhaustionConfigFromEnvironment());
+        var tradeManagementReversalAcceleration = new Tmg028ReversalAccelerationExitStrategy(BuildTradeManagementReversalAccelerationConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -504,6 +505,19 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_027_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_027_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_027_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg028ReversalAccelerationExitConfig BuildTradeManagementReversalAccelerationConfigFromEnvironment()
+    {
+        return new Tmg028ReversalAccelerationExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_028_ENABLED", false),
+            ReversalBars: Math.Max(2, TryReadEnvironmentInt("TMG_028_REVERSAL_BARS", 2)),
+            MinAdverseMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_028_MIN_ADVERSE_MOVE_PCT", 0.0015)),
+            RequireAcceleration: TryReadEnvironmentBool("TMG_028_REQUIRE_ACCELERATION", true),
+            RequireAdverseUnrealized: TryReadEnvironmentBool("TMG_028_REQUIRE_ADVERSE_UNREALIZED", true),
+            FlattenRoute: TryReadEnvironmentString("TMG_028_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_028_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_028_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
