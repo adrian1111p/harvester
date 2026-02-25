@@ -8,16 +8,20 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
     private readonly HashSet<string> _selectedSymbols;
     private readonly HashSet<string> _submittedSymbols;
     private readonly double _orderQuantity;
+    private readonly string _orderSide;
     private readonly string _orderType;
     private readonly string _timeInForce;
+    private readonly double _limitOffsetBps;
 
     public ScannerCandidateReplayRuntime(
         string candidatesInputPath,
         int topN,
         double minScore,
         double orderQuantity,
+        string orderSide,
         string orderType,
-        string timeInForce)
+        string timeInForce,
+        double limitOffsetBps)
     {
         if (string.IsNullOrWhiteSpace(candidatesInputPath))
         {
@@ -55,8 +59,10 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
 
         _submittedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _orderQuantity = Math.Max(0, orderQuantity);
+        _orderSide = NormalizeOrderSide(orderSide);
         _orderType = NormalizeOrderType(orderType);
         _timeInForce = NormalizeTimeInForce(timeInForce);
+        _limitOffsetBps = Math.Max(0, limitOffsetBps);
     }
 
     public Task InitializeAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
@@ -97,7 +103,8 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
             return [];
         }
 
-        if (dataSlice.Positions.Any(x => string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase) && Math.Abs(x.Quantity) > 1e-9))
+        var side = ResolveOrderSide(symbol, dataSlice.Positions);
+        if (string.IsNullOrWhiteSpace(side))
         {
             _submittedSymbols.Add(symbol);
             return [];
@@ -115,7 +122,10 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
                 return [];
             }
 
-            limitPrice = markPrice;
+            var offset = markPrice * (_limitOffsetBps / 10000.0);
+            limitPrice = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+                ? Math.Max(0.0001, markPrice - offset)
+                : markPrice + offset;
         }
 
         _submittedSymbols.Add(symbol);
@@ -124,7 +134,7 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
             new ReplayOrderIntent(
                 dataSlice.TimestampUtc,
                 symbol,
-                "BUY",
+                side,
                 _orderQuantity,
                 _orderType,
                 limitPrice,
@@ -135,6 +145,28 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
                 null,
                 "scanner-candidate")
         ];
+    }
+
+    private string ResolveOrderSide(string symbol, IReadOnlyList<PositionRow> positions)
+    {
+        if (string.Equals(_orderSide, "AUTO", StringComparison.OrdinalIgnoreCase))
+        {
+            var positionQty = positions
+                .Where(x => string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase))
+                .Sum(x => x.Quantity);
+
+            return positionQty > 1e-9 ? "SELL" : "BUY";
+        }
+
+        return _orderSide;
+    }
+
+    private static string NormalizeOrderSide(string value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? "BUY" : value.Trim().ToUpperInvariant();
+        return normalized is "BUY" or "SELL" or "AUTO"
+            ? normalized
+            : "BUY";
     }
 
     private static string NormalizeOrderType(string value)

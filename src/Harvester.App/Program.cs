@@ -12,8 +12,10 @@ if (options.Mode == RunMode.StrategyReplay
 		options.ReplayScannerTopN,
 		options.ReplayScannerMinScore,
 		options.ReplayScannerOrderQuantity,
+		options.ReplayScannerOrderSide,
 		options.ReplayScannerOrderType,
-		options.ReplayScannerOrderTimeInForce);
+		options.ReplayScannerOrderTimeInForce,
+		options.ReplayScannerLimitOffsetBps);
 }
 
 var runtime = new SnapshotRuntime(options, strategyRuntime);

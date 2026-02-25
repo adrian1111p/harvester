@@ -1,5 +1,9 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using ClosedXML.Excel;
 using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Connection;
 using Harvester.App.IBKR.Contracts;
@@ -237,6 +241,9 @@ public sealed class SnapshotRuntime
                     break;
                 case RunMode.ScannerWorkbench:
                     await RunScannerWorkbenchMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
+                case RunMode.ScannerPreview:
+                    await RunScannerPreviewMode(runtimeCts.Token);
                     break;
                 case RunMode.DisplayGroupsQuery:
                     await RunDisplayGroupsQueryMode(client, brokerAdapter, runtimeCts.Token);
@@ -534,56 +541,14 @@ public sealed class SnapshotRuntime
         return code is 1100 or 1300 or 2110;
     }
 
-    private bool IsSoftenedCancelNotFoundError(IbApiError error)
+    private ApiErrorClassification ClassifyApiError(IbApiError error)
     {
-        if (!_options.CancelOrderIdempotent || _options.Mode != RunMode.OrdersCancelSim)
-        {
-            return false;
-        }
-
-        if (error.Code != 10147)
-        {
-            return false;
-        }
-
-        if (_options.CancelOrderId > 0 && error.Id.HasValue && error.Id.Value != _options.CancelOrderId)
-        {
-            return false;
-        }
-
-        return error.Message.Contains("needs to be cancelled is not found", StringComparison.OrdinalIgnoreCase)
-            || error.Message.Contains("not found", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private bool IsCancelSuccessConfirmation(IbApiError error)
-    {
-        if (_options.Mode != RunMode.OrdersCancelSim)
-        {
-            return false;
-        }
-
-        if (error.Code != 202)
-        {
-            return false;
-        }
-
-        if (_options.CancelOrderId > 0 && error.Id.HasValue && error.Id.Value != _options.CancelOrderId)
-        {
-            return false;
-        }
-
-        return error.Message.Contains("order canceled", StringComparison.OrdinalIgnoreCase)
-            || error.Message.Contains("order cancelled", StringComparison.OrdinalIgnoreCase);
+        return OrderLifecycleModel.ClassifyApiError(error, _options, _errorPolicy);
     }
 
     private bool ShouldTreatAsBlockingApiError(IbApiError error)
     {
-        if (IsSoftenedCancelNotFoundError(error) || IsCancelSuccessConfirmation(error))
-        {
-            return false;
-        }
-
-        return _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback).Action == IbErrorAction.HardFail;
+        return ClassifyApiError(error).Disposition == ApiErrorDisposition.Blocking;
     }
 
     private async Task RunConnectMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -663,6 +628,7 @@ public sealed class SnapshotRuntime
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
         ApplyReconciliationTelemetry(reconciliation.Ledger);
         ExportPreTradeTelemetry(outputDir, timestamp);
+        ExportOrderLifecycleArtifacts(outputDir, timestamp, nameof(RunOrdersMode));
 
         Console.WriteLine($"[OK] Open orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
@@ -733,6 +699,7 @@ public sealed class SnapshotRuntime
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
         ApplyReconciliationTelemetry(reconciliation.Ledger);
         ExportPreTradeTelemetry(outputDir, timestamp);
+        ExportOrderLifecycleArtifacts(outputDir, timestamp, nameof(RunOrdersAllOpenMode));
 
         Console.WriteLine($"[OK] All-open-orders snapshot: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
         Console.WriteLine($"[OK] Completed orders snapshot: {completedOrdersPath} (rows={_wrapper.CompletedOrders.Count})");
@@ -832,6 +799,7 @@ public sealed class SnapshotRuntime
         WriteJson(reconciliationSummaryPath, new[] { reconciliation.Summary });
         ApplyReconciliationTelemetry(reconciliation.Ledger);
         ExportPreTradeTelemetry(outputDir, timestamp);
+        ExportOrderLifecycleArtifacts(outputDir, timestamp, nameof(RunSnapshotAllMode));
         WriteJson(accountSummaryPath, _wrapper.AccountSummaryRows.ToArray());
         WriteJson(positionsPath, _wrapper.Positions.ToArray());
         File.WriteAllText(reportPath, BuildReport(timestamp));
@@ -962,7 +930,10 @@ public sealed class SnapshotRuntime
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
         var livePlan = ResolveLiveOrderPlacementPlan();
+        var quoteSnapshot = await FetchLiveQuoteSnapshotAsync(client, brokerAdapter, livePlan.Symbol, 9917, token);
+        livePlan = ApplyLiveDefaultLimitFromQuote(livePlan, quoteSnapshot);
         ValidateLiveSafetyInputs(livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, livePlan.Symbol);
+        ValidateLivePriceSanity(livePlan, quoteSnapshot);
 
         var notional = livePlan.Quantity * livePlan.LimitPrice;
         if (notional > _options.MaxNotional)
@@ -1072,6 +1043,127 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Sim cancel status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
     }
 
+    private LiveOrderPlacementPlan ApplyLiveDefaultLimitFromQuote(LiveOrderPlacementPlan livePlan, LiveQuoteSnapshot quoteSnapshot)
+    {
+        if (!string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(livePlan.Action, "SELL", StringComparison.OrdinalIgnoreCase))
+        {
+            return livePlan;
+        }
+
+        if (quoteSnapshot.Bid > 0)
+        {
+            Console.WriteLine($"[INFO] Live default limit set from current bid: {quoteSnapshot.Bid:F4} (action={livePlan.Action}).");
+            return livePlan with { LimitPrice = quoteSnapshot.Bid };
+        }
+
+        Console.WriteLine($"[WARN] Live default limit: no bid quote available; falling back to --live-limit value {livePlan.LimitPrice:F4}.");
+        return livePlan;
+    }
+
+    private void ValidateLivePriceSanity(LiveOrderPlacementPlan livePlan, LiveQuoteSnapshot quoteSnapshot)
+    {
+        if (!string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var ticks = quoteSnapshot.Ticks;
+        var bid = quoteSnapshot.Bid;
+        var ask = quoteSnapshot.Ask;
+        var last = quoteSnapshot.Last;
+        var reference = ask > 0 ? ask : last;
+        if (reference <= 0)
+        {
+            if (!_options.LivePriceSanityRequireQuote)
+            {
+                Console.WriteLine("[WARN] Live price sanity: no ask/last reference price returned; continuing because --live-price-sanity-require-quote=false.");
+                return;
+            }
+
+            throw new InvalidOperationException(
+                "Live order blocked: no ask/last reference price returned for market sanity check.");
+        }
+
+        if (reference > _options.MaxPrice)
+        {
+            throw new InvalidOperationException(
+                $"Live order blocked: current reference price {reference:F2} exceeds configured max-price {_options.MaxPrice:F2}.");
+        }
+
+        var minReasonableBuyLimit = Math.Round(reference * 0.8, 4);
+        if (livePlan.LimitPrice < minReasonableBuyLimit)
+        {
+            throw new InvalidOperationException(
+                $"Live order blocked: buy limit {livePlan.LimitPrice:F2} is too far below market reference {reference:F2}. Minimum allowed by sanity gate is {minReasonableBuyLimit:F2}.");
+        }
+
+        if (!_options.LiveMomentumGuardEnabled)
+        {
+            return;
+        }
+
+        var lastTradeSeries = ticks
+            .Where(t => t.Field == 4 && t.Price > 0)
+            .Select(t => t.Price)
+            .ToArray();
+
+        if (lastTradeSeries.Length >= 2 && lastTradeSeries[0] > 0)
+        {
+            var openingLast = lastTradeSeries[0];
+            var currentLast = lastTradeSeries[^1];
+            var adverseBps = ((openingLast - currentLast) / openingLast) * 10000.0;
+
+            if (adverseBps >= _options.LiveMomentumMaxAdverseBps)
+            {
+                throw new InvalidOperationException(
+                    $"Live order blocked: momentum guard detected short-horizon downside ({adverseBps:F1} bps >= {_options.LiveMomentumMaxAdverseBps:F1} bps). Disable with --live-momentum-guard false if you intentionally want to buy into weakness.");
+            }
+        }
+        else if (bid > 0 && last > 0 && last <= bid)
+        {
+            throw new InvalidOperationException(
+                "Live order blocked: momentum guard detected weak tape (last trade at or below bid). Disable with --live-momentum-guard false if intentional.");
+        }
+        else
+        {
+            Console.WriteLine("[WARN] Live momentum guard: insufficient last-trade samples; skipping momentum trend test.");
+        }
+    }
+
+    private async Task<LiveQuoteSnapshot> FetchLiveQuoteSnapshotAsync(EClientSocket client, IBrokerAdapter brokerAdapter, string symbol, int requestId, CancellationToken token)
+    {
+        var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, requestId, contract);
+
+        try
+        {
+            var firstTickTask = _wrapper.TopDataFirstTickTask;
+            await Task.WhenAny(firstTickTask, Task.Delay(TimeSpan.FromSeconds(3), token));
+        }
+        finally
+        {
+            brokerAdapter.CancelMarketData(client, requestId);
+        }
+
+        var ticks = _wrapper.TopTicks
+            .Where(t => t.TickerId == requestId && t.Kind == "tickPrice")
+            .OrderBy(t => t.TimestampUtc)
+            .ToArray();
+
+        var bid = ticks.LastOrDefault(t => t.Field == 1)?.Price ?? 0;
+        var ask = ticks.LastOrDefault(t => t.Field == 2)?.Price ?? 0;
+        var last = ticks.LastOrDefault(t => t.Field == 4)?.Price ?? 0;
+        return new LiveQuoteSnapshot(bid, ask, last, ticks);
+    }
+
     private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan()
     {
         var symbol = _options.LiveSymbol;
@@ -1080,15 +1172,22 @@ public sealed class SnapshotRuntime
         var limitPrice = _options.LiveLimitPrice;
         var source = "manual";
 
-        if (string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath))
+        var scannerInputPath = ResolveLiveScannerInputPath(action);
+        if (string.IsNullOrWhiteSpace(scannerInputPath))
         {
             return new LiveOrderPlacementPlan(symbol, action, quantity, limitPrice, source);
         }
 
-        var fullPath = Path.GetFullPath(_options.LiveScannerCandidatesInputPath);
+        var fullPath = Path.GetFullPath(scannerInputPath);
         if (!File.Exists(fullPath))
         {
             throw new FileNotFoundException($"Live scanner candidates input not found: {fullPath}");
+        }
+
+        var fileName = Path.GetFileName(fullPath);
+        if (fileName.StartsWith("~$", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Live handoff blocked: '{fileName}' looks like an Excel lock/temp file. Use the real workbook file, not ~$*.xlsx.");
         }
 
         if (_options.LiveScannerKillSwitchMaxFileAgeMinutes > 0)
@@ -1102,10 +1201,7 @@ public sealed class SnapshotRuntime
             }
         }
 
-        var rows = JsonSerializer.Deserialize<LiveScannerCandidateRow[]>(File.ReadAllText(fullPath), new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        }) ?? [];
+        var rows = LoadLiveScannerCandidateRows(fullPath);
 
         var selected = rows
             .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
@@ -1173,6 +1269,182 @@ public sealed class SnapshotRuntime
         }
 
         return new LiveOrderPlacementPlan(symbol, action, quantity, limitPrice, source);
+    }
+
+    private string ResolveLiveScannerInputPath(string action)
+    {
+        if (!string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath))
+        {
+            return _options.LiveScannerCandidatesInputPath;
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.LiveScannerOpenPhaseInputPath)
+            && string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenGainersInputPath)
+            && string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenLosersInputPath))
+        {
+            return string.Empty;
+        }
+
+        var calendar = new UsEquitiesExchangeCalendarService();
+        if (!calendar.TryGetSessionWindowUtc("US-EQUITIES", DateTime.UtcNow, out var session)
+            || !session.IsTradingDay)
+        {
+            return string.IsNullOrWhiteSpace(_options.LiveScannerOpenPhaseInputPath)
+                ? _options.LiveScannerPostOpenGainersInputPath
+                : _options.LiveScannerOpenPhaseInputPath;
+        }
+
+        var nowUtc = DateTime.UtcNow;
+        var openPhaseEnd = session.SessionOpenUtc.AddMinutes(_options.LiveScannerOpenPhaseMinutes);
+        var postOpenEnd = openPhaseEnd.AddMinutes(_options.LiveScannerPostOpenMinutes);
+
+        if (nowUtc >= session.SessionOpenUtc && nowUtc < openPhaseEnd)
+        {
+            return _options.LiveScannerOpenPhaseInputPath;
+        }
+
+        if (nowUtc >= openPhaseEnd && nowUtc < postOpenEnd)
+        {
+            if (string.Equals(action, "SELL", StringComparison.OrdinalIgnoreCase))
+            {
+                return !string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenLosersInputPath)
+                    ? _options.LiveScannerPostOpenLosersInputPath
+                    : _options.LiveScannerPostOpenGainersInputPath;
+            }
+
+            return !string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenGainersInputPath)
+                ? _options.LiveScannerPostOpenGainersInputPath
+                : _options.LiveScannerPostOpenLosersInputPath;
+        }
+
+        return string.Empty;
+    }
+
+    private static LiveScannerCandidateRow[] LoadLiveScannerCandidateRows(string fullPath)
+    {
+        var extension = Path.GetExtension(fullPath);
+        if (string.Equals(extension, ".xlsx", StringComparison.OrdinalIgnoreCase))
+        {
+            return LoadLiveScannerCandidateRowsFromExcel(fullPath);
+        }
+
+        return JsonSerializer.Deserialize<LiveScannerCandidateRow[]>(File.ReadAllText(fullPath), new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        }) ?? [];
+    }
+
+    private static LiveScannerCandidateRow[] LoadLiveScannerCandidateRowsFromExcel(string fullPath)
+    {
+        using var sourceStream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var memoryStream = new MemoryStream();
+        sourceStream.CopyTo(memoryStream);
+        memoryStream.Position = 0;
+        using var workbook = new XLWorkbook(memoryStream);
+        var worksheet = workbook.Worksheets.First();
+        var usedRange = worksheet.RangeUsed();
+        if (usedRange is null)
+        {
+            return [];
+        }
+
+        var headerMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var headerRow = usedRange.FirstRowUsed();
+        foreach (var cell in headerRow.CellsUsed())
+        {
+            var key = cell.GetString().Trim();
+            if (!string.IsNullOrWhiteSpace(key))
+            {
+                headerMap[key] = cell.Address.ColumnNumber;
+            }
+        }
+
+        var symbolColumn = ResolveHeaderColumn(headerMap, "Symbol", fallbackColumn: 1);
+        var scoreColumn = ResolveHeaderColumn(headerMap, "WeightedScore", fallbackColumn: 2, alternateHeaders: ["Score", "Weighted Score"]);
+        var eligibleColumn = ResolveHeaderColumn(headerMap, "Eligible", fallbackColumn: 3);
+        var rankColumn = ResolveHeaderColumn(headerMap, "AverageRank", fallbackColumn: 4, alternateHeaders: ["AvgRank", "Average Rank"]);
+
+        var rows = new List<LiveScannerCandidateRow>();
+        foreach (var row in usedRange.RowsUsed().Skip(1))
+        {
+            var symbol = row.Cell(symbolColumn).GetString().Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(symbol))
+            {
+                continue;
+            }
+
+            var weightedScore = TryReadDouble(row.Cell(scoreColumn));
+            var eligible = TryReadBoolean(row.Cell(eligibleColumn));
+            var averageRank = TryReadDouble(row.Cell(rankColumn));
+
+            rows.Add(new LiveScannerCandidateRow
+            {
+                Symbol = symbol,
+                WeightedScore = weightedScore,
+                Eligible = eligible,
+                AverageRank = averageRank
+            });
+        }
+
+        return rows.ToArray();
+    }
+
+    private static int ResolveHeaderColumn(Dictionary<string, int> headerMap, string primaryHeader, int fallbackColumn, string[]? alternateHeaders = null)
+    {
+        if (headerMap.TryGetValue(primaryHeader, out var column))
+        {
+            return column;
+        }
+
+        if (alternateHeaders is not null)
+        {
+            foreach (var alternate in alternateHeaders)
+            {
+                if (headerMap.TryGetValue(alternate, out column))
+                {
+                    return column;
+                }
+            }
+        }
+
+        return fallbackColumn;
+    }
+
+    private static double TryReadDouble(IXLCell cell)
+    {
+        if (cell.TryGetValue<double>(out var value))
+        {
+            return value;
+        }
+
+        var text = cell.GetString().Trim();
+        return double.TryParse(text, out value) ? value : 0;
+    }
+
+    private static bool? TryReadBoolean(IXLCell cell)
+    {
+        if (cell.TryGetValue<bool>(out var boolValue))
+        {
+            return boolValue;
+        }
+
+        var text = cell.GetString().Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        if (bool.TryParse(text, out var parsed))
+        {
+            return parsed;
+        }
+
+        return text.ToUpperInvariant() switch
+        {
+            "1" or "Y" or "YES" or "TRUE" => true,
+            "0" or "N" or "NO" or "FALSE" => false,
+            _ => null
+        };
     }
 
     private static double ResolveTargetNotional(string mode, double budget, double selectedScore, IReadOnlyList<LiveScannerCandidateRow> selected)
@@ -3125,6 +3397,148 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Scanner workbench candidates export: {candidatesPath} (rows={candidateRows.Length})");
     }
 
+    private Task RunScannerPreviewMode(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        var nowUtc = DateTime.UtcNow;
+        var action = _options.LiveAction;
+        var resolvedPath = ResolveLiveScannerInputPath(action);
+        var fullPath = string.IsNullOrWhiteSpace(resolvedPath)
+            ? string.Empty
+            : Path.GetFullPath(resolvedPath);
+
+        var sessionCalendar = new UsEquitiesExchangeCalendarService();
+        var hasSession = sessionCalendar.TryGetSessionWindowUtc("US-EQUITIES", nowUtc, out var session);
+        var sessionOpenUtc = hasSession && session.IsTradingDay
+            ? session.SessionOpenUtc
+            : DateTime.MinValue;
+        var openPhaseEndUtc = hasSession && session.IsTradingDay
+            ? sessionOpenUtc.AddMinutes(_options.LiveScannerOpenPhaseMinutes)
+            : DateTime.MinValue;
+        var postOpenEndUtc = hasSession && session.IsTradingDay
+            ? openPhaseEndUtc.AddMinutes(_options.LiveScannerPostOpenMinutes)
+            : DateTime.MinValue;
+
+        var phase = "outside-window";
+        if (hasSession && session.IsTradingDay)
+        {
+            phase = nowUtc < sessionOpenUtc
+                ? "pre-open"
+                : nowUtc < openPhaseEndUtc
+                    ? "open-phase"
+                    : nowUtc < postOpenEndUtc
+                        ? "post-open"
+                        : "post-window";
+        }
+
+        var fileConfigured = !string.IsNullOrWhiteSpace(fullPath);
+        var fileExists = fileConfigured && File.Exists(fullPath);
+        var fileIsTemp = fileExists
+            && Path.GetFileName(fullPath).StartsWith("~$", StringComparison.OrdinalIgnoreCase);
+
+        var rawRows = fileExists && !fileIsTemp
+            ? LoadLiveScannerCandidateRows(fullPath)
+            : [];
+
+        var allowSet = _options.AllowedSymbols
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim().ToUpperInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var normalizedRows = rawRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+            .Select(x => new LiveScannerCandidateRow
+            {
+                Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                WeightedScore = x.WeightedScore,
+                Eligible = x.Eligible,
+                AverageRank = x.AverageRank
+            })
+            .ToArray();
+
+        var selectedSymbols = normalizedRows
+            .Where(x => x.Eligible is not false)
+            .Where(x => x.WeightedScore >= _options.LiveScannerMinScore)
+            .Where(x => allowSet.Contains(x.Symbol))
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .Take(Math.Max(1, _options.LiveScannerTopN))
+            .Select(x => x.Symbol)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var selectedCandidates = normalizedRows
+            .Where(x => selectedSymbols.Contains(x.Symbol))
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .ToArray();
+
+        var previewCandidates = normalizedRows
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .Select(x => new ScannerPreviewCandidateRow(
+                x.Symbol,
+                x.WeightedScore,
+                x.Eligible,
+                x.AverageRank,
+                allowSet.Contains(x.Symbol),
+                x.Eligible is not false && x.WeightedScore >= _options.LiveScannerMinScore,
+                selectedSymbols.Contains(x.Symbol)
+            ))
+            .ToArray();
+
+        var notes = new List<string>();
+        if (!fileConfigured)
+        {
+            notes.Add("No scanner file configured for current time window and action.");
+        }
+        else if (!fileExists)
+        {
+            notes.Add($"Resolved file not found: {fullPath}");
+        }
+        else if (fileIsTemp)
+        {
+            notes.Add("Resolved file is an Excel lock/temp file (~$*.xlsx). Use the real workbook file.");
+        }
+
+        if (selectedCandidates.Length == 0 && fileExists && !fileIsTemp)
+        {
+            notes.Add("No candidates passed allow-list, eligibility, and score filters.");
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var summaryPath = Path.Combine(outputDir, $"scanner_preview_summary_{timestamp}.json");
+        var candidatesPath = Path.Combine(outputDir, $"scanner_preview_candidates_{timestamp}.json");
+
+        var summary = new ScannerPreviewSummaryRow(
+            DateTime.UtcNow,
+            action,
+            resolvedPath,
+            fullPath,
+            fileConfigured,
+            fileExists,
+            fileIsTemp,
+            phase,
+            hasSession && session.IsTradingDay,
+            sessionOpenUtc,
+            openPhaseEndUtc,
+            postOpenEndUtc,
+            rawRows.Length,
+            normalizedRows.Length,
+            selectedCandidates.Length,
+            selectedCandidates.Select(x => x.Symbol).ToArray(),
+            notes.ToArray());
+
+        WriteJson(summaryPath, new[] { summary });
+        WriteJson(candidatesPath, previewCandidates);
+
+        Console.WriteLine($"[OK] Scanner preview summary export: {summaryPath} (selected={selectedCandidates.Length})");
+        Console.WriteLine($"[OK] Scanner preview candidates export: {candidatesPath} (rows={previewCandidates.Length})");
+
+        return Task.CompletedTask;
+    }
+
     private ScannerWorkbenchCandidateRow[] BuildScannerWorkbenchCandidates(
         IReadOnlyList<ScannerWorkbenchCandidateObservationRow> observationRows,
         int totalScanCodes,
@@ -3522,6 +3936,18 @@ public sealed class SnapshotRuntime
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
         var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
         var replayValidationSummaryPath = Path.Combine(outputDir, $"strategy_replay_validation_summary_{timestamp}.json");
+        var replayLimitOrderCaseMatrixPath = Path.Combine(outputDir, $"strategy_replay_limit_order_case_matrix_{timestamp}.json");
+        var replaySelfLearningSamplesPath = Path.Combine(outputDir, $"strategy_replay_self_learning_samples_{timestamp}.json");
+        var replaySelfLearningPredictionsPath = Path.Combine(outputDir, $"strategy_replay_self_learning_predictions_{timestamp}.json");
+        var replaySelfLearningSummaryPath = Path.Combine(outputDir, $"strategy_replay_self_learning_summary_{timestamp}.json");
+        var replaySelfLearningStoreSnapshotPath = Path.Combine(outputDir, $"strategy_replay_self_learning_store_snapshot_{timestamp}.json");
+        var replaySelfLearningPostprocessPath = Path.Combine(outputDir, $"strategy_replay_self_learning_m9_postprocess_{timestamp}.json");
+        var replaySelfLearningGovernancePath = Path.Combine(outputDir, $"strategy_replay_self_learning_promotion_governance_{timestamp}.json");
+        var replaySelfLearningLifecycleSnapshotPath = Path.Combine(outputDir, $"strategy_replay_self_learning_lifecycle_{timestamp}.json");
+        var replaySelfLearningModelRegistrySnapshotPath = Path.Combine(outputDir, $"strategy_replay_self_learning_model_registry_{timestamp}.json");
+        var replaySelfLearningStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_store.json");
+        var replaySelfLearningLifecycleStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_lifecycle.json");
+        var replaySelfLearningModelRegistryStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_model_registry.json");
 
         var replayFeeBreakdownRows = replayFillRows
             .Select(fill =>
@@ -3623,6 +4049,18 @@ public sealed class SnapshotRuntime
 
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
+        var selfLearningAnalyzer = new ReplaySelfLearningAnalyzer();
+        var selfLearning = selfLearningAnalyzer.Analyze(replayFillRows, replayCostDeltaRows, performance.Packets);
+        var selfLearningStore = UpdateReplaySelfLearningStore(replaySelfLearningStorePath, replayFillRows, strategyContext.Symbol);
+        var selfLearningPostprocess = BuildReplaySelfLearningPostprocessReport(selfLearningStore, replayFillRows);
+        var selfLearningGovernance = BuildReplaySelfLearningPromotionGovernanceReport(selfLearningStore, replayFillRows, strategyContext.Symbol);
+        var selfLearningLifecycleAndRegistry = UpdateReplaySelfLearningLifecycleAndRegistry(
+            replaySelfLearningLifecycleStorePath,
+            replaySelfLearningModelRegistryStorePath,
+            selfLearningStore,
+            selfLearningGovernance,
+            performance.Summary,
+            strategyContext.Symbol);
         var strategySourceCounts = replayOrderRows
             .GroupBy(x => string.IsNullOrWhiteSpace(x.Source) ? "unknown" : x.Source.Trim(), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
@@ -3649,9 +4087,13 @@ public sealed class SnapshotRuntime
                 _options.ReplayScannerTopN,
                 _options.ReplayScannerMinScore,
                 _options.ReplayScannerOrderQuantity,
+                _options.ReplayScannerOrderSide,
                 _options.ReplayScannerOrderType,
-                _options.ReplayScannerOrderTimeInForce)
+                _options.ReplayScannerOrderTimeInForce,
+                _options.ReplayScannerLimitOffsetBps)
         };
+
+            var replayLimitOrderCaseMatrixRows = BuildReplayLimitOrderCaseMatrixRows();
 
         WriteJson(replayPath, slices);
         WriteJson(replayOrdersPath, replayOrderRows);
@@ -3680,6 +4122,15 @@ public sealed class SnapshotRuntime
         WriteJson(replayPacketsPath, performance.Packets);
         WriteJson(replaySummaryPath, new[] { performance.Summary });
         WriteJson(replayValidationSummaryPath, replayValidationSummary);
+        WriteJson(replayLimitOrderCaseMatrixPath, replayLimitOrderCaseMatrixRows);
+        WriteJson(replaySelfLearningSamplesPath, selfLearning.Samples);
+        WriteJson(replaySelfLearningPredictionsPath, selfLearning.Predictions);
+        WriteJson(replaySelfLearningSummaryPath, new[] { selfLearning.Summary });
+        WriteJson(replaySelfLearningStoreSnapshotPath, new[] { selfLearningStore });
+        WriteJson(replaySelfLearningPostprocessPath, new[] { selfLearningPostprocess });
+        WriteJson(replaySelfLearningGovernancePath, new[] { selfLearningGovernance });
+        WriteJson(replaySelfLearningLifecycleSnapshotPath, new[] { selfLearningLifecycleAndRegistry.Lifecycle });
+        WriteJson(replaySelfLearningModelRegistrySnapshotPath, new[] { selfLearningLifecycleAndRegistry.Registry });
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
@@ -3707,6 +4158,775 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
         Console.WriteLine($"[OK] Strategy replay performance summary export: {replaySummaryPath}");
         Console.WriteLine($"[OK] Strategy replay validation summary export: {replayValidationSummaryPath}");
+        Console.WriteLine($"[OK] Strategy replay limit-order case matrix export: {replayLimitOrderCaseMatrixPath} (rows={replayLimitOrderCaseMatrixRows.Length})");
+        Console.WriteLine($"[OK] Strategy replay self-learning samples export: {replaySelfLearningSamplesPath} (rows={selfLearning.Samples.Count})");
+        Console.WriteLine($"[OK] Strategy replay self-learning predictions export: {replaySelfLearningPredictionsPath} (rows={selfLearning.Predictions.Count})");
+        Console.WriteLine($"[OK] Strategy replay self-learning summary export: {replaySelfLearningSummaryPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning store snapshot export: {replaySelfLearningStoreSnapshotPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning M9 postprocess export: {replaySelfLearningPostprocessPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning promotion governance export: {replaySelfLearningGovernancePath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning lifecycle export: {replaySelfLearningLifecycleSnapshotPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning model registry export: {replaySelfLearningModelRegistrySnapshotPath}");
+    }
+
+    private ReplaySelfLearningStoreRow UpdateReplaySelfLearningStore(
+        string storePath,
+        IReadOnlyList<ReplayFillRow> fills,
+        string defaultSymbol)
+    {
+        var existingStore = new ReplaySelfLearningStoreRow(
+            Version: 1,
+            UpdatedTsNs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
+            TotalRuns: 0,
+            LastDatasetReference: string.Empty,
+            LastTradeClosedCount: 0,
+            LastTradeClosedPnlSum: 0,
+            SymbolBias: new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase));
+
+        if (File.Exists(storePath))
+        {
+            try
+            {
+                var parsed = LoadJsonSingletonOrArray<ReplaySelfLearningStoreRow>(storePath);
+
+                if (parsed is not null)
+                {
+                    existingStore = parsed with
+                    {
+                        SymbolBias = parsed.SymbolBias is null
+                            ? new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+                            : new Dictionary<string, double>(parsed.SymbolBias, StringComparer.OrdinalIgnoreCase)
+                    };
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        var symbolStats = fills
+            .GroupBy(x => string.IsNullOrWhiteSpace(x.Symbol) ? defaultSymbol : x.Symbol.ToUpperInvariant())
+            .Select(group => new
+            {
+                Symbol = group.Key,
+                Count = group.Count(),
+                Wins = group.Count(fill => fill.RealizedPnlDelta > 0)
+            })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol) && x.Count > 0)
+            .ToArray();
+
+        var updatedBias = existingStore.SymbolBias is null
+            ? new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, double>(existingStore.SymbolBias, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var stat in symbolStats)
+        {
+            var winRate = (double)stat.Wins / stat.Count;
+            var delta = Math.Clamp((winRate - 0.5) * 0.2, -0.1, 0.1);
+            var old = updatedBias.TryGetValue(stat.Symbol, out var value) ? value : 0.0;
+            updatedBias[stat.Symbol] = Math.Round(Math.Clamp(old + delta, -1.0, 1.0), 6);
+        }
+
+        var updatedStore = new ReplaySelfLearningStoreRow(
+            Version: Math.Max(1, existingStore.Version),
+            UpdatedTsNs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
+            TotalRuns: existingStore.TotalRuns + 1,
+            LastDatasetReference: _options.ReplayInputPath,
+            LastTradeClosedCount: fills.Count,
+            LastTradeClosedPnlSum: Math.Round(fills.Sum(x => x.RealizedPnlDelta), 6),
+            SymbolBias: updatedBias
+                .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase));
+
+        WriteJson(storePath, new[] { updatedStore });
+        return updatedStore;
+    }
+
+    private ReplaySelfLearningLifecycleRegistryUpdateRow UpdateReplaySelfLearningLifecycleAndRegistry(
+        string lifecycleStorePath,
+        string modelRegistryStorePath,
+        ReplaySelfLearningStoreRow store,
+        ReplaySelfLearningPromotionGovernanceRow governance,
+        ReplayPerformanceSummaryRow performanceSummary,
+        string defaultSymbol)
+    {
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        var minRuns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["candidate"] = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_CANDIDATE", 1)),
+            ["shadow"] = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_SHADOW", 1)),
+            ["staged"] = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_STAGED", 1))
+        };
+
+        var stageOrder = new[] { "candidate", "shadow", "staged", "production" };
+        var lifecycle = LoadJsonSingletonOrArray<ReplaySelfLearningLifecycleRow>(lifecycleStorePath)
+            ?? new ReplaySelfLearningLifecycleRow(
+                Version: 1,
+                UpdatedTsNs: nowNs,
+                CurrentStage: governance.CurrentStage,
+                PreviousStage: null,
+                ConsecutiveDrift: 0,
+                PromotionMinRuns: minRuns,
+                LastRun: null,
+                History: [],
+                Events: [],
+                ModelRegistry: new ReplaySelfLearningLifecycleModelRegistryRow(
+                    Path: Path.GetFullPath(modelRegistryStorePath),
+                    ModelId: governance.ModelId,
+                    PromotionApprovalPath: governance.ApprovalsPath,
+                    PromotionRequireApproval: governance.ApprovalRequired,
+                    PromotionSignatureRequired: governance.SignatureRequired,
+                    PromotionSigningKeyEnv: Environment.GetEnvironmentVariable("SELF_LEARNING_PROMOTION_SIGNING_KEY_ENV")
+                        ?? "SELF_LEARNING_PROMOTION_SIGNING_KEY",
+                    LastPromotionApproval: BuildReplayPromotionApprovalMeta(governance),
+                    ProductionHumanWorkflowRequired: governance.HumanWorkflow.Required,
+                    ProductionHumanWorkflowRequiredTeams: governance.HumanWorkflow.RequiredTeams,
+                    ProductionHumanWorkflowMaxApprovalAgeHours: governance.HumanWorkflow.MaxApprovalAgeHours,
+                    ProductionHumanWorkflowRequireDistinctApprovers: governance.HumanWorkflow.RequireDistinctApprovers,
+                    LastPromotionHumanWorkflow: BuildReplayPromotionHumanWorkflowMeta(governance)));
+
+        var currentStage = NormalizeReplayStage(lifecycle.CurrentStage, governance.CurrentStage);
+        var previousStage = lifecycle.PreviousStage;
+
+        var history = lifecycle.History?
+            .Where(x => x is not null)
+            .ToList() ?? [];
+        var stageHistory = history
+            .Where(x => string.Equals(x.Stage, currentStage, StringComparison.OrdinalIgnoreCase))
+            .TakeLast(10)
+            .ToArray();
+
+        var baselineWinRate = stageHistory.Length == 0 ? 0 : stageHistory.Average(x => x.WinRate);
+        var baselinePnl = stageHistory.Length == 0 ? 0 : stageHistory.Average(x => x.PnlSum);
+        var winRateNow = performanceSummary.WinRate;
+        var pnlNow = store.LastTradeClosedPnlSum;
+        var driftDetected = stageHistory.Length > 0
+            && (winRateNow < baselineWinRate - 0.10
+                || pnlNow < baselinePnl - Math.Max(0.01, Math.Abs(baselinePnl) * 0.25));
+        var driftReasons = new List<string>();
+        if (stageHistory.Length > 0 && winRateNow < baselineWinRate - 0.10)
+        {
+            driftReasons.Add("win_rate_drop");
+        }
+        if (stageHistory.Length > 0 && pnlNow < baselinePnl - Math.Max(0.01, Math.Abs(baselinePnl) * 0.25))
+        {
+            driftReasons.Add("pnl_drop");
+        }
+
+        var consecutiveDrift = driftDetected
+            ? Math.Max(0, lifecycle.ConsecutiveDrift) + 1
+            : 0;
+
+        var events = lifecycle.Events?
+            .Where(x => x is not null)
+            .ToList() ?? [];
+        var eventType = string.Empty;
+        var eventReason = string.Empty;
+        ReplaySelfLearningPromotionApprovalMetaRow approvalMeta;
+        ReplaySelfLearningPromotionHumanWorkflowMetaRow humanMeta;
+
+        var qualityPassed = true;
+        if (qualityPassed && !driftDetected)
+        {
+            var stageIndex = Array.FindIndex(stageOrder, x => string.Equals(x, currentStage, StringComparison.OrdinalIgnoreCase));
+            if (stageIndex >= 0 && stageIndex < stageOrder.Length - 1)
+            {
+                var requiredRuns = minRuns.TryGetValue(currentStage, out var min) ? min : 1;
+                var runsAtStage = history.Count(x => string.Equals(x.Stage, currentStage, StringComparison.OrdinalIgnoreCase));
+                var promotedTo = stageOrder[stageIndex + 1];
+
+                approvalMeta = BuildReplayPromotionApprovalMeta(governance);
+                humanMeta = BuildReplayPromotionHumanWorkflowMeta(governance);
+
+                if (runsAtStage >= requiredRuns)
+                {
+                    if (string.Equals(governance.CurrentStage, currentStage, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(governance.TargetStage, promotedTo, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(governance.Status, "pass", StringComparison.OrdinalIgnoreCase))
+                    {
+                        previousStage = currentStage;
+                        currentStage = promotedTo;
+                        eventType = "promotion";
+                        eventReason = "quality_pass_no_drift";
+                    }
+                    else
+                    {
+                        eventType = "promotion_blocked";
+                        eventReason = string.Equals(governance.Reason, "human_workflow_gate_failed", StringComparison.OrdinalIgnoreCase)
+                            ? "human_workflow_gate_failed"
+                            : "approval_gate_failed";
+                    }
+
+                    events.Add(new ReplaySelfLearningLifecycleEventRow(
+                        TsNs: nowNs,
+                        DatasetDir: _options.ReplayInputPath,
+                        Type: eventType,
+                        From: governance.CurrentStage,
+                        To: governance.TargetStage,
+                        Reason: eventReason,
+                        StageRuns: runsAtStage,
+                        RequiredRuns: requiredRuns,
+                        ModelId: governance.ModelId,
+                        Approval: approvalMeta,
+                        HumanWorkflow: humanMeta));
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(eventType))
+        {
+            approvalMeta = BuildReplayPromotionApprovalMeta(governance);
+            humanMeta = BuildReplayPromotionHumanWorkflowMeta(governance);
+        }
+        else
+        {
+            approvalMeta = BuildReplayPromotionApprovalMeta(governance);
+            humanMeta = BuildReplayPromotionHumanWorkflowMeta(governance);
+        }
+
+        var lifecycleEntry = new ReplaySelfLearningLifecycleHistoryRow(
+            TsNs: nowNs,
+            DatasetDir: _options.ReplayInputPath,
+            ModelId: governance.ModelId,
+            Stage: currentStage,
+            TradeCount: store.LastTradeClosedCount,
+            PnlSum: store.LastTradeClosedPnlSum,
+            WinRate: winRateNow,
+            QualityPassed: qualityPassed,
+            DriftDetected: driftDetected,
+            DriftReasons: driftReasons,
+            ConsecutiveDrift: consecutiveDrift,
+            PromotionApproval: approvalMeta,
+            PromotionHumanWorkflow: humanMeta,
+            Baseline: new ReplaySelfLearningLifecycleBaselineRow(
+                WinRate: baselineWinRate,
+                PnlSum: baselinePnl,
+                Samples: stageHistory.Length));
+
+        history.Add(lifecycleEntry);
+        if (history.Count > 500)
+        {
+            history = history.TakeLast(500).ToList();
+        }
+
+        if (events.Count > 500)
+        {
+            events = events.TakeLast(500).ToList();
+        }
+
+        var lifecycleReport = new ReplaySelfLearningLifecycleRow(
+            Version: Math.Max(1, lifecycle.Version),
+            UpdatedTsNs: nowNs,
+            CurrentStage: currentStage,
+            PreviousStage: previousStage,
+            ConsecutiveDrift: consecutiveDrift,
+            PromotionMinRuns: minRuns,
+            LastRun: lifecycleEntry,
+            History: history,
+            Events: events,
+            ModelRegistry: new ReplaySelfLearningLifecycleModelRegistryRow(
+                Path: Path.GetFullPath(modelRegistryStorePath),
+                ModelId: governance.ModelId,
+                PromotionApprovalPath: governance.ApprovalsPath,
+                PromotionRequireApproval: governance.ApprovalRequired,
+                PromotionSignatureRequired: governance.SignatureRequired,
+                PromotionSigningKeyEnv: Environment.GetEnvironmentVariable("SELF_LEARNING_PROMOTION_SIGNING_KEY_ENV")
+                    ?? "SELF_LEARNING_PROMOTION_SIGNING_KEY",
+                LastPromotionApproval: approvalMeta,
+                ProductionHumanWorkflowRequired: governance.HumanWorkflow.Required,
+                ProductionHumanWorkflowRequiredTeams: governance.HumanWorkflow.RequiredTeams,
+                ProductionHumanWorkflowMaxApprovalAgeHours: governance.HumanWorkflow.MaxApprovalAgeHours,
+                ProductionHumanWorkflowRequireDistinctApprovers: governance.HumanWorkflow.RequireDistinctApprovers,
+                LastPromotionHumanWorkflow: humanMeta));
+
+        WriteJson(lifecycleStorePath, new[] { lifecycleReport });
+
+        var registry = LoadJsonSingletonOrArray<ReplaySelfLearningModelRegistryRow>(modelRegistryStorePath)
+            ?? new ReplaySelfLearningModelRegistryRow(
+                Version: 1,
+                UpdatedTsNs: 0,
+                Models: new Dictionary<string, ReplaySelfLearningModelRegistryModelRow>(StringComparer.OrdinalIgnoreCase),
+                Promotions: []);
+
+        var models = registry.Models is null
+            ? new Dictionary<string, ReplaySelfLearningModelRegistryModelRow>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, ReplaySelfLearningModelRegistryModelRow>(registry.Models, StringComparer.OrdinalIgnoreCase);
+        var promotions = registry.Promotions?.ToList() ?? [];
+
+        if (!models.TryGetValue(governance.ModelId, out var modelRecord))
+        {
+            modelRecord = new ReplaySelfLearningModelRegistryModelRow(
+                ModelId: governance.ModelId,
+                CreatedTsNs: nowNs,
+                UpdatedTsNs: nowNs,
+                Runs: 0,
+                CurrentStage: currentStage,
+                LatestDatasetDir: _options.ReplayInputPath,
+                LatestMetrics: new ReplaySelfLearningModelRegistryMetricsRow(performanceSummary.WinRate, store.LastTradeClosedPnlSum, store.LastTradeClosedCount),
+                LastPromotionApproval: approvalMeta,
+                LastPromotionHumanWorkflow: humanMeta,
+                LastPromotion: null);
+        }
+
+        ReplaySelfLearningModelRegistryPromotionRow? lastPromotion = modelRecord.LastPromotion;
+        if (string.Equals(eventType, "promotion", StringComparison.OrdinalIgnoreCase))
+        {
+            lastPromotion = new ReplaySelfLearningModelRegistryPromotionRow(
+                TsNs: nowNs,
+                ModelId: governance.ModelId,
+                From: governance.CurrentStage,
+                To: governance.TargetStage,
+                Reason: eventReason,
+                Approval: approvalMeta,
+                HumanWorkflow: humanMeta);
+            promotions.Add(lastPromotion);
+        }
+
+        modelRecord = modelRecord with
+        {
+            UpdatedTsNs = nowNs,
+            Runs = Math.Max(0, modelRecord.Runs) + 1,
+            CurrentStage = currentStage,
+            LatestDatasetDir = _options.ReplayInputPath,
+            LatestMetrics = new ReplaySelfLearningModelRegistryMetricsRow(
+                WinRate: performanceSummary.WinRate,
+                PnlSum: store.LastTradeClosedPnlSum,
+                TradeCount: store.LastTradeClosedCount),
+            LastPromotionApproval = approvalMeta,
+            LastPromotionHumanWorkflow = humanMeta,
+            LastPromotion = lastPromotion
+        };
+
+        models[governance.ModelId] = modelRecord;
+        var registryReport = new ReplaySelfLearningModelRegistryRow(
+            Version: Math.Max(1, registry.Version),
+            UpdatedTsNs: nowNs,
+            Models: models,
+            Promotions: promotions.TakeLast(500).ToArray());
+
+        WriteJson(modelRegistryStorePath, new[] { registryReport });
+
+        return new ReplaySelfLearningLifecycleRegistryUpdateRow(
+            lifecycleReport,
+            registryReport);
+    }
+
+    private static T? LoadJsonSingletonOrArray<T>(string path)
+        where T : class
+    {
+        if (!File.Exists(path))
+        {
+            return default;
+        }
+
+        var json = File.ReadAllText(path);
+        var serializerOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        };
+
+        var trimmed = json.TrimStart();
+        if (trimmed.StartsWith("[", StringComparison.Ordinal))
+        {
+            return JsonSerializer.Deserialize<T[]>(json, serializerOptions)?.FirstOrDefault();
+        }
+
+        return JsonSerializer.Deserialize<T>(json, serializerOptions);
+    }
+
+    private static string NormalizeReplayStage(string stage, string fallback)
+    {
+        var normalized = string.IsNullOrWhiteSpace(stage) ? fallback : stage;
+        normalized = normalized.Trim().ToLowerInvariant();
+        return normalized is "candidate" or "shadow" or "staged" or "production"
+            ? normalized
+            : "candidate";
+    }
+
+    private static ReplaySelfLearningPromotionApprovalMetaRow BuildReplayPromotionApprovalMeta(ReplaySelfLearningPromotionGovernanceRow governance)
+    {
+        var first = governance.TransitionApprovals.FirstOrDefault();
+        var signed = governance.TransitionApprovals.Any() && governance.TransitionApprovals.All(x => x.SignatureVerified);
+        var approvalFound = governance.TransitionApprovals.Count > 0;
+        var error = string.Equals(governance.Status, "pass", StringComparison.OrdinalIgnoreCase)
+            ? string.Empty
+            : string.Equals(governance.Reason, "human_workflow_gate_failed", StringComparison.OrdinalIgnoreCase)
+                ? "human_workflow_gate_failed"
+                : "approval_gate_failed";
+
+        return new ReplaySelfLearningPromotionApprovalMetaRow(
+            Required: governance.ApprovalRequired,
+            SignatureRequired: governance.SignatureRequired,
+            Source: governance.ApprovalsPath,
+            Ok: string.Equals(governance.Status, "pass", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(governance.Reason, "human_workflow_gate_failed", StringComparison.OrdinalIgnoreCase),
+            ApprovalFound: approvalFound,
+            Signed: signed,
+            ApprovalId: first?.ApprovalId ?? string.Empty,
+            ApprovedBy: first?.ApprovedBy ?? string.Empty,
+            ChangeTicket: first?.ChangeTicket ?? string.Empty,
+            Error: error);
+    }
+
+    private static ReplaySelfLearningPromotionHumanWorkflowMetaRow BuildReplayPromotionHumanWorkflowMeta(ReplaySelfLearningPromotionGovernanceRow governance)
+    {
+        var approvalsUsed = governance.TransitionApprovals
+            .Where(x => !string.IsNullOrWhiteSpace(x.Team))
+            .Select(x => new ReplaySelfLearningWorkflowApprovalRow(
+                ApprovalId: x.ApprovalId,
+                Team: x.Team,
+                ApprovedBy: x.ApprovedBy,
+                ChangeTicket: x.ChangeTicket,
+                IssuedTsNs: x.IssuedTsNs,
+                ExpiresTsNs: x.ExpiresTsNs,
+                Signed: x.SignatureVerified))
+            .ToArray();
+
+        var error = governance.HumanWorkflow.Required && governance.HumanWorkflow.TeamsMissing.Count > 0
+            ? "workflow_teams_missing"
+            : governance.HumanWorkflow.Required
+                && governance.HumanWorkflow.RequireDistinctApprovers
+                && !governance.HumanWorkflow.DistinctApproversOk
+                    ? "workflow_approvers_not_distinct"
+                    : governance.HumanWorkflow.Required
+                        ? string.Empty
+                        : "workflow_not_required";
+
+        return new ReplaySelfLearningPromotionHumanWorkflowMetaRow(
+            Required: governance.HumanWorkflow.Required,
+            Source: governance.ApprovalsPath,
+            RequiredTeams: governance.HumanWorkflow.RequiredTeams,
+            MaxApprovalAgeHours: governance.HumanWorkflow.MaxApprovalAgeHours,
+            RequireDistinctApprovers: governance.HumanWorkflow.RequireDistinctApprovers,
+            Ok: !governance.HumanWorkflow.Required
+                || (governance.HumanWorkflow.TeamsMissing.Count == 0
+                    && (!governance.HumanWorkflow.RequireDistinctApprovers || governance.HumanWorkflow.DistinctApproversOk)
+                    && governance.HumanWorkflow.FreshApprovalCount > 0),
+            TeamsApproved: governance.HumanWorkflow.TeamsApproved,
+            TeamsMissing: governance.HumanWorkflow.TeamsMissing,
+            DistinctApproversOk: governance.HumanWorkflow.DistinctApproversOk,
+            ApprovalsUsed: approvalsUsed,
+            Error: error);
+    }
+
+    private static ReplaySelfLearningM9PostprocessRow BuildReplaySelfLearningPostprocessReport(
+        ReplaySelfLearningStoreRow store,
+        IReadOnlyList<ReplayFillRow> fills)
+    {
+        var tradeCount = fills.Count;
+        var pnlSum = fills.Sum(x => x.RealizedPnlDelta);
+        var winCount = fills.Count(x => x.RealizedPnlDelta > 0);
+        var winRate = tradeCount <= 0 ? 0 : (double)winCount / tradeCount;
+
+        var scannerWeightAdjust = Math.Round(Math.Clamp((winRate - 0.5) * 0.4, -0.2, 0.2), 6);
+        var stopDistMultiplier = pnlSum < 0 ? 1.1 : pnlSum > 0 ? 0.95 : 1.0;
+
+        var symbolOverrides = (store.SymbolBias ?? new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase))
+            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(x => new ReplaySelfLearningSymbolOverrideRow(
+                Symbol: x.Key,
+                ScannerScoreShift: Math.Round(Math.Clamp(x.Value, -0.5, 0.5), 6),
+                Action: x.Value > 0 ? "upweight" : x.Value < 0 ? "downweight" : "hold"))
+            .ToArray();
+
+        return new ReplaySelfLearningM9PostprocessRow(
+            GeneratedTsNs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000,
+            Inputs: new ReplaySelfLearningM9InputsRow(
+                TradeCount: tradeCount,
+                PnlSum: Math.Round(pnlSum, 6),
+                WinRate: Math.Round(winRate, 6),
+                SymbolBiasCount: symbolOverrides.Length),
+            Recommendations: new ReplaySelfLearningM9RecommendationsRow(
+                ScannerWeightAdjust: scannerWeightAdjust,
+                StopDistMultiplier: stopDistMultiplier,
+                SymbolOverrides: symbolOverrides),
+            Guardrails: new ReplaySelfLearningM9GuardrailsRow(
+                OfflineOnly: true,
+                LiveRiskExecutionMutationAllowed: false));
+    }
+
+    private ReplaySelfLearningPromotionGovernanceRow BuildReplaySelfLearningPromotionGovernanceReport(
+        ReplaySelfLearningStoreRow store,
+        IReadOnlyList<ReplayFillRow> fills,
+        string defaultSymbol)
+    {
+        var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
+        var approvalRequired = TryReadEnvironmentBool("SELF_LEARNING_PROMOTION_REQUIRE_APPROVAL", true);
+        var signatureRequired = TryReadEnvironmentBool("SELF_LEARNING_PROMOTION_SIGNATURE_REQUIRED", false);
+        var signingKeyEnvName = Environment.GetEnvironmentVariable("SELF_LEARNING_PROMOTION_SIGNING_KEY_ENV")
+            ?? "SELF_LEARNING_PROMOTION_SIGNING_KEY";
+        var signingKey = Environment.GetEnvironmentVariable(signingKeyEnvName) ?? string.Empty;
+
+        var approvalsPathRaw = Environment.GetEnvironmentVariable("SELF_LEARNING_PROMOTION_APPROVALS_PATH")
+            ?? Path.Combine(_options.ExportDir, "model_promotion_approvals.json");
+        var approvalsPath = Path.GetFullPath(approvalsPathRaw);
+
+        var humanWorkflowRequired = TryReadEnvironmentBool("SELF_LEARNING_HUMAN_PROMOTION_WORKFLOW_REQUIRED", false);
+        var requiredTeams = (Environment.GetEnvironmentVariable("SELF_LEARNING_HUMAN_PROMOTION_REQUIRED_TEAMS") ?? "engineering,risk,operations")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => x.Trim().ToLowerInvariant())
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (requiredTeams.Length == 0)
+        {
+            requiredTeams = ["engineering", "risk", "operations"];
+        }
+
+        var maxApprovalAgeHours = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_HUMAN_PROMOTION_MAX_APPROVAL_AGE_HOURS", 72));
+        var requireDistinctApprovers = TryReadEnvironmentBool("SELF_LEARNING_HUMAN_PROMOTION_REQUIRE_DISTINCT_APPROVERS", true);
+        var minRunsCandidate = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_CANDIDATE", 1));
+        var minRunsShadow = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_SHADOW", 1));
+
+        var modelId = BuildReplaySelfLearningModelId(store, fills, defaultSymbol);
+        var totalRuns = Math.Max(1, store.TotalRuns);
+        var fromStage = totalRuns <= minRunsCandidate
+            ? "candidate"
+            : totalRuns <= minRunsCandidate + minRunsShadow
+                ? "shadow"
+                : "staged";
+        var toStage = fromStage switch
+        {
+            "candidate" => "shadow",
+            "shadow" => "staged",
+            _ => "production"
+        };
+
+        var approvalsLoaded = LoadReplaySelfLearningPromotionApprovals(approvalsPath);
+        var transitionApprovals = approvalsLoaded
+            .Where(approval =>
+                (string.Equals(approval.ModelId, "*", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(approval.ModelId, modelId, StringComparison.OrdinalIgnoreCase))
+                && string.Equals(approval.FromStage, fromStage, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(approval.ToStage, toStage, StringComparison.OrdinalIgnoreCase)
+                && approval.IssuedTsNs <= nowNs
+                && (approval.ExpiresTsNs <= 0 || approval.ExpiresTsNs >= nowNs))
+            .Select(approval =>
+            {
+                var signatureVerified = !signatureRequired
+                    || (!string.IsNullOrWhiteSpace(signingKey)
+                        && string.Equals(
+                            approval.Signature,
+                            ComputeReplaySelfLearningApprovalSignature(signingKey, approval),
+                            StringComparison.OrdinalIgnoreCase));
+
+                return approval with
+                {
+                    SignatureVerified = signatureVerified
+                };
+            })
+            .Where(approval => !signatureRequired || approval.SignatureVerified)
+            .ToArray();
+
+        var maxApprovalAgeNs = (long)maxApprovalAgeHours * 60L * 60L * 1_000_000_000L;
+        var freshCutoffNs = nowNs - maxApprovalAgeNs;
+        var freshApprovals = transitionApprovals
+            .Where(approval => approval.IssuedTsNs >= freshCutoffNs)
+            .ToArray();
+
+        var teamsApproved = freshApprovals
+            .Select(approval => (approval.Team ?? string.Empty).Trim().ToLowerInvariant())
+            .Where(team => !string.IsNullOrWhiteSpace(team))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var teamsMissing = requiredTeams
+            .Except(teamsApproved, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var distinctApprovers = freshApprovals
+            .Select(approval => (approval.ApprovedBy ?? string.Empty).Trim().ToLowerInvariant())
+            .Where(approver => !string.IsNullOrWhiteSpace(approver))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var distinctApproversOk = !requireDistinctApprovers || distinctApprovers.Length >= teamsApproved.Length;
+        var approvalGatePassed = !approvalRequired || transitionApprovals.Length > 0;
+        var humanGatePassed = !humanWorkflowRequired
+            || (teamsMissing.Length == 0
+                && distinctApproversOk
+                && freshApprovals.Length > 0);
+
+        var checks = new[]
+        {
+            new ReplaySelfLearningPromotionCheckRow(
+                "approvals-file-present",
+                !approvalRequired || File.Exists(approvalsPath),
+                approvalRequired
+                    ? $"path={approvalsPath}"
+                    : "approvals optional"),
+            new ReplaySelfLearningPromotionCheckRow(
+                "transition-approval-valid",
+                approvalGatePassed,
+                $"transition={fromStage}->{toStage} matches={transitionApprovals.Length} required={approvalRequired}"),
+            new ReplaySelfLearningPromotionCheckRow(
+                "approval-signature",
+                !signatureRequired || transitionApprovals.All(x => x.SignatureVerified),
+                signatureRequired
+                    ? $"required=true keyEnv={signingKeyEnvName} keyPresent={!string.IsNullOrWhiteSpace(signingKey)}"
+                    : "signature not required"),
+            new ReplaySelfLearningPromotionCheckRow(
+                "human-workflow-teams",
+                !humanWorkflowRequired || teamsMissing.Length == 0,
+                humanWorkflowRequired
+                    ? $"requiredTeams={string.Join(',', requiredTeams)} approvedTeams={string.Join(',', teamsApproved)}"
+                    : "human workflow not required"),
+            new ReplaySelfLearningPromotionCheckRow(
+                "human-workflow-distinct-approvers",
+                !humanWorkflowRequired || distinctApproversOk,
+                humanWorkflowRequired
+                    ? $"requiredDistinct={requireDistinctApprovers} distinctApprovers={distinctApprovers.Length}"
+                    : "human workflow not required"),
+            new ReplaySelfLearningPromotionCheckRow(
+                "human-workflow-approval-freshness",
+                !humanWorkflowRequired || freshApprovals.Length > 0,
+                humanWorkflowRequired
+                    ? $"maxAgeHours={maxApprovalAgeHours} freshApprovals={freshApprovals.Length}"
+                    : "human workflow not required")
+        };
+
+        var passed = checks.All(x => x.Passed);
+        var status = passed ? "pass" : "blocked";
+        var reason = passed
+            ? "promotion_gate_passed"
+            : !approvalGatePassed
+                ? "promotion_approval_gate_failed"
+                : "human_workflow_gate_failed";
+
+        return new ReplaySelfLearningPromotionGovernanceRow(
+            GeneratedTsNs: nowNs,
+            ModelId: modelId,
+            CurrentStage: fromStage,
+            TargetStage: toStage,
+            Status: status,
+            Reason: reason,
+            ApprovalRequired: approvalRequired,
+            SignatureRequired: signatureRequired,
+            ApprovalsPath: approvalsPath,
+            TransitionApprovals: transitionApprovals,
+            HumanWorkflow: new ReplaySelfLearningHumanWorkflowRow(
+                Required: humanWorkflowRequired,
+                RequiredTeams: requiredTeams,
+                TeamsApproved: teamsApproved,
+                TeamsMissing: teamsMissing,
+                RequireDistinctApprovers: requireDistinctApprovers,
+                DistinctApproversOk: distinctApproversOk,
+                MaxApprovalAgeHours: maxApprovalAgeHours,
+                FreshApprovalCount: freshApprovals.Length),
+            Checks: checks);
+    }
+
+    private static ReplaySelfLearningPromotionApprovalRow[] LoadReplaySelfLearningPromotionApprovals(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return [];
+        }
+
+        try
+        {
+            var payload = JsonSerializer.Deserialize<ReplaySelfLearningPromotionApprovalsDocumentRow>(
+                File.ReadAllText(path),
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+            return payload?.Approvals?
+                .Where(x => x is not null)
+                .Select(x => x with
+                {
+                    ModelId = string.IsNullOrWhiteSpace(x.ModelId) ? "*" : x.ModelId.Trim(),
+                    FromStage = string.IsNullOrWhiteSpace(x.FromStage) ? string.Empty : x.FromStage.Trim().ToLowerInvariant(),
+                    ToStage = string.IsNullOrWhiteSpace(x.ToStage) ? string.Empty : x.ToStage.Trim().ToLowerInvariant(),
+                    Team = string.IsNullOrWhiteSpace(x.Team) ? string.Empty : x.Team.Trim().ToLowerInvariant(),
+                    ApprovedBy = x.ApprovedBy ?? string.Empty,
+                    ChangeTicket = x.ChangeTicket ?? string.Empty,
+                    Signature = x.Signature ?? string.Empty,
+                    SignatureVerified = false
+                })
+                .ToArray()
+                ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static bool TryReadEnvironmentBool(string name, bool fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (bool.TryParse(value, out var parsed))
+        {
+            return parsed;
+        }
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "1" or "Y" or "YES" or "TRUE" => true,
+            "0" or "N" or "NO" or "FALSE" => false,
+            _ => fallback
+        };
+    }
+
+    private static int TryReadEnvironmentInt(string name, int fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        return int.TryParse(value, out var parsed) ? parsed : fallback;
+    }
+
+    private static string BuildReplaySelfLearningModelId(
+        ReplaySelfLearningStoreRow store,
+        IReadOnlyList<ReplayFillRow> fills,
+        string defaultSymbol)
+    {
+        var symbol = fills
+            .Select(x => x.Symbol)
+            .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x))
+            ?? defaultSymbol;
+
+        return $"model-{symbol.Trim().ToUpperInvariant()}";
+    }
+
+    private static string ComputeReplaySelfLearningApprovalSignature(string secret, ReplaySelfLearningPromotionApprovalRow approval)
+    {
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            return string.Empty;
+        }
+
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var canonicalPayload = BuildCanonicalReplaySelfLearningApprovalPayloadJson(approval);
+        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(canonicalPayload));
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static string BuildCanonicalReplaySelfLearningApprovalPayloadJson(ReplaySelfLearningPromotionApprovalRow approval)
+    {
+        var canonicalPayload = new SortedDictionary<string, object?>
+        {
+            ["approved_by"] = approval.ApprovedBy ?? string.Empty,
+            ["change_ticket"] = approval.ChangeTicket ?? string.Empty,
+            ["expires_ts_ns"] = approval.ExpiresTsNs,
+            ["from_stage"] = approval.FromStage ?? string.Empty,
+            ["issued_ts_ns"] = approval.IssuedTsNs,
+            ["model_id"] = approval.ModelId ?? string.Empty,
+            ["team"] = approval.Team ?? string.Empty,
+            ["to_stage"] = approval.ToStage ?? string.Empty
+        };
+
+        return JsonSerializer.Serialize(canonicalPayload);
     }
 
     private ScannerSubscription BuildScannerSubscriptionFromOptions()
@@ -3983,6 +5203,12 @@ public sealed class SnapshotRuntime
         if (!symbolAllowed)
         {
             throw new InvalidOperationException($"Live order blocked: symbol '{symbol}' is not in allow-list.");
+        }
+
+        var primaryExchange = (_options.PrimaryExchange ?? string.Empty).Trim().ToUpperInvariant();
+        if (primaryExchange is not ("NYSE" or "NASDAQ"))
+        {
+            throw new InvalidOperationException($"Live order blocked: primary exchange '{_options.PrimaryExchange}' is not allowed. Use NYSE or NSDQ.");
         }
     }
 
@@ -4440,20 +5666,15 @@ public sealed class SnapshotRuntime
         Console.WriteLine("\n=== API Errors ===");
         foreach (var error in _wrapper.ApiErrors)
         {
-            if (IsSoftenedCancelNotFoundError(error) || IsCancelSuccessConfirmation(error))
+            var classification = ClassifyApiError(error);
+            if (classification.Disposition is ApiErrorDisposition.Ignored or ApiErrorDisposition.NonBlocking)
             {
                 continue;
             }
 
-            var decision = _errorPolicy.Evaluate(error, _options.Mode, _options.OptionGreeksAutoFallback);
-            if (decision.Action == IbErrorAction.Ignore)
+            if (classification.Disposition is ApiErrorDisposition.Warning or ApiErrorDisposition.Retryable)
             {
-                continue;
-            }
-
-            if (decision.Action is IbErrorAction.Warn or IbErrorAction.Retry)
-            {
-                var key = $"{decision.Action}:{error.Code?.ToString() ?? "none"}";
+                var key = $"{classification.Disposition}:{error.Code?.ToString() ?? "none"}";
                 if (!emittedKeys.Add(key))
                 {
                     if (error.Code is int code)
@@ -4464,7 +5685,7 @@ public sealed class SnapshotRuntime
                 }
             }
 
-            Console.WriteLine($"[{decision.Action}] ts={error.UtcTimestamp:O} id={error.Id?.ToString() ?? "n/a"} code={error.Code?.ToString() ?? "n/a"} msg={error.Message} reason={decision.Reason}");
+            Console.WriteLine($"[{classification.Disposition}] ts={error.UtcTimestamp:O} id={error.Id?.ToString() ?? "n/a"} code={error.Code?.ToString() ?? "n/a"} msg={error.Message} reason={classification.Reason}");
         }
 
         foreach (var item in throttledCounts.OrderBy(kvp => kvp.Key))
@@ -4490,6 +5711,47 @@ public sealed class SnapshotRuntime
         {
             Console.WriteLine($"[REQ] corr={row.CorrelationId} reqId={row.RequestId?.ToString() ?? "n/a"} type={row.Type} origin={row.Origin} status={row.Status} started={row.StartedAtUtc:O} deadline={row.DeadlineUtc:O} details={row.Details ?? "n/a"}");
         }
+    }
+
+    private void ExportOrderLifecycleArtifacts(string outputDir, string timestamp, string mode)
+    {
+        var lifecycleTransitions = OrderLifecycleModel.BuildTransitions(_wrapper.CanonicalOrderEvents.ToArray());
+        if (lifecycleTransitions.Length > 0)
+        {
+            var transitionsPath = Path.Combine(outputDir, $"order_lifecycle_transitions_{timestamp}.json");
+            var summaryPath = Path.Combine(outputDir, $"order_lifecycle_summary_{timestamp}.json");
+            var summary = OrderLifecycleModel.BuildSummary(mode, lifecycleTransitions);
+
+            WriteJson(transitionsPath, lifecycleTransitions);
+            WriteJson(summaryPath, new[] { summary });
+            Console.WriteLine($"[OK] Order lifecycle transitions: {transitionsPath} (rows={lifecycleTransitions.Length})");
+            Console.WriteLine($"[OK] Order lifecycle summary: {summaryPath}");
+        }
+
+        if (_wrapper.ApiErrors.IsEmpty)
+        {
+            return;
+        }
+
+        var normalizedErrors = _wrapper.ApiErrors
+            .Select(error =>
+            {
+                var classification = ClassifyApiError(error);
+                return new ApiErrorNormalizationRow(
+                    error.UtcTimestamp,
+                    error.Id,
+                    error.Code,
+                    error.Message,
+                    classification.Disposition,
+                    classification.PolicyAction,
+                    classification.Disposition == ApiErrorDisposition.Blocking,
+                    classification.Reason);
+            })
+            .ToArray();
+
+        var errorsPath = Path.Combine(outputDir, $"api_error_normalization_{timestamp}.json");
+        WriteJson(errorsPath, normalizedErrors);
+        Console.WriteLine($"[OK] API error normalization: {errorsPath} (rows={normalizedErrors.Length})");
     }
 
     private void ExportAdapterTraceArtifact()
@@ -4618,6 +5880,25 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Resilience drill acceptance export: {path}");
     }
 
+    private ReplayLimitOrderCaseMatrixRow[] BuildReplayLimitOrderCaseMatrixRows()
+    {
+        var strategyUsesLimit = string.Equals(_options.ReplayScannerOrderType, "LMT", StringComparison.OrdinalIgnoreCase);
+
+        return
+        [
+            new ReplayLimitOrderCaseMatrixRow("LMT-BUY-01", "LEAN", "BUY", "Bar low <= limit", "Filled at limit", true, "ReplayExecutionSimulator.ResolveFillPrice BUY branch"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BUY-02", "LEAN", "BUY", "Bar low > limit", "Remains open", true, "ReplayExecutionSimulator.ResolveFillPrice BUY branch"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BUY-03", "ZIPLINE", "BUY", "No bar and mark <= limit", "Filled at limit", true, "ReplayExecutionSimulator no-bar fallback"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-SELL-01", "LEAN", "SELL", "Bar high >= limit", "Filled at limit", true, "ReplayExecutionSimulator.ResolveFillPrice SELL branch"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-SELL-02", "LEAN", "SELL", "Bar high < limit", "Remains open", true, "ReplayExecutionSimulator.ResolveFillPrice SELL branch"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-SELL-03", "ZIPLINE", "SELL", "No bar and mark >= limit", "Filled at limit", true, "ReplayExecutionSimulator no-bar fallback"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BOTH-01", "LEAN", "BUY/SELL", "IOC/FOK with no immediate fill", "Canceled first eligible slice", true, "TryGetOrderExpiry + immediate-or-cancel paths"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BOTH-02", "LEAN", "BUY/SELL", "Tick-size increment configured", "Limit and fill quantized", true, "QuantizePrice + --replay-price-increment"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BOTH-03", "ZIPLINE", "BUY/SELL", "Participation cap active", "Partial fills possible", true, "ReplayMaxFillParticipationRate + strategy_replay_partial_fill_events_*.json"),
+            new ReplayLimitOrderCaseMatrixRow("LMT-BOTH-04", "HARVESTER", "BUY/SELL/AUTO", "Scanner replay strategy emits limit orders", "Emits side-aware limit intent with optional offset", strategyUsesLimit, "ScannerCandidateReplayRuntime --replay-scanner-order-side/--replay-scanner-limit-offset-bps")
+        ];
+    }
+
     private void ExportLeanZiplineParityChecklistArtifact(DateTime runStartedUtc, int exitCode)
     {
         var checks = new[]
@@ -4639,7 +5920,8 @@ public sealed class SnapshotRuntime
             new LeanZiplineParityChecklistRow("P-015", "Malformed derivative contract recovery", "LEAN", true, "IbContractNormalizationService OCC/suffix parsers"),
             new LeanZiplineParityChecklistRow("P-016", "Combo order translation aliases and per-leg limits", "LEAN", true, "IbOrderTranslationService combo aliases + OrderComboLegs"),
             new LeanZiplineParityChecklistRow("P-017", "Replay combo lifecycle and atomic combo-group execution", "LEAN", true, "strategy_replay_combo_events_*.json + atomic combo group execution path"),
-            new LeanZiplineParityChecklistRow("P-018", "Resilience drill acceptance artifact", "ZIPLINE", true, "resilience_drill_acceptance_<mode>_*.json")
+            new LeanZiplineParityChecklistRow("P-018", "Resilience drill acceptance artifact", "ZIPLINE", true, "resilience_drill_acceptance_<mode>_*.json"),
+            new LeanZiplineParityChecklistRow("P-019", "Limit BUY/SELL case matrix and strategy wiring", "LEAN/ZIPLINE", true, "strategy_replay_limit_order_case_matrix_*.json + scanner replay side-aware limit settings")
         };
 
         var summary = new LeanZiplineParityChecklistSummaryRow(
@@ -4665,8 +5947,19 @@ public sealed class SnapshotRuntime
         var outputDir = EnsureOutputDir();
         var hasReplayValidationSummary = Directory.GetFiles(outputDir, "strategy_replay_validation_summary_*.json").Length > 0;
 
-        var hasLiveScannerInput = string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath)
-            || File.Exists(Path.GetFullPath(_options.LiveScannerCandidatesInputPath));
+        var configuredScannerPaths = new[]
+        {
+            _options.LiveScannerCandidatesInputPath,
+            _options.LiveScannerOpenPhaseInputPath,
+            _options.LiveScannerPostOpenGainersInputPath,
+            _options.LiveScannerPostOpenLosersInputPath
+        }
+        .Where(path => !string.IsNullOrWhiteSpace(path))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+        var hasLiveScannerInput = configuredScannerPaths.Length == 0
+            || configuredScannerPaths.All(path => File.Exists(Path.GetFullPath(path)));
         var killSwitchConfigured = _options.LiveScannerKillSwitchMinCandidates >= 1
             && _options.LiveScannerKillSwitchMaxFileAgeMinutes >= 0
             && _options.LiveScannerKillSwitchMaxBudgetConcentrationPct is >= 0 and <= 100;
@@ -4694,9 +5987,9 @@ public sealed class SnapshotRuntime
             new PromotionReadinessCheckRow(
                 "live-scanner-input",
                 hasLiveScannerInput,
-                string.IsNullOrWhiteSpace(_options.LiveScannerCandidatesInputPath)
+                configuredScannerPaths.Length == 0
                     ? "manual symbol mode"
-                    : $"path={_options.LiveScannerCandidatesInputPath}"),
+                    : $"paths={string.Join(';', configuredScannerPaths)}"),
             new PromotionReadinessCheckRow(
                 "live-killswitch-configured",
                 killSwitchConfigured,
@@ -4804,7 +6097,7 @@ public sealed class SnapshotRuntime
             return false;
         }
 
-        if ((_options.Mode == RunMode.ScannerExamples || _options.Mode == RunMode.ScannerComplex || _options.Mode == RunMode.ScannerParameters || _options.Mode == RunMode.ScannerWorkbench)
+        if ((_options.Mode == RunMode.ScannerExamples || _options.Mode == RunMode.ScannerComplex || _options.Mode == RunMode.ScannerParameters || _options.Mode == RunMode.ScannerWorkbench || _options.Mode == RunMode.ScannerPreview)
             && (error.Contains("code=162", StringComparison.OrdinalIgnoreCase)
                 || error.Contains("code=200", StringComparison.OrdinalIgnoreCase)
                 || error.Contains("code=300", StringComparison.OrdinalIgnoreCase)
@@ -4899,6 +6192,9 @@ public sealed record AppOptions(
     string LiveAction,
     double LiveQuantity,
     double LiveLimitPrice,
+    bool LivePriceSanityRequireQuote,
+    bool LiveMomentumGuardEnabled,
+    double LiveMomentumMaxAdverseBps,
     int CancelOrderId,
     bool CancelOrderIdempotent,
     double MaxNotional,
@@ -4907,6 +6203,11 @@ public sealed record AppOptions(
     string[] AllowedSymbols
     ,
     string LiveScannerCandidatesInputPath,
+    string LiveScannerOpenPhaseInputPath,
+    string LiveScannerPostOpenGainersInputPath,
+    string LiveScannerPostOpenLosersInputPath,
+    int LiveScannerOpenPhaseMinutes,
+    int LiveScannerPostOpenMinutes,
     int LiveScannerTopN,
     double LiveScannerMinScore,
     string LiveAllocationMode,
@@ -5021,8 +6322,10 @@ public sealed record AppOptions(
     int ReplayScannerTopN,
     double ReplayScannerMinScore,
     double ReplayScannerOrderQuantity,
+    string ReplayScannerOrderSide,
     string ReplayScannerOrderType,
     string ReplayScannerOrderTimeInForce,
+    double ReplayScannerLimitOffsetBps,
     string ReplayPriceNormalization,
     int ReplayIntervalSeconds,
     int ReplayMaxRows,
@@ -5069,6 +6372,9 @@ public sealed record AppOptions(
         var liveAction = "BUY";
         var liveQuantity = 1.0;
         var liveLimitPrice = 5.00;
+        var livePriceSanityRequireQuote = true;
+        var liveMomentumGuardEnabled = true;
+        var liveMomentumMaxAdverseBps = 20.0;
         var cancelOrderId = 0;
         var cancelOrderIdempotent = false;
         var maxNotional = 100.00;
@@ -5076,6 +6382,11 @@ public sealed record AppOptions(
         var maxPrice = 10.0;
         var allowedSymbols = new[] { "SIRI", "SOFI", "F", "PLTR" };
         var liveScannerCandidatesInputPath = string.Empty;
+        var liveScannerOpenPhaseInputPath = string.Empty;
+        var liveScannerPostOpenGainersInputPath = string.Empty;
+        var liveScannerPostOpenLosersInputPath = string.Empty;
+        var liveScannerOpenPhaseMinutes = 60;
+        var liveScannerPostOpenMinutes = 120;
         var liveScannerTopN = 5;
         var liveScannerMinScore = 60.0;
         var liveAllocationMode = "manual";
@@ -5190,8 +6501,10 @@ public sealed record AppOptions(
         var replayScannerTopN = 5;
         var replayScannerMinScore = 60.0;
         var replayScannerOrderQuantity = 1.0;
+        var replayScannerOrderSide = "BUY";
         var replayScannerOrderType = "MKT";
         var replayScannerOrderTimeInForce = "DAY";
+        var replayScannerLimitOffsetBps = 0.0;
         var replayPriceNormalization = "raw";
         var replayIntervalSeconds = 0;
         var replayMaxRows = 5000;
@@ -5253,7 +6566,7 @@ public sealed record AppOptions(
                     symbol = args[++i].ToUpperInvariant();
                     break;
                 case "--primary-exchange" when i + 1 < args.Length:
-                    primaryExchange = args[++i].ToUpperInvariant();
+                    primaryExchange = NormalizeSupportedStockExchange(args[++i], "--primary-exchange");
                     break;
                 case "--enable-live" when i + 1 < args.Length:
                     enableLive = bool.TryParse(args[++i], out var flag) && flag;
@@ -5270,6 +6583,16 @@ public sealed record AppOptions(
                     break;
                 case "--live-limit" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lp):
                     liveLimitPrice = lp;
+                    i++;
+                    break;
+                case "--live-price-sanity-require-quote" when i + 1 < args.Length:
+                    livePriceSanityRequireQuote = bool.TryParse(args[++i], out var lpsrq) && lpsrq;
+                    break;
+                case "--live-momentum-guard" when i + 1 < args.Length:
+                    liveMomentumGuardEnabled = bool.TryParse(args[++i], out var lmg) && lmg;
+                    break;
+                case "--live-momentum-max-adverse-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lmmab):
+                    liveMomentumMaxAdverseBps = Math.Max(0, lmmab);
                     i++;
                     break;
                 case "--cancel-order-id" when i + 1 < args.Length && int.TryParse(args[i + 1], out var coid):
@@ -5299,6 +6622,23 @@ public sealed record AppOptions(
                     break;
                 case "--live-scanner-candidates-input" when i + 1 < args.Length:
                     liveScannerCandidatesInputPath = args[++i];
+                    break;
+                case "--live-scanner-open-phase-input" when i + 1 < args.Length:
+                    liveScannerOpenPhaseInputPath = args[++i];
+                    break;
+                case "--live-scanner-post-open-gainers-input" when i + 1 < args.Length:
+                    liveScannerPostOpenGainersInputPath = args[++i];
+                    break;
+                case "--live-scanner-post-open-losers-input" when i + 1 < args.Length:
+                    liveScannerPostOpenLosersInputPath = args[++i];
+                    break;
+                case "--live-scanner-open-phase-minutes" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lsopm):
+                    liveScannerOpenPhaseMinutes = Math.Max(1, lsopm);
+                    i++;
+                    break;
+                case "--live-scanner-post-open-minutes" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lspom):
+                    liveScannerPostOpenMinutes = Math.Max(1, lspom);
+                    i++;
                     break;
                 case "--live-scanner-top-n" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lstn):
                     liveScannerTopN = Math.Max(1, lstn);
@@ -5343,7 +6683,7 @@ public sealed record AppOptions(
                     i++;
                     break;
                 case "--depth-exchange" when i + 1 < args.Length:
-                    depthExchange = args[++i].ToUpperInvariant();
+                    depthExchange = NormalizeSupportedStockExchange(args[++i], "--depth-exchange");
                     break;
                 case "--rtb-what" when i + 1 < args.Length:
                     realTimeBarsWhatToShow = args[++i].ToUpperInvariant();
@@ -5544,7 +6884,7 @@ public sealed record AppOptions(
                     faOrderExchange = args[++i].ToUpperInvariant();
                     break;
                 case "--fa-order-primary-exchange" when i + 1 < args.Length:
-                    faOrderPrimaryExchange = args[++i].ToUpperInvariant();
+                    faOrderPrimaryExchange = NormalizeSupportedStockExchange(args[++i], "--fa-order-primary-exchange");
                     break;
                 case "--fa-order-currency" when i + 1 < args.Length:
                     faOrderCurrency = args[++i].ToUpperInvariant();
@@ -5690,11 +7030,18 @@ public sealed record AppOptions(
                     replayScannerOrderQuantity = Math.Max(0, rsoq);
                     i++;
                     break;
+                case "--replay-scanner-order-side" when i + 1 < args.Length:
+                    replayScannerOrderSide = args[++i].ToUpperInvariant();
+                    break;
                 case "--replay-scanner-order-type" when i + 1 < args.Length:
                     replayScannerOrderType = args[++i].ToUpperInvariant();
                     break;
                 case "--replay-scanner-order-tif" when i + 1 < args.Length:
                     replayScannerOrderTimeInForce = args[++i].ToUpperInvariant();
+                    break;
+                case "--replay-scanner-limit-offset-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var rslob):
+                    replayScannerLimitOffsetBps = Math.Max(0, rslob);
+                    i++;
                     break;
                 case "--replay-price-normalization" when i + 1 < args.Length:
                     replayPriceNormalization = args[++i];
@@ -5820,6 +7167,9 @@ public sealed record AppOptions(
             liveAction,
             liveQuantity,
             liveLimitPrice,
+            livePriceSanityRequireQuote,
+            liveMomentumGuardEnabled,
+            liveMomentumMaxAdverseBps,
             cancelOrderId,
             cancelOrderIdempotent,
             maxNotional,
@@ -5827,6 +7177,11 @@ public sealed record AppOptions(
             maxPrice,
             allowedSymbols,
             liveScannerCandidatesInputPath,
+            liveScannerOpenPhaseInputPath,
+            liveScannerPostOpenGainersInputPath,
+            liveScannerPostOpenLosersInputPath,
+            liveScannerOpenPhaseMinutes,
+            liveScannerPostOpenMinutes,
             liveScannerTopN,
             liveScannerMinScore,
             liveAllocationMode,
@@ -5941,8 +7296,10 @@ public sealed record AppOptions(
             replayScannerTopN,
             replayScannerMinScore,
             replayScannerOrderQuantity,
+            replayScannerOrderSide,
             replayScannerOrderType,
             replayScannerOrderTimeInForce,
+            replayScannerLimitOffsetBps,
             replayPriceNormalization,
             replayIntervalSeconds,
             replayMaxRows,
@@ -6021,6 +7378,18 @@ public sealed record AppOptions(
         };
     }
 
+    private static string NormalizeSupportedStockExchange(string value, string optionName)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            "NYSE" => "NYSE",
+            "NSDQ" => "NASDAQ",
+            "NASDAQ" => "NASDAQ",
+            _ => throw new ArgumentException($"Unsupported exchange '{value}' for {optionName}. Use NYSE or NSDQ.")
+        };
+    }
+
     private static RunMode ParseMode(string value)
     {
         return value.ToLowerInvariant() switch
@@ -6072,12 +7441,13 @@ public sealed record AppOptions(
             "scanner-complex" => RunMode.ScannerComplex,
             "scanner-parameters" => RunMode.ScannerParameters,
             "scanner-workbench" => RunMode.ScannerWorkbench,
+            "scanner-preview" => RunMode.ScannerPreview,
             "display-groups-query" => RunMode.DisplayGroupsQuery,
             "display-groups-subscribe" => RunMode.DisplayGroupsSubscribe,
             "display-groups-update" => RunMode.DisplayGroupsUpdate,
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
             "strategy-replay" => RunMode.StrategyReplay,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
         };
     }
 }
@@ -6145,6 +7515,7 @@ public enum RunMode
     ScannerComplex,
     ScannerParameters,
     ScannerWorkbench,
+    ScannerPreview,
     DisplayGroupsQuery,
     DisplayGroupsSubscribe,
     DisplayGroupsUpdate,
@@ -6205,6 +7576,13 @@ internal sealed record LiveOrderPlacementPlan(
     string Source
 );
 
+internal sealed record LiveQuoteSnapshot(
+    double Bid,
+    double Ask,
+    double Last,
+    TopTickRow[] Ticks
+);
+
 internal sealed class LiveScannerCandidateRow
 {
     public string Symbol { get; set; } = string.Empty;
@@ -6212,6 +7590,36 @@ internal sealed class LiveScannerCandidateRow
     public bool? Eligible { get; set; }
     public double AverageRank { get; set; }
 }
+
+public sealed record ScannerPreviewSummaryRow(
+    DateTime TimestampUtc,
+    string Action,
+    string ResolvedInputPath,
+    string ResolvedInputFullPath,
+    bool FileConfigured,
+    bool FileExists,
+    bool FileIsTempLock,
+    string Phase,
+    bool IsTradingDay,
+    DateTime SessionOpenUtc,
+    DateTime OpenPhaseEndUtc,
+    DateTime PostOpenEndUtc,
+    int RawRowCount,
+    int NormalizedRowCount,
+    int SelectedRowCount,
+    string[] SelectedSymbols,
+    string[] Notes
+);
+
+public sealed record ScannerPreviewCandidateRow(
+    string Symbol,
+    double WeightedScore,
+    bool? Eligible,
+    double AverageRank,
+    bool AllowListed,
+    bool MeetsScoreAndEligibility,
+    bool Selected
+);
 
 public sealed record ManagedAccountRow(
     DateTime TimestampUtc,
@@ -6481,8 +7889,256 @@ public sealed record ReplayValidationSummaryRow(
     int ScannerTopN,
     double ScannerMinScore,
     double ScannerOrderQuantity,
+    string ScannerOrderSide,
     string ScannerOrderType,
-    string ScannerOrderTimeInForce
+    string ScannerOrderTimeInForce,
+    double ScannerLimitOffsetBps
+);
+
+public sealed record ReplayLimitOrderCaseMatrixRow(
+    string CaseId,
+    string Reference,
+    string Side,
+    string Trigger,
+    string ExpectedBehavior,
+    bool Implemented,
+    string Evidence
+);
+
+public sealed record ReplaySelfLearningStoreRow(
+    int Version,
+    long UpdatedTsNs,
+    int TotalRuns,
+    string LastDatasetReference,
+    int LastTradeClosedCount,
+    double LastTradeClosedPnlSum,
+    IReadOnlyDictionary<string, double> SymbolBias
+);
+
+public sealed record ReplaySelfLearningSymbolOverrideRow(
+    string Symbol,
+    double ScannerScoreShift,
+    string Action
+);
+
+public sealed record ReplaySelfLearningM9InputsRow(
+    int TradeCount,
+    double PnlSum,
+    double WinRate,
+    int SymbolBiasCount
+);
+
+public sealed record ReplaySelfLearningM9RecommendationsRow(
+    double ScannerWeightAdjust,
+    double StopDistMultiplier,
+    IReadOnlyList<ReplaySelfLearningSymbolOverrideRow> SymbolOverrides
+);
+
+public sealed record ReplaySelfLearningM9GuardrailsRow(
+    bool OfflineOnly,
+    bool LiveRiskExecutionMutationAllowed
+);
+
+public sealed record ReplaySelfLearningM9PostprocessRow(
+    long GeneratedTsNs,
+    ReplaySelfLearningM9InputsRow Inputs,
+    ReplaySelfLearningM9RecommendationsRow Recommendations,
+    ReplaySelfLearningM9GuardrailsRow Guardrails
+);
+
+public sealed record ReplaySelfLearningPromotionApprovalsDocumentRow(
+    [property: JsonPropertyName("version")] int Version,
+    [property: JsonPropertyName("generated_ts_ns")] long GeneratedTsNs,
+    [property: JsonPropertyName("approvals")] IReadOnlyList<ReplaySelfLearningPromotionApprovalRow> Approvals
+);
+
+public sealed record ReplaySelfLearningPromotionApprovalRow(
+    [property: JsonPropertyName("approval_id")] string ApprovalId,
+    [property: JsonPropertyName("model_id")] string ModelId,
+    [property: JsonPropertyName("from_stage")] string FromStage,
+    [property: JsonPropertyName("to_stage")] string ToStage,
+    [property: JsonPropertyName("approved_by")] string ApprovedBy,
+    [property: JsonPropertyName("change_ticket")] string ChangeTicket,
+    [property: JsonPropertyName("issued_ts_ns")] long IssuedTsNs,
+    [property: JsonPropertyName("expires_ts_ns")] long ExpiresTsNs,
+    [property: JsonPropertyName("team")] string Team,
+    [property: JsonPropertyName("signature")] string Signature,
+    bool SignatureVerified
+);
+
+public sealed record ReplaySelfLearningPromotionCheckRow(
+    string CheckName,
+    bool Passed,
+    string Details
+);
+
+public sealed record ReplaySelfLearningHumanWorkflowRow(
+    bool Required,
+    IReadOnlyList<string> RequiredTeams,
+    IReadOnlyList<string> TeamsApproved,
+    IReadOnlyList<string> TeamsMissing,
+    bool RequireDistinctApprovers,
+    bool DistinctApproversOk,
+    int MaxApprovalAgeHours,
+    int FreshApprovalCount
+);
+
+public sealed record ReplaySelfLearningPromotionGovernanceRow(
+    long GeneratedTsNs,
+    string ModelId,
+    string CurrentStage,
+    string TargetStage,
+    string Status,
+    string Reason,
+    bool ApprovalRequired,
+    bool SignatureRequired,
+    string ApprovalsPath,
+    IReadOnlyList<ReplaySelfLearningPromotionApprovalRow> TransitionApprovals,
+    ReplaySelfLearningHumanWorkflowRow HumanWorkflow,
+    IReadOnlyList<ReplaySelfLearningPromotionCheckRow> Checks
+);
+
+public sealed record ReplaySelfLearningWorkflowApprovalRow(
+    string ApprovalId,
+    string Team,
+    string ApprovedBy,
+    string ChangeTicket,
+    long IssuedTsNs,
+    long ExpiresTsNs,
+    bool Signed
+);
+
+public sealed record ReplaySelfLearningPromotionApprovalMetaRow(
+    bool Required,
+    bool SignatureRequired,
+    string Source,
+    bool Ok,
+    bool ApprovalFound,
+    bool Signed,
+    string ApprovalId,
+    string ApprovedBy,
+    string ChangeTicket,
+    string Error
+);
+
+public sealed record ReplaySelfLearningPromotionHumanWorkflowMetaRow(
+    bool Required,
+    string Source,
+    IReadOnlyList<string> RequiredTeams,
+    int MaxApprovalAgeHours,
+    bool RequireDistinctApprovers,
+    bool Ok,
+    IReadOnlyList<string> TeamsApproved,
+    IReadOnlyList<string> TeamsMissing,
+    bool DistinctApproversOk,
+    IReadOnlyList<ReplaySelfLearningWorkflowApprovalRow> ApprovalsUsed,
+    string Error
+);
+
+public sealed record ReplaySelfLearningLifecycleBaselineRow(
+    double WinRate,
+    double PnlSum,
+    int Samples
+);
+
+public sealed record ReplaySelfLearningLifecycleHistoryRow(
+    long TsNs,
+    string DatasetDir,
+    string ModelId,
+    string Stage,
+    int TradeCount,
+    double PnlSum,
+    double WinRate,
+    bool QualityPassed,
+    bool DriftDetected,
+    IReadOnlyList<string> DriftReasons,
+    int ConsecutiveDrift,
+    ReplaySelfLearningPromotionApprovalMetaRow PromotionApproval,
+    ReplaySelfLearningPromotionHumanWorkflowMetaRow PromotionHumanWorkflow,
+    ReplaySelfLearningLifecycleBaselineRow Baseline
+);
+
+public sealed record ReplaySelfLearningLifecycleEventRow(
+    long TsNs,
+    string DatasetDir,
+    string Type,
+    string From,
+    string To,
+    string Reason,
+    int StageRuns,
+    int RequiredRuns,
+    string ModelId,
+    ReplaySelfLearningPromotionApprovalMetaRow Approval,
+    ReplaySelfLearningPromotionHumanWorkflowMetaRow HumanWorkflow
+);
+
+public sealed record ReplaySelfLearningLifecycleModelRegistryRow(
+    string Path,
+    string ModelId,
+    string PromotionApprovalPath,
+    bool PromotionRequireApproval,
+    bool PromotionSignatureRequired,
+    string PromotionSigningKeyEnv,
+    ReplaySelfLearningPromotionApprovalMetaRow LastPromotionApproval,
+    bool ProductionHumanWorkflowRequired,
+    IReadOnlyList<string> ProductionHumanWorkflowRequiredTeams,
+    int ProductionHumanWorkflowMaxApprovalAgeHours,
+    bool ProductionHumanWorkflowRequireDistinctApprovers,
+    ReplaySelfLearningPromotionHumanWorkflowMetaRow LastPromotionHumanWorkflow
+);
+
+public sealed record ReplaySelfLearningLifecycleRow(
+    int Version,
+    long UpdatedTsNs,
+    string CurrentStage,
+    string? PreviousStage,
+    int ConsecutiveDrift,
+    IReadOnlyDictionary<string, int> PromotionMinRuns,
+    ReplaySelfLearningLifecycleHistoryRow? LastRun,
+    IReadOnlyList<ReplaySelfLearningLifecycleHistoryRow> History,
+    IReadOnlyList<ReplaySelfLearningLifecycleEventRow> Events,
+    ReplaySelfLearningLifecycleModelRegistryRow ModelRegistry
+);
+
+public sealed record ReplaySelfLearningModelRegistryMetricsRow(
+    double WinRate,
+    double PnlSum,
+    int TradeCount
+);
+
+public sealed record ReplaySelfLearningModelRegistryPromotionRow(
+    long TsNs,
+    string ModelId,
+    string From,
+    string To,
+    string Reason,
+    ReplaySelfLearningPromotionApprovalMetaRow Approval,
+    ReplaySelfLearningPromotionHumanWorkflowMetaRow HumanWorkflow
+);
+
+public sealed record ReplaySelfLearningModelRegistryModelRow(
+    string ModelId,
+    long CreatedTsNs,
+    long UpdatedTsNs,
+    int Runs,
+    string CurrentStage,
+    string LatestDatasetDir,
+    ReplaySelfLearningModelRegistryMetricsRow LatestMetrics,
+    ReplaySelfLearningPromotionApprovalMetaRow LastPromotionApproval,
+    ReplaySelfLearningPromotionHumanWorkflowMetaRow LastPromotionHumanWorkflow,
+    ReplaySelfLearningModelRegistryPromotionRow? LastPromotion
+);
+
+public sealed record ReplaySelfLearningModelRegistryRow(
+    int Version,
+    long UpdatedTsNs,
+    IReadOnlyDictionary<string, ReplaySelfLearningModelRegistryModelRow> Models,
+    IReadOnlyList<ReplaySelfLearningModelRegistryPromotionRow> Promotions
+);
+
+public sealed record ReplaySelfLearningLifecycleRegistryUpdateRow(
+    ReplaySelfLearningLifecycleRow Lifecycle,
+    ReplaySelfLearningModelRegistryRow Registry
 );
 
 public sealed record PromotionReadinessCheckRow(
