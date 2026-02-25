@@ -421,6 +421,24 @@ public sealed record Tmg020UnderperformanceTimeoutExitConfig(
         FlattenOrderType: "MARKET");
 }
 
+public sealed record Tmg021QuotePressureExitConfig(
+    bool Enabled,
+    double MinPressurePct,
+    bool RequireAdverseUnrealized,
+    string FlattenRoute,
+    string FlattenTif,
+    string FlattenOrderType
+)
+{
+    public static Tmg021QuotePressureExitConfig Default { get; } = new(
+        Enabled: false,
+        MinPressurePct: 0.001,
+        RequireAdverseUnrealized: true,
+        FlattenRoute: "SMART",
+        FlattenTif: "DAY",
+        FlattenOrderType: "MARKETABLE_LIMIT");
+}
+
 public interface IReplayEndOfDayStrategy
 {
     IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
@@ -3533,6 +3551,135 @@ public sealed class Tmg020UnderperformanceTimeoutExitStrategy : IReplayTradeMana
     private sealed record GuardState(
         string Side,
         int HoldingBars,
+        bool Triggered
+    );
+}
+
+public sealed class Tmg021QuotePressureExitStrategy : IReplayTradeManagementStrategy
+{
+    public const string StrategyId = "TMG_021_QUOTE_PRESSURE_EXIT";
+
+    private readonly Tmg021QuotePressureExitConfig _config;
+    private readonly Dictionary<string, GuardState> _stateBySymbol;
+
+    public Tmg021QuotePressureExitStrategy(Tmg021QuotePressureExitConfig? config = null)
+    {
+        _config = config ?? Tmg021QuotePressureExitConfig.Default;
+        _stateBySymbol = new Dictionary<string, GuardState>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context)
+    {
+        if (!_config.Enabled)
+        {
+            return [];
+        }
+
+        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(symbol) || context.MarkPrice <= 0)
+        {
+            return [];
+        }
+
+        if (Math.Abs(context.PositionQuantity) <= 1e-9)
+        {
+            _stateBySymbol.Remove(symbol);
+            return [];
+        }
+
+        var side = context.PositionQuantity > 0 ? "LONG" : "SHORT";
+        var state = _stateBySymbol.TryGetValue(symbol, out var existing)
+            ? existing
+            : new GuardState(Side: side, Triggered: false);
+        if (!string.Equals(state.Side, side, StringComparison.OrdinalIgnoreCase))
+        {
+            state = new GuardState(Side: side, Triggered: false);
+        }
+
+        if (state.Triggered)
+        {
+            _stateBySymbol[symbol] = state;
+            return [];
+        }
+
+        if (context.BidPrice <= 0 || context.AskPrice <= 0 || context.AskPrice < context.BidPrice)
+        {
+            _stateBySymbol[symbol] = state;
+            return [];
+        }
+
+        var mid = (context.BidPrice + context.AskPrice) / 2.0;
+        if (mid <= 1e-9)
+        {
+            _stateBySymbol[symbol] = state;
+            return [];
+        }
+
+        var pressurePct = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? Math.Max(0.0, (mid - context.BidPrice) / mid)
+            : Math.Max(0.0, (context.AskPrice - mid) / mid);
+        if (pressurePct < Math.Max(0.0, _config.MinPressurePct))
+        {
+            _stateBySymbol[symbol] = state;
+            return [];
+        }
+
+        var entry = Math.Max(1e-9, context.AveragePrice);
+        var unrealizedPnl = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? (context.MarkPrice - entry) * Math.Abs(context.PositionQuantity)
+            : (entry - context.MarkPrice) * Math.Abs(context.PositionQuantity);
+        if (_config.RequireAdverseUnrealized && unrealizedPnl >= 0)
+        {
+            _stateBySymbol[symbol] = state;
+            return [];
+        }
+
+        _stateBySymbol[symbol] = state with { Triggered = true };
+
+        var qty = Math.Abs(context.PositionQuantity);
+        var flattenSide = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+        var flattenOrderType = string.Equals(_config.FlattenOrderType, "MARKETABLE_LIMIT", StringComparison.OrdinalIgnoreCase)
+            ? "LMT"
+            : "MKT";
+        var flattenLimitPrice = flattenOrderType == "LMT"
+            ? (flattenSide == "BUY" ? context.AskPrice : context.BidPrice)
+            : (double?)null;
+
+        return
+        [
+            new ReplayOrderIntent(
+                TimestampUtc: context.TimestampUtc,
+                Symbol: symbol,
+                Side: string.Empty,
+                Quantity: 0,
+                OrderType: "CANCEL",
+                LimitPrice: null,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"trade-management:{StrategyId}:pressure-cancel",
+                Route: _config.FlattenRoute),
+            new ReplayOrderIntent(
+                TimestampUtc: context.TimestampUtc,
+                Symbol: symbol,
+                Side: flattenSide,
+                Quantity: qty,
+                OrderType: flattenOrderType,
+                LimitPrice: flattenLimitPrice,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"trade-management:{StrategyId}:pressure-flatten",
+                Route: _config.FlattenRoute)
+        ];
+    }
+
+    private sealed record GuardState(
+        string Side,
         bool Triggered
     );
 }
