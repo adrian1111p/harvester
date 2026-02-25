@@ -41,11 +41,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementAdaptive = new Tmg006VolatilityAdaptiveExitStrategy(BuildTradeManagementAdaptiveConfigFromEnvironment());
         var tradeManagementDrawdownDerisk = new Tmg007DrawdownDeriskStrategy(BuildTradeManagementDrawdownDeriskConfigFromEnvironment());
         var tradeManagementVwapReversion = new Tmg008SessionVwapReversionExitStrategy(BuildTradeManagementVwapReversionConfigFromEnvironment());
+        var tradeManagementSpreadGuard = new Tmg009LiquiditySpreadExitStrategy(BuildTradeManagementSpreadGuardConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -89,16 +90,30 @@ public sealed class ScannerCandidateReplayRuntime :
             return [];
         }
 
-        var markPrice = ResolveMarkPrice(dataSlice);
+        var bidPrice = ResolveBidPrice(dataSlice);
+        var askPrice = ResolveAskPrice(dataSlice);
+        var markPrice = ResolveMarkPrice(dataSlice, bidPrice, askPrice);
         if (markPrice <= 0)
         {
             return [];
+        }
+
+        if (bidPrice <= 0)
+        {
+            bidPrice = markPrice;
+        }
+
+        if (askPrice <= 0)
+        {
+            askPrice = markPrice;
         }
 
         var dayTradingContext = new ReplayDayTradingContext(
             TimestampUtc: dataSlice.TimestampUtc,
             Symbol: symbol,
             MarkPrice: markPrice,
+            BidPrice: bidPrice,
+            AskPrice: askPrice,
             PositionQuantity: _positionQuantity,
             AveragePrice: _averagePrice);
 
@@ -117,7 +132,7 @@ public sealed class ScannerCandidateReplayRuntime :
             result.Fills);
     }
 
-    private static double ResolveMarkPrice(StrategyDataSlice dataSlice)
+    private static double ResolveMarkPrice(StrategyDataSlice dataSlice, double bidPrice, double askPrice)
     {
         var last = dataSlice.TopTicks
             .Where(x => x.Field == 4)
@@ -128,20 +143,28 @@ public sealed class ScannerCandidateReplayRuntime :
             return last;
         }
 
-        var bid = dataSlice.TopTicks
-            .Where(x => x.Field == 1)
-            .Select(x => x.Price)
-            .LastOrDefault(x => x > 0);
-        var ask = dataSlice.TopTicks
-            .Where(x => x.Field == 2)
-            .Select(x => x.Price)
-            .LastOrDefault(x => x > 0);
-        if (bid > 0 && ask > 0)
+        if (bidPrice > 0 && askPrice > 0)
         {
-            return (bid + ask) / 2.0;
+            return (bidPrice + askPrice) / 2.0;
         }
 
         return dataSlice.HistoricalBars.LastOrDefault()?.Close ?? 0;
+    }
+
+    private static double ResolveBidPrice(StrategyDataSlice dataSlice)
+    {
+        return dataSlice.TopTicks
+            .Where(x => x.Field == 1)
+            .Select(x => x.Price)
+            .LastOrDefault(x => x > 0);
+    }
+
+    private static double ResolveAskPrice(StrategyDataSlice dataSlice)
+    {
+        return dataSlice.TopTicks
+            .Where(x => x.Field == 2)
+            .Select(x => x.Price)
+            .LastOrDefault(x => x > 0);
     }
 
     private static Ovl001FlattenConfig BuildOverlayConfigFromEnvironment()
@@ -243,6 +266,18 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_008_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_008_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_008_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg009LiquiditySpreadExitConfig BuildTradeManagementSpreadGuardConfigFromEnvironment()
+    {
+        return new Tmg009LiquiditySpreadExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_009_ENABLED", false),
+            SpreadTriggerPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_009_SPREAD_TRIGGER_PCT", 0.003)),
+            RequireUnrealizedLoss: TryReadEnvironmentBool("TMG_009_REQUIRE_UNREALIZED_LOSS", true),
+            MinAdverseMovePct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_009_MIN_ADVERSE_MOVE_PCT", 0.001)),
+            FlattenRoute: TryReadEnvironmentString("TMG_009_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_009_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_009_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
