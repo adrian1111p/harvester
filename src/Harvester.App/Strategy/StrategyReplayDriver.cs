@@ -10,7 +10,9 @@ public sealed record StrategyReplayInputRow(
     double High,
     double Low,
     double Close,
-    decimal Volume
+    decimal Volume,
+    double Bid = 0,
+    double Ask = 0
 );
 
 public sealed class StrategyReplayDriver
@@ -58,14 +60,40 @@ public sealed class StrategyReplayDriver
 
     private static StrategyDataSlice BuildSlice(StrategyReplayInputRow row, int index)
     {
-        var topTick = new TopTickRow(
+        var topTicks = new List<TopTickRow>();
+
+        if (row.Bid > 0)
+        {
+            topTicks.Add(new TopTickRow(
+                row.TimestampUtc,
+                790000 + index,
+                row.Symbol,
+                1,
+                row.Bid,
+                (int)Math.Max(0, Math.Min(int.MaxValue, row.Volume)),
+                row.Bid.ToString("F4")));
+        }
+
+        if (row.Ask > 0)
+        {
+            topTicks.Add(new TopTickRow(
+                row.TimestampUtc,
+                795000 + index,
+                row.Symbol,
+                2,
+                row.Ask,
+                (int)Math.Max(0, Math.Min(int.MaxValue, row.Volume)),
+                row.Ask.ToString("F4")));
+        }
+
+        topTicks.Add(new TopTickRow(
             row.TimestampUtc,
             800000 + index,
             row.Symbol,
             4,
             row.Close,
             (int)Math.Max(0, Math.Min(int.MaxValue, row.Volume)),
-            row.Close.ToString("F4"));
+            row.Close.ToString("F4")));
 
         var historicalBar = new HistoricalBarRow(
             row.TimestampUtc,
@@ -82,7 +110,8 @@ public sealed class StrategyReplayDriver
         return new StrategyDataSlice(
             row.TimestampUtc,
             "StrategyReplay",
-            [topTick],
+            topTicks,
+            [],
             [historicalBar],
             [],
             [],

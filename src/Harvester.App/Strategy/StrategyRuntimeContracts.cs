@@ -21,6 +21,7 @@ public sealed record StrategyDataSlice(
     DateTime TimestampUtc,
     string Mode,
     IReadOnlyList<TopTickRow> TopTicks,
+    IReadOnlyList<DepthRow> DepthRows,
     IReadOnlyList<HistoricalBarRow> HistoricalBars,
     IReadOnlyList<PositionRow> Positions,
     IReadOnlyList<AccountSummaryRow> AccountSummary,

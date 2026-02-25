@@ -199,6 +199,17 @@ public sealed class ScannerCandidateReplayRuntime :
 
     private static double ResolveBidPrice(StrategyDataSlice dataSlice)
     {
+        var depthBid = dataSlice.DepthRows
+            .Where(x => x.Side == 1 && x.Price > 0 && x.Size > 0)
+            .OrderByDescending(x => x.TimestampUtc)
+            .ThenBy(x => x.Position)
+            .Select(x => x.Price)
+            .FirstOrDefault();
+        if (depthBid > 0)
+        {
+            return depthBid;
+        }
+
         return dataSlice.TopTicks
             .Where(x => x.Field == 1)
             .Select(x => x.Price)
@@ -207,6 +218,17 @@ public sealed class ScannerCandidateReplayRuntime :
 
     private static double ResolveAskPrice(StrategyDataSlice dataSlice)
     {
+        var depthAsk = dataSlice.DepthRows
+            .Where(x => x.Side == 0 && x.Price > 0 && x.Size > 0)
+            .OrderByDescending(x => x.TimestampUtc)
+            .ThenBy(x => x.Position)
+            .Select(x => x.Price)
+            .FirstOrDefault();
+        if (depthAsk > 0)
+        {
+            return depthAsk;
+        }
+
         return dataSlice.TopTicks
             .Where(x => x.Field == 2)
             .Select(x => x.Price)

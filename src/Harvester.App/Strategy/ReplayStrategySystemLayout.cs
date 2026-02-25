@@ -1764,15 +1764,20 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         double? limitPrice = null;
         if (string.Equals(_orderType, "LMT", StringComparison.OrdinalIgnoreCase))
         {
-            if (context.MarkPrice <= 0)
+            var referenceBid = context.BidPrice > 0 ? context.BidPrice : context.MarkPrice;
+            var referenceAsk = context.AskPrice > 0 ? context.AskPrice : context.MarkPrice;
+            var reference = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+                ? referenceBid
+                : referenceAsk;
+            if (reference <= 0)
             {
                 return [];
             }
 
-            var offset = context.MarkPrice * (_limitOffsetBps / 10000.0);
+            var offset = reference * (_limitOffsetBps / 10000.0);
             limitPrice = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
-                ? Math.Max(0.0001, context.MarkPrice - offset)
-                : context.MarkPrice + offset;
+                ? Math.Max(0.0001, reference - offset)
+                : reference + offset;
         }
 
         _submittedSymbols.Add(symbol);

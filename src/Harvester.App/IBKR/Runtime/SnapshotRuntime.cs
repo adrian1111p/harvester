@@ -5843,6 +5843,7 @@ public sealed class SnapshotRuntime
             DateTime.UtcNow,
             mode,
             _wrapper.TopTicks.ToArray(),
+            _wrapper.DepthRows.ToArray(),
             _wrapper.HistoricalBars.ToArray(),
             _wrapper.Positions.ToArray(),
             _wrapper.AccountSummaryRows.ToArray(),

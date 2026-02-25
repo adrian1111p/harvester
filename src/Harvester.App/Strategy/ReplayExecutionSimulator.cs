@@ -373,6 +373,7 @@ public sealed class ReplayExecutionSimulator
         var markPrice = bar is not null
             ? bar.Close
             : (slice.TopTicks.FirstOrDefault()?.Price ?? 0);
+        var (bestBidPrice, bestAskPrice) = ResolveBestBidAsk(slice, bar, markPrice);
         var availableSliceQuantity = bar is null
             ? double.MaxValue
             : Math.Max(0, (double)bar.Volume * _maxFillParticipationRate);
@@ -536,6 +537,8 @@ public sealed class ReplayExecutionSimulator
                 slice,
                 bar,
                 markPrice,
+                bestBidPrice,
+                bestAskPrice,
                 isSessionOpenSlice,
                 borrowLocateProfile,
                 fills,
@@ -590,7 +593,7 @@ public sealed class ReplayExecutionSimulator
             }
 
             var executableIntent = GetExecutableIntent(active, slice.TimestampUtc);
-            var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice, isSessionOpenSlice);
+            var fillPrice = ResolveFillPrice(executableIntent, bar, markPrice, bestBidPrice, bestAskPrice, isSessionOpenSlice);
             if (fillPrice is null)
             {
                 if (IsImmediateOrCancelTimeInForce(active.Intent.TimeInForce))
@@ -851,6 +854,8 @@ public sealed class ReplayExecutionSimulator
         StrategyDataSlice slice,
         HistoricalBarRow? bar,
         double markPrice,
+        double bestBidPrice,
+        double bestAskPrice,
         bool isSessionOpenSlice,
         ReplayBorrowLocateProfileRow borrowLocateProfile,
         List<ReplayFillRow> fills,
@@ -912,7 +917,7 @@ public sealed class ReplayExecutionSimulator
         var pricedLegs = new List<(ActiveReplayOrder Active, ReplayOrderIntent Intent, double FillPrice)>();
         foreach (var leg in executableLegs)
         {
-            var fillPrice = ResolveFillPrice(leg.Intent, bar, markPrice, isSessionOpenSlice);
+            var fillPrice = ResolveFillPrice(leg.Intent, bar, markPrice, bestBidPrice, bestAskPrice, isSessionOpenSlice);
             if (!fillPrice.HasValue)
             {
                 if (IsImmediateOrCancelTimeInForce(leg.Active.Intent.TimeInForce))
@@ -2024,7 +2029,13 @@ public sealed class ReplayExecutionSimulator
         return applied;
     }
 
-    private double? ResolveFillPrice(ReplayOrderIntent intent, HistoricalBarRow? bar, double markPrice, bool isSessionOpenSlice)
+    private double? ResolveFillPrice(
+        ReplayOrderIntent intent,
+        HistoricalBarRow? bar,
+        double markPrice,
+        double bestBidPrice,
+        double bestAskPrice,
+        bool isSessionOpenSlice)
     {
         var side = ParseSide(intent.Side);
         if (side == 0)
@@ -2066,6 +2077,12 @@ public sealed class ReplayExecutionSimulator
             }
 
             var limit = intent.LimitPrice.Value;
+            var quoteFill = ResolveQuoteBasedLimitFill(side, limit, bestBidPrice, bestAskPrice);
+            if (quoteFill.HasValue)
+            {
+                return quoteFill;
+            }
+
             if (bar is null)
             {
                 var canFillNoBar = side > 0 ? markPrice <= limit : markPrice >= limit;
@@ -2085,6 +2102,84 @@ public sealed class ReplayExecutionSimulator
 
         var slippageFactor = 1 + (side * (_slippageBps / 10000.0));
         return QuantizePrice(markPrice * slippageFactor);
+    }
+
+    private double? ResolveQuoteBasedLimitFill(int side, double limitPrice, double bestBidPrice, double bestAskPrice)
+    {
+        if (side > 0)
+        {
+            if (bestAskPrice > 0 && bestAskPrice <= limitPrice)
+            {
+                return QuantizePrice(Math.Min(limitPrice, bestAskPrice));
+            }
+
+            if (bestBidPrice > 0 && bestBidPrice <= limitPrice)
+            {
+                return QuantizePrice(Math.Min(limitPrice, bestBidPrice));
+            }
+
+            return null;
+        }
+
+        if (bestBidPrice > 0 && bestBidPrice >= limitPrice)
+        {
+            return QuantizePrice(Math.Max(limitPrice, bestBidPrice));
+        }
+
+        if (bestAskPrice > 0 && bestAskPrice >= limitPrice)
+        {
+            return QuantizePrice(Math.Max(limitPrice, bestAskPrice));
+        }
+
+        return null;
+    }
+
+    private static (double Bid, double Ask) ResolveBestBidAsk(StrategyDataSlice slice, HistoricalBarRow? bar, double markPrice)
+    {
+        var depthBid = slice.DepthRows
+            .Where(x => x.Side == 1 && x.Price > 0 && x.Size > 0)
+            .OrderByDescending(x => x.TimestampUtc)
+            .ThenBy(x => x.Position)
+            .Select(x => x.Price)
+            .FirstOrDefault();
+
+        var depthAsk = slice.DepthRows
+            .Where(x => x.Side == 0 && x.Price > 0 && x.Size > 0)
+            .OrderByDescending(x => x.TimestampUtc)
+            .ThenBy(x => x.Position)
+            .Select(x => x.Price)
+            .FirstOrDefault();
+
+        var l1Bid = slice.TopTicks
+            .Where(x => x.Field == 1 && x.Price > 0)
+            .Select(x => x.Price)
+            .LastOrDefault();
+
+        var l1Ask = slice.TopTicks
+            .Where(x => x.Field == 2 && x.Price > 0)
+            .Select(x => x.Price)
+            .LastOrDefault();
+
+        var bid = depthBid > 0 ? depthBid : l1Bid;
+        var ask = depthAsk > 0 ? depthAsk : l1Ask;
+
+        if (bid <= 0 || ask <= 0)
+        {
+            if (bar is not null && bar.Close > 0)
+            {
+                var halfSpread = Math.Max(0.0001, bar.Close * 0.0005);
+                bid = bid > 0 ? bid : bar.Close - halfSpread;
+                ask = ask > 0 ? ask : bar.Close + halfSpread;
+            }
+            else if (markPrice > 0)
+            {
+                var halfSpread = Math.Max(0.0001, markPrice * 0.0005);
+                bid = bid > 0 ? bid : markPrice - halfSpread;
+                ask = ask > 0 ? ask : markPrice + halfSpread;
+            }
+        }
+
+        return (Math.Max(0, bid), Math.Max(0, ask));
     }
 
     private double QuantizePrice(double price)
