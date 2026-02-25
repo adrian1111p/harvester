@@ -55,9 +55,43 @@ public interface IReplayTradeManagementStrategy
     IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
 }
 
+public sealed record Tmg001BracketConfig(
+    bool Enabled,
+    double StopLossPct,
+    double TakeProfitPct,
+    string TimeInForce
+)
+{
+    public static Tmg001BracketConfig Default { get; } = new(
+        Enabled: true,
+        StopLossPct: 0.003,
+        TakeProfitPct: 0.006,
+        TimeInForce: "DAY");
+}
+
 public interface IReplayEndOfDayStrategy
 {
     IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
+}
+
+public sealed record Eod001ForceFlatConfig(
+    bool Enabled,
+    int SessionCloseHourUtc,
+    int SessionCloseMinuteUtc,
+    int FlattenLeadMinutes,
+    string FlattenRoute,
+    string FlattenTif,
+    string FlattenOrderType
+)
+{
+    public static Eod001ForceFlatConfig Default { get; } = new(
+        Enabled: true,
+        SessionCloseHourUtc: 21,
+        SessionCloseMinuteUtc: 0,
+        FlattenLeadMinutes: 5,
+        FlattenRoute: "SMART",
+        FlattenTif: "DAY+",
+        FlattenOrderType: "MARKET");
 }
 
 public sealed class ReplayDayTradingPipeline
@@ -564,5 +598,219 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         return normalized is "DAY" or "DAY+" or "GTC" or "IOC" or "FOK"
             ? normalized
             : "DAY";
+    }
+}
+
+public sealed class Tmg001BracketExitStrategy : IReplayTradeManagementStrategy
+{
+    public const string StrategyId = "TMG_001_BRACKET_EXIT";
+
+    private readonly Tmg001BracketConfig _config;
+    private readonly Dictionary<string, BracketState> _stateBySymbol;
+
+    public Tmg001BracketExitStrategy(Tmg001BracketConfig? config = null)
+    {
+        _config = config ?? Tmg001BracketConfig.Default;
+        _stateBySymbol = new Dictionary<string, BracketState>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context)
+    {
+        if (!_config.Enabled)
+        {
+            return [];
+        }
+
+        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            return [];
+        }
+
+        if (Math.Abs(context.PositionQuantity) <= 1e-9)
+        {
+            _stateBySymbol.Remove(symbol);
+            return [];
+        }
+
+        var shares = Math.Abs(context.PositionQuantity);
+        var side = context.PositionQuantity > 0 ? "LONG" : "SHORT";
+        var entry = context.AveragePrice;
+        if (entry <= 0)
+        {
+            return [];
+        }
+
+        var needsRefresh = true;
+        if (_stateBySymbol.TryGetValue(symbol, out var existing))
+        {
+            needsRefresh = !string.Equals(existing.Side, side, StringComparison.OrdinalIgnoreCase)
+                || Math.Abs(existing.Shares - shares) > 1e-9;
+        }
+
+        if (!needsRefresh)
+        {
+            return [];
+        }
+
+        var ocoGroup = $"{StrategyId}:{symbol}:{context.TimestampUtc:yyyyMMddHHmmssfff}";
+        var exitSide = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+        var limitPrice = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? entry * (1.0 + _config.TakeProfitPct)
+            : entry * (1.0 - _config.TakeProfitPct);
+        var stopPrice = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? entry * (1.0 - _config.StopLossPct)
+            : entry * (1.0 + _config.StopLossPct);
+
+        var orders = new List<ReplayOrderIntent>();
+        if (existing is not null)
+        {
+            orders.Add(new ReplayOrderIntent(
+                TimestampUtc: context.TimestampUtc,
+                Symbol: symbol,
+                Side: string.Empty,
+                Quantity: 0,
+                OrderType: "CANCEL",
+                LimitPrice: null,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.TimeInForce,
+                ExpireAtUtc: null,
+                Source: $"trade-management:{StrategyId}:refresh-cancel"));
+        }
+
+        orders.Add(new ReplayOrderIntent(
+            TimestampUtc: context.TimestampUtc,
+            Symbol: symbol,
+            Side: exitSide,
+            Quantity: shares,
+            OrderType: "LMT",
+            LimitPrice: limitPrice,
+            StopPrice: null,
+            TrailAmount: null,
+            TrailPercent: null,
+            TimeInForce: _config.TimeInForce,
+            ExpireAtUtc: null,
+            Source: $"trade-management:{StrategyId}:take-profit",
+            OcoGroup: ocoGroup));
+
+        orders.Add(new ReplayOrderIntent(
+            TimestampUtc: context.TimestampUtc,
+            Symbol: symbol,
+            Side: exitSide,
+            Quantity: shares,
+            OrderType: "STP",
+            LimitPrice: null,
+            StopPrice: stopPrice,
+            TrailAmount: null,
+            TrailPercent: null,
+            TimeInForce: _config.TimeInForce,
+            ExpireAtUtc: null,
+            Source: $"trade-management:{StrategyId}:stop-loss",
+            OcoGroup: ocoGroup));
+
+        _stateBySymbol[symbol] = new BracketState(side, shares, ocoGroup);
+        return orders;
+    }
+
+    private sealed record BracketState(
+        string Side,
+        double Shares,
+        string OcoGroup
+    );
+}
+
+public sealed class Eod001ForceFlatStrategy : IReplayEndOfDayStrategy
+{
+    public const string StrategyId = "EOD_001_FORCE_FLAT";
+
+    private readonly Eod001ForceFlatConfig _config;
+    private readonly HashSet<string> _flattenedBySymbolAndDate;
+
+    public Eod001ForceFlatStrategy(Eod001ForceFlatConfig? config = null)
+    {
+        _config = config ?? Eod001ForceFlatConfig.Default;
+        _flattenedBySymbolAndDate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context)
+    {
+        if (!_config.Enabled)
+        {
+            return [];
+        }
+
+        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(symbol) || Math.Abs(context.PositionQuantity) <= 1e-9)
+        {
+            return [];
+        }
+
+        var ts = context.TimestampUtc;
+        var sessionCloseUtc = new DateTime(
+            ts.Year,
+            ts.Month,
+            ts.Day,
+            Math.Clamp(_config.SessionCloseHourUtc, 0, 23),
+            Math.Clamp(_config.SessionCloseMinuteUtc, 0, 59),
+            0,
+            DateTimeKind.Utc);
+        var triggerAtUtc = sessionCloseUtc.AddMinutes(-Math.Max(0, _config.FlattenLeadMinutes));
+        if (ts < triggerAtUtc)
+        {
+            return [];
+        }
+
+        var key = $"{symbol}:{ts:yyyyMMdd}";
+        if (_flattenedBySymbolAndDate.Contains(key))
+        {
+            return [];
+        }
+
+        _flattenedBySymbolAndDate.Add(key);
+
+        var qty = Math.Abs(context.PositionQuantity);
+        var flattenSide = context.PositionQuantity > 0 ? "SELL" : "BUY";
+        var flattenOrderType = string.Equals(_config.FlattenOrderType, "MARKETABLE_LIMIT", StringComparison.OrdinalIgnoreCase)
+            ? "LMT"
+            : "MKT";
+        var flattenLimitPrice = flattenOrderType == "LMT"
+            ? (flattenSide == "BUY"
+                ? context.MarkPrice * 1.001
+                : context.MarkPrice * 0.999)
+            : (double?)null;
+
+        return
+        [
+            new ReplayOrderIntent(
+                TimestampUtc: ts,
+                Symbol: symbol,
+                Side: string.Empty,
+                Quantity: 0,
+                OrderType: "CANCEL",
+                LimitPrice: null,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"end-of-day:{StrategyId}:cancel",
+                Route: _config.FlattenRoute),
+            new ReplayOrderIntent(
+                TimestampUtc: ts,
+                Symbol: symbol,
+                Side: flattenSide,
+                Quantity: qty,
+                OrderType: flattenOrderType,
+                LimitPrice: flattenLimitPrice,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"end-of-day:{StrategyId}:flatten",
+                Route: _config.FlattenRoute)
+        ];
     }
 }

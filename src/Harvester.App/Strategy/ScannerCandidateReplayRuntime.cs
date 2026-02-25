@@ -33,11 +33,13 @@ public sealed class ScannerCandidateReplayRuntime :
             orderType,
             timeInForce,
             limitOffsetBps);
+        var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
+        var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [],
-            endOfDayStrategies: []);
+            tradeManagementStrategies: [tradeManagement],
+            endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
     }
@@ -147,6 +149,27 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("OVL_001_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("OVL_001_FLATTEN_TIF", "DAY+"),
             FlattenOrderType: TryReadEnvironmentString("OVL_001_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg001BracketConfig BuildTradeManagementConfigFromEnvironment()
+    {
+        return new Tmg001BracketConfig(
+            Enabled: TryReadEnvironmentBool("TMG_001_ENABLED", true),
+            StopLossPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_STOP_LOSS_PCT", 0.003)),
+            TakeProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_TAKE_PROFIT_PCT", 0.006)),
+            TimeInForce: TryReadEnvironmentString("TMG_001_TIF", "DAY").ToUpperInvariant());
+    }
+
+    private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
+    {
+        return new Eod001ForceFlatConfig(
+            Enabled: TryReadEnvironmentBool("EOD_001_ENABLED", true),
+            SessionCloseHourUtc: Math.Clamp(TryReadEnvironmentInt("EOD_001_SESSION_CLOSE_HOUR_UTC", 21), 0, 23),
+            SessionCloseMinuteUtc: Math.Clamp(TryReadEnvironmentInt("EOD_001_SESSION_CLOSE_MINUTE_UTC", 0), 0, 59),
+            FlattenLeadMinutes: Math.Max(0, TryReadEnvironmentInt("EOD_001_FLATTEN_LEAD_MINUTES", 5)),
+            FlattenRoute: TryReadEnvironmentString("EOD_001_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("EOD_001_FLATTEN_TIF", "DAY+"),
+            FlattenOrderType: TryReadEnvironmentString("EOD_001_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static bool TryReadEnvironmentBool(string name, bool fallback)
