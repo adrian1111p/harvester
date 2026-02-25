@@ -36,11 +36,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
         var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
         var tradeManagementTrailing = new Tmg003TrailingProgressionStrategy(BuildTradeManagementTrailingConfigFromEnvironment());
+        var tradeManagementPartialRunner = new Tmg004PartialTakeProfitRunnerTrailStrategy(BuildTradeManagementPartialRunnerConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -178,6 +179,17 @@ public sealed class ScannerCandidateReplayRuntime :
             TriggerProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_003_TRIGGER_PROFIT_PCT", 0.006)),
             TrailOffsetPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_003_TRAIL_OFFSET_PCT", 0.002)),
             TimeInForce: TryReadEnvironmentString("TMG_003_TIF", "DAY").ToUpperInvariant());
+    }
+
+    private static Tmg004PartialTakeProfitRunnerTrailConfig BuildTradeManagementPartialRunnerConfigFromEnvironment()
+    {
+        return new Tmg004PartialTakeProfitRunnerTrailConfig(
+            Enabled: TryReadEnvironmentBool("TMG_004_ENABLED", false),
+            TriggerProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_004_TRIGGER_PROFIT_PCT", 0.008)),
+            TakeProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_004_TAKE_PROFIT_PCT", 0.008)),
+            TakeProfitFraction: Math.Clamp(TryReadEnvironmentDouble("TMG_004_TAKE_PROFIT_FRACTION", 0.5), 0.0, 1.0),
+            RunnerTrailOffsetPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_004_RUNNER_TRAIL_OFFSET_PCT", 0.002)),
+            TimeInForce: TryReadEnvironmentString("TMG_004_TIF", "DAY").ToUpperInvariant());
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
