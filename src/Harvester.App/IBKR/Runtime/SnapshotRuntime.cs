@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using System.Text;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Globalization;
 using ClosedXML.Excel;
 using Harvester.App.IBKR.Broker;
 using Harvester.App.IBKR.Connection;
@@ -3901,6 +3902,11 @@ public sealed class SnapshotRuntime
             replayOrderCancellationRows.AddRange(simulation.Cancellations);
             replayPortfolioRows.Add(simulation.Portfolio);
 
+            if (_strategyRuntime is IReplaySimulationFeedbackSink replayFeedbackSink)
+            {
+                replayFeedbackSink.OnReplaySliceResult(slice, simulation, activeSymbol);
+            }
+
             if (_options.ReplayIntervalSeconds > 0)
             {
                 await Task.Delay(TimeSpan.FromSeconds(_options.ReplayIntervalSeconds), token);
@@ -3936,6 +3942,7 @@ public sealed class SnapshotRuntime
         var replayPacketsPath = Path.Combine(outputDir, $"strategy_replay_performance_packets_{timestamp}.json");
         var replaySummaryPath = Path.Combine(outputDir, $"strategy_replay_performance_summary_{timestamp}.json");
         var replayValidationSummaryPath = Path.Combine(outputDir, $"strategy_replay_validation_summary_{timestamp}.json");
+        var replayScannerSelectionPath = Path.Combine(outputDir, $"strategy_replay_scanner_symbol_selection_{timestamp}.json");
         var replayLimitOrderCaseMatrixPath = Path.Combine(outputDir, $"strategy_replay_limit_order_case_matrix_{timestamp}.json");
         var replaySelfLearningSamplesPath = Path.Combine(outputDir, $"strategy_replay_self_learning_samples_{timestamp}.json");
         var replaySelfLearningPredictionsPath = Path.Combine(outputDir, $"strategy_replay_self_learning_predictions_{timestamp}.json");
@@ -4060,6 +4067,8 @@ public sealed class SnapshotRuntime
             selfLearningStore,
             selfLearningGovernance,
             performance.Summary,
+            slices.Count,
+            performance.Packets.Count,
             strategyContext.Symbol);
         var strategySourceCounts = replayOrderRows
             .GroupBy(x => string.IsNullOrWhiteSpace(x.Source) ? "unknown" : x.Source.Trim(), StringComparer.OrdinalIgnoreCase)
@@ -4122,6 +4131,10 @@ public sealed class SnapshotRuntime
         WriteJson(replayPacketsPath, performance.Packets);
         WriteJson(replaySummaryPath, new[] { performance.Summary });
         WriteJson(replayValidationSummaryPath, replayValidationSummary);
+        if (_strategyRuntime is IReplayScannerSelectionSource scannerSelectionSource)
+        {
+            WriteJson(replayScannerSelectionPath, new[] { scannerSelectionSource.GetScannerSelectionSnapshot() });
+        }
         WriteJson(replayLimitOrderCaseMatrixPath, replayLimitOrderCaseMatrixRows);
         WriteJson(replaySelfLearningSamplesPath, selfLearning.Samples);
         WriteJson(replaySelfLearningPredictionsPath, selfLearning.Predictions);
@@ -4158,6 +4171,10 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay performance packets export: {replayPacketsPath} (rows={performance.Packets.Count})");
         Console.WriteLine($"[OK] Strategy replay performance summary export: {replaySummaryPath}");
         Console.WriteLine($"[OK] Strategy replay validation summary export: {replayValidationSummaryPath}");
+        if (_strategyRuntime is IReplayScannerSelectionSource)
+        {
+            Console.WriteLine($"[OK] Strategy replay scanner symbol selection export: {replayScannerSelectionPath}");
+        }
         Console.WriteLine($"[OK] Strategy replay limit-order case matrix export: {replayLimitOrderCaseMatrixPath} (rows={replayLimitOrderCaseMatrixRows.Length})");
         Console.WriteLine($"[OK] Strategy replay self-learning samples export: {replaySelfLearningSamplesPath} (rows={selfLearning.Samples.Count})");
         Console.WriteLine($"[OK] Strategy replay self-learning predictions export: {replaySelfLearningPredictionsPath} (rows={selfLearning.Predictions.Count})");
@@ -4248,6 +4265,8 @@ public sealed class SnapshotRuntime
         ReplaySelfLearningStoreRow store,
         ReplaySelfLearningPromotionGovernanceRow governance,
         ReplayPerformanceSummaryRow performanceSummary,
+        int replaySliceCount,
+        int replayPacketCount,
         string defaultSymbol)
     {
         var nowNs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000;
@@ -4257,6 +4276,22 @@ public sealed class SnapshotRuntime
             ["shadow"] = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_SHADOW", 1)),
             ["staged"] = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_PROMOTE_MIN_RUNS_STAGED", 1))
         };
+
+        var driftWinrateDropWarn = Math.Max(0.0, TryReadEnvironmentDouble("SELF_LEARNING_DRIFT_WINRATE_DROP_WARN", 0.15));
+        var driftPnlDropWarn = Math.Max(0.0, TryReadEnvironmentDouble("SELF_LEARNING_DRIFT_PNL_DROP_WARN", 50.0));
+        var rollbackConsecutiveDrift = Math.Max(1, TryReadEnvironmentInt("SELF_LEARNING_ROLLBACK_CONSECUTIVE_DRIFT", 2));
+        var qualityMinDecodeRatio = Math.Clamp(TryReadEnvironmentDouble("SELF_LEARNING_MIN_DECODE_RATIO", 0.95), 0.0, 1.0);
+        var qualityMaxParseFailRatio = Math.Clamp(TryReadEnvironmentDouble("SELF_LEARNING_MAX_PARSE_FAIL_RATIO", 0.05), 0.0, 1.0);
+        var lineageRequireClean = TryReadEnvironmentBool("SELF_LEARNING_LINEAGE_REQUIRE_CLEAN", false);
+        var lineageRequireTraceId = TryReadEnvironmentBool("SELF_LEARNING_LINEAGE_REQUIRE_TRACE_ID", false);
+        var lineageMinTraceCoverage = Math.Clamp(TryReadEnvironmentDouble("SELF_LEARNING_LINEAGE_MIN_TRACE_COVERAGE", 0.80), 0.0, 1.0);
+        var lineageMaxParseFailRatio = Math.Clamp(TryReadEnvironmentDouble("SELF_LEARNING_LINEAGE_MAX_PARSE_FAIL_RATIO", 0.10), 0.0, 1.0);
+        var lineageUpstreamPrefixes = ParseEnvironmentCsv(
+            "SELF_LEARNING_LINEAGE_UPSTREAM_PREFIXES",
+            ["md.trades.", "md.l2.", "bars.", "feat.frame."]);
+        var lineageContaminationTokens = ParseEnvironmentCsv(
+            "SELF_LEARNING_LINEAGE_CONTAMINATION_TOKENS",
+            ["replay", "sim", "paper", "mock", "synthetic", "test"]);
 
         var stageOrder = new[] { "candidate", "shadow", "staged", "production" };
         var lifecycle = LoadJsonSingletonOrArray<ReplaySelfLearningLifecycleRow>(lifecycleStorePath)
@@ -4295,20 +4330,44 @@ public sealed class SnapshotRuntime
             .Where(x => string.Equals(x.Stage, currentStage, StringComparison.OrdinalIgnoreCase))
             .TakeLast(10)
             .ToArray();
+        var datasetDir = _options.ReplayInputPath ?? string.Empty;
+
+        var decodeRatio = replaySliceCount > 0 ? 1.0 : 0.0;
+        var parseFailRatio = 0.0;
+        var replayInputText = (_options.ReplayInputPath ?? string.Empty).Trim();
+        var contaminationFlags = lineageContaminationTokens
+            .Where(token => !string.IsNullOrWhiteSpace(token)
+                && replayInputText.Contains(token, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var contaminationDetected = contaminationFlags.Length > 0;
+        var traceCoverage = replayPacketCount > 0 ? 1.0 : 0.0;
+        var traceCoveragePassed = !lineageRequireTraceId || traceCoverage >= lineageMinTraceCoverage;
+        var feeds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["bars."] = replaySliceCount,
+            ["feat.frame."] = replayPacketCount,
+            ["md.trades."] = replaySliceCount,
+            ["md.l2."] = replaySliceCount
+        };
+        var lineagePassed = (!lineageRequireClean || !contaminationDetected)
+            && traceCoveragePassed
+            && parseFailRatio <= lineageMaxParseFailRatio;
 
         var baselineWinRate = stageHistory.Length == 0 ? 0 : stageHistory.Average(x => x.WinRate);
         var baselinePnl = stageHistory.Length == 0 ? 0 : stageHistory.Average(x => x.PnlSum);
         var winRateNow = performanceSummary.WinRate;
         var pnlNow = store.LastTradeClosedPnlSum;
         var driftDetected = stageHistory.Length > 0
-            && (winRateNow < baselineWinRate - 0.10
-                || pnlNow < baselinePnl - Math.Max(0.01, Math.Abs(baselinePnl) * 0.25));
+            && (winRateNow < baselineWinRate - driftWinrateDropWarn
+                || pnlNow < baselinePnl - Math.Max(driftPnlDropWarn, Math.Abs(baselinePnl) * 0.25));
         var driftReasons = new List<string>();
-        if (stageHistory.Length > 0 && winRateNow < baselineWinRate - 0.10)
+        if (stageHistory.Length > 0 && winRateNow < baselineWinRate - driftWinrateDropWarn)
         {
             driftReasons.Add("win_rate_drop");
         }
-        if (stageHistory.Length > 0 && pnlNow < baselinePnl - Math.Max(0.01, Math.Abs(baselinePnl) * 0.25))
+        if (stageHistory.Length > 0 && pnlNow < baselinePnl - Math.Max(driftPnlDropWarn, Math.Abs(baselinePnl) * 0.25))
         {
             driftReasons.Add("pnl_drop");
         }
@@ -4325,7 +4384,36 @@ public sealed class SnapshotRuntime
         ReplaySelfLearningPromotionApprovalMetaRow approvalMeta;
         ReplaySelfLearningPromotionHumanWorkflowMetaRow humanMeta;
 
-        var qualityPassed = true;
+        var qualityPassed = decodeRatio >= qualityMinDecodeRatio && parseFailRatio <= qualityMaxParseFailRatio;
+        if (lineageRequireClean)
+        {
+            qualityPassed = qualityPassed && lineagePassed;
+        }
+
+        if (currentStage is "staged" or "production" && consecutiveDrift >= rollbackConsecutiveDrift)
+        {
+            var stageIndex = Array.FindIndex(stageOrder, x => string.Equals(x, currentStage, StringComparison.OrdinalIgnoreCase));
+            if (stageIndex > 0)
+            {
+                var rolledBackTo = stageOrder[stageIndex - 1];
+                events.Add(new ReplaySelfLearningLifecycleEventRow(
+                    TsNs: nowNs,
+                    DatasetDir: datasetDir,
+                    Type: "rollback",
+                    From: currentStage,
+                    To: rolledBackTo,
+                    Reason: "drift_consecutive_threshold",
+                    StageRuns: history.Count(x => string.Equals(x.Stage, currentStage, StringComparison.OrdinalIgnoreCase)),
+                    RequiredRuns: rollbackConsecutiveDrift,
+                    ModelId: governance.ModelId,
+                    Approval: BuildReplayPromotionApprovalMeta(governance),
+                    HumanWorkflow: BuildReplayPromotionHumanWorkflowMeta(governance)));
+                previousStage = currentStage;
+                currentStage = rolledBackTo;
+                consecutiveDrift = 0;
+            }
+        }
+
         if (qualityPassed && !driftDetected)
         {
             var stageIndex = Array.FindIndex(stageOrder, x => string.Equals(x, currentStage, StringComparison.OrdinalIgnoreCase));
@@ -4359,7 +4447,7 @@ public sealed class SnapshotRuntime
 
                     events.Add(new ReplaySelfLearningLifecycleEventRow(
                         TsNs: nowNs,
-                        DatasetDir: _options.ReplayInputPath,
+                        DatasetDir: datasetDir,
                         Type: eventType,
                         From: governance.CurrentStage,
                         To: governance.TargetStage,
@@ -4386,7 +4474,7 @@ public sealed class SnapshotRuntime
 
         var lifecycleEntry = new ReplaySelfLearningLifecycleHistoryRow(
             TsNs: nowNs,
-            DatasetDir: _options.ReplayInputPath,
+            DatasetDir: datasetDir,
             ModelId: governance.ModelId,
             Stage: currentStage,
             TradeCount: store.LastTradeClosedCount,
@@ -4396,6 +4484,19 @@ public sealed class SnapshotRuntime
             DriftDetected: driftDetected,
             DriftReasons: driftReasons,
             ConsecutiveDrift: consecutiveDrift,
+            DecodeRatio: decodeRatio,
+            ParseFailRatio: parseFailRatio,
+            Lineage: new ReplaySelfLearningLineageRow(
+                RequiredUpstreamPrefixes: lineageUpstreamPrefixes,
+                RequireTraceId: lineageRequireTraceId,
+                MinTraceCoverage: lineageMinTraceCoverage,
+                MaxParseFailRatio: lineageMaxParseFailRatio,
+                RequireClean: lineageRequireClean,
+                ContaminationDetected: contaminationDetected,
+                Passed: lineagePassed,
+                TraceCoverage: traceCoverage,
+                Flags: contaminationFlags,
+                Feeds: feeds),
             PromotionApproval: approvalMeta,
             PromotionHumanWorkflow: humanMeta,
             Baseline: new ReplaySelfLearningLifecycleBaselineRow(
@@ -4420,6 +4521,26 @@ public sealed class SnapshotRuntime
             CurrentStage: currentStage,
             PreviousStage: previousStage,
             ConsecutiveDrift: consecutiveDrift,
+            Drift: new ReplaySelfLearningDriftControlsRow(
+                Active: driftDetected,
+                Reasons: driftReasons,
+                RollbackThreshold: rollbackConsecutiveDrift,
+                WinrateDropWarn: driftWinrateDropWarn,
+                PnlDropWarn: driftPnlDropWarn),
+            QualityControls: new ReplaySelfLearningQualityControlsRow(
+                MinDecodeRatio: qualityMinDecodeRatio,
+                MaxParseFailRatio: qualityMaxParseFailRatio,
+                Passed: qualityPassed),
+            LineageControls: new ReplaySelfLearningLineageControlsRow(
+                RequiredUpstreamPrefixes: lineageUpstreamPrefixes,
+                RequireTraceId: lineageRequireTraceId,
+                MinTraceCoverage: lineageMinTraceCoverage,
+                MaxParseFailRatio: lineageMaxParseFailRatio,
+                RequireClean: lineageRequireClean,
+                ContaminationDetected: contaminationDetected,
+                Passed: lineagePassed,
+                Flags: contaminationFlags,
+                Feeds: feeds),
             PromotionMinRuns: minRuns,
             LastRun: lifecycleEntry,
             History: history,
@@ -4461,7 +4582,7 @@ public sealed class SnapshotRuntime
                 UpdatedTsNs: nowNs,
                 Runs: 0,
                 CurrentStage: currentStage,
-                LatestDatasetDir: _options.ReplayInputPath,
+                LatestDatasetDir: datasetDir,
                 LatestMetrics: new ReplaySelfLearningModelRegistryMetricsRow(performanceSummary.WinRate, store.LastTradeClosedPnlSum, store.LastTradeClosedCount),
                 LastPromotionApproval: approvalMeta,
                 LastPromotionHumanWorkflow: humanMeta,
@@ -4487,7 +4608,7 @@ public sealed class SnapshotRuntime
             UpdatedTsNs = nowNs,
             Runs = Math.Max(0, modelRecord.Runs) + 1,
             CurrentStage = currentStage,
-            LatestDatasetDir = _options.ReplayInputPath,
+            LatestDatasetDir = datasetDir,
             LatestMetrics = new ReplaySelfLearningModelRegistryMetricsRow(
                 WinRate: performanceSummary.WinRate,
                 PnlSum: store.LastTradeClosedPnlSum,
@@ -4884,6 +5005,47 @@ public sealed class SnapshotRuntime
         }
 
         return int.TryParse(value, out var parsed) ? parsed : fallback;
+    }
+
+    private static double TryReadEnvironmentDouble(string name, double fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private static string[] ParseEnvironmentCsv(string name, IReadOnlyList<string> fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        var parsed = value
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return parsed.Length == 0
+            ? fallback
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray()
+            : parsed;
     }
 
     private static string BuildReplaySelfLearningModelId(
@@ -8055,7 +8217,49 @@ public sealed record ReplaySelfLearningLifecycleHistoryRow(
     int ConsecutiveDrift,
     ReplaySelfLearningPromotionApprovalMetaRow PromotionApproval,
     ReplaySelfLearningPromotionHumanWorkflowMetaRow PromotionHumanWorkflow,
-    ReplaySelfLearningLifecycleBaselineRow Baseline
+    ReplaySelfLearningLifecycleBaselineRow Baseline,
+    double DecodeRatio = 1.0,
+    double ParseFailRatio = 0.0,
+    ReplaySelfLearningLineageRow? Lineage = null
+);
+
+public sealed record ReplaySelfLearningLineageRow(
+    IReadOnlyList<string> RequiredUpstreamPrefixes,
+    bool RequireTraceId,
+    double MinTraceCoverage,
+    double MaxParseFailRatio,
+    bool RequireClean,
+    bool ContaminationDetected,
+    bool Passed,
+    double TraceCoverage,
+    IReadOnlyList<string> Flags,
+    IReadOnlyDictionary<string, int> Feeds
+);
+
+public sealed record ReplaySelfLearningDriftControlsRow(
+    bool Active,
+    IReadOnlyList<string> Reasons,
+    int RollbackThreshold,
+    double WinrateDropWarn,
+    double PnlDropWarn
+);
+
+public sealed record ReplaySelfLearningQualityControlsRow(
+    double MinDecodeRatio,
+    double MaxParseFailRatio,
+    bool Passed
+);
+
+public sealed record ReplaySelfLearningLineageControlsRow(
+    IReadOnlyList<string> RequiredUpstreamPrefixes,
+    bool RequireTraceId,
+    double MinTraceCoverage,
+    double MaxParseFailRatio,
+    bool RequireClean,
+    bool ContaminationDetected,
+    bool Passed,
+    IReadOnlyList<string> Flags,
+    IReadOnlyDictionary<string, int> Feeds
 );
 
 public sealed record ReplaySelfLearningLifecycleEventRow(
@@ -8097,7 +8301,10 @@ public sealed record ReplaySelfLearningLifecycleRow(
     ReplaySelfLearningLifecycleHistoryRow? LastRun,
     IReadOnlyList<ReplaySelfLearningLifecycleHistoryRow> History,
     IReadOnlyList<ReplaySelfLearningLifecycleEventRow> Events,
-    ReplaySelfLearningLifecycleModelRegistryRow ModelRegistry
+    ReplaySelfLearningLifecycleModelRegistryRow ModelRegistry,
+    ReplaySelfLearningDriftControlsRow? Drift = null,
+    ReplaySelfLearningQualityControlsRow? QualityControls = null,
+    ReplaySelfLearningLineageControlsRow? LineageControls = null
 );
 
 public sealed record ReplaySelfLearningModelRegistryMetricsRow(

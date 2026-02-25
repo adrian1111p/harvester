@@ -1,0 +1,568 @@
+using System.Text.Json;
+using Harvester.App.IBKR.Runtime;
+
+namespace Harvester.App.Strategy;
+
+public sealed record ReplayScannerRankedSymbolRow(
+    string Symbol,
+    double WeightedScore,
+    bool Eligible,
+    double AverageRank
+);
+
+public sealed record ReplayScannerSymbolSelectionSnapshotRow(
+    DateTime TimestampUtc,
+    string SourcePath,
+    IReadOnlyList<ReplayScannerRankedSymbolRow> RankedSymbols,
+    IReadOnlyList<string> SelectedSymbols
+);
+
+public interface IReplayScannerSelectionSource
+{
+    ReplayScannerSymbolSelectionSnapshotRow GetScannerSelectionSnapshot();
+}
+
+public interface IReplaySimulationFeedbackSink
+{
+    void OnReplaySliceResult(StrategyDataSlice dataSlice, ReplaySliceSimulationResult result, string activeSymbol);
+}
+
+public sealed record ReplayDayTradingContext(
+    DateTime TimestampUtc,
+    string Symbol,
+    double MarkPrice,
+    double PositionQuantity,
+    double AveragePrice
+);
+
+public sealed record ReplayDayTradingDecision(
+    IReadOnlyList<ReplayOrderIntent> Orders,
+    bool StopFurtherProcessing
+);
+
+public interface IReplayGlobalSafetyOverlayStrategy
+{
+    ReplayDayTradingDecision Evaluate(ReplayDayTradingContext context);
+}
+
+public interface IReplayEntryStrategy
+{
+    IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context, ReplayScannerSymbolSelectionSnapshotRow selection);
+}
+
+public interface IReplayTradeManagementStrategy
+{
+    IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
+}
+
+public interface IReplayEndOfDayStrategy
+{
+    IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
+}
+
+public sealed class ReplayDayTradingPipeline
+{
+    private readonly IReadOnlyList<IReplayGlobalSafetyOverlayStrategy> _globalSafetyOverlays;
+    private readonly IReadOnlyList<IReplayEntryStrategy> _entryStrategies;
+    private readonly IReadOnlyList<IReplayTradeManagementStrategy> _tradeManagementStrategies;
+    private readonly IReadOnlyList<IReplayEndOfDayStrategy> _endOfDayStrategies;
+
+    public ReplayDayTradingPipeline(
+        IReadOnlyList<IReplayGlobalSafetyOverlayStrategy> globalSafetyOverlays,
+        IReadOnlyList<IReplayEntryStrategy> entryStrategies,
+        IReadOnlyList<IReplayTradeManagementStrategy> tradeManagementStrategies,
+        IReadOnlyList<IReplayEndOfDayStrategy> endOfDayStrategies)
+    {
+        _globalSafetyOverlays = globalSafetyOverlays;
+        _entryStrategies = entryStrategies;
+        _tradeManagementStrategies = tradeManagementStrategies;
+        _endOfDayStrategies = endOfDayStrategies;
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(
+        ReplayDayTradingContext context,
+        ReplayScannerSymbolSelectionSnapshotRow selection)
+    {
+        var orders = new List<ReplayOrderIntent>();
+
+        foreach (var overlay in _globalSafetyOverlays)
+        {
+            var decision = overlay.Evaluate(context);
+            if (decision.Orders.Count > 0)
+            {
+                orders.AddRange(decision.Orders);
+            }
+
+            if (decision.StopFurtherProcessing)
+            {
+                return orders;
+            }
+        }
+
+        foreach (var entry in _entryStrategies)
+        {
+            var entryOrders = entry.Evaluate(context, selection);
+            if (entryOrders.Count > 0)
+            {
+                orders.AddRange(entryOrders);
+            }
+        }
+
+        foreach (var management in _tradeManagementStrategies)
+        {
+            var managementOrders = management.Evaluate(context);
+            if (managementOrders.Count > 0)
+            {
+                orders.AddRange(managementOrders);
+            }
+        }
+
+        foreach (var endOfDay in _endOfDayStrategies)
+        {
+            var eodOrders = endOfDay.Evaluate(context);
+            if (eodOrders.Count > 0)
+            {
+                orders.AddRange(eodOrders);
+            }
+        }
+
+        return orders;
+    }
+}
+
+public sealed class ReplayScannerSymbolSelectionModule
+{
+    private readonly ReplayScannerSymbolSelectionSnapshotRow _snapshot;
+
+    public ReplayScannerSymbolSelectionModule(string candidatesInputPath, int topN, double minScore)
+    {
+        if (string.IsNullOrWhiteSpace(candidatesInputPath))
+        {
+            throw new ArgumentException("Replay scanner candidates input path is required.", nameof(candidatesInputPath));
+        }
+
+        var fullPath = Path.GetFullPath(candidatesInputPath);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException($"Replay scanner candidates input not found: {fullPath}");
+        }
+
+        var rows = JsonSerializer.Deserialize<ScannerCandidateInputRow[]>(File.ReadAllText(fullPath), new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        }) ?? [];
+
+        var ranked = rows
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+            .Select(x => new ReplayScannerRankedSymbolRow(
+                x.Symbol.Trim().ToUpperInvariant(),
+                x.WeightedScore,
+                x.Eligible is not false,
+                x.AverageRank))
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .ToArray();
+
+        var selected = ranked
+            .Where(x => x.Eligible)
+            .Where(x => x.WeightedScore >= minScore)
+            .Take(Math.Max(1, topN))
+            .Select(x => x.Symbol)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        _snapshot = new ReplayScannerSymbolSelectionSnapshotRow(
+            DateTime.UtcNow,
+            fullPath,
+            ranked,
+            selected);
+    }
+
+    public ReplayScannerSymbolSelectionSnapshotRow GetSnapshot()
+    {
+        return _snapshot;
+    }
+
+    private sealed class ScannerCandidateInputRow
+    {
+        public string Symbol { get; set; } = string.Empty;
+        public double WeightedScore { get; set; }
+        public bool? Eligible { get; set; }
+        public double AverageRank { get; set; }
+    }
+}
+
+public sealed record Ovl001FlattenConfig(
+    int ImmediateWindowSec,
+    double ImmediateAdverseMovePct,
+    double ImmediateAdverseMoveUsd,
+    double GivebackPctOfNotional,
+    double GivebackUsdCap,
+    bool TrailingActivatesOnlyAfterProfit,
+    string FlattenRoute,
+    string FlattenTif,
+    string FlattenOrderType
+)
+{
+    public static Ovl001FlattenConfig Default { get; } = new(
+        ImmediateWindowSec: 5,
+        ImmediateAdverseMovePct: 0.002,
+        ImmediateAdverseMoveUsd: 10.0,
+        GivebackPctOfNotional: 0.01,
+        GivebackUsdCap: 30.0,
+        TrailingActivatesOnlyAfterProfit: true,
+        FlattenRoute: "SMART",
+        FlattenTif: "DAY+",
+        FlattenOrderType: "MARKET");
+}
+
+public sealed class Ovl001FlattenReversalAndGivebackCapStrategy : IReplayGlobalSafetyOverlayStrategy
+{
+    public const string StrategyId = "OVL_001_FLATTEN_REVERSAL_AND_GIVEBACK_CAP";
+
+    private readonly Ovl001FlattenConfig _config;
+    private readonly Dictionary<string, Ovl001PositionState> _stateBySymbol;
+
+    public Ovl001FlattenReversalAndGivebackCapStrategy(Ovl001FlattenConfig? config = null)
+    {
+        _config = config ?? Ovl001FlattenConfig.Default;
+        _stateBySymbol = new Dictionary<string, Ovl001PositionState>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public void OnPositionEvent(
+        string symbol,
+        DateTime timestampUtc,
+        double positionQuantity,
+        double averagePrice,
+        IReadOnlyList<ReplayFillRow> fills)
+    {
+        var normalizedSymbol = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedSymbol))
+        {
+            return;
+        }
+
+        if (Math.Abs(positionQuantity) <= 1e-9)
+        {
+            _stateBySymbol.Remove(normalizedSymbol);
+            return;
+        }
+
+        var side = positionQuantity > 0 ? "LONG" : "SHORT";
+        var shares = Math.Abs(positionQuantity);
+
+        if (!_stateBySymbol.TryGetValue(normalizedSymbol, out var current)
+            || !string.Equals(current.Side, side, StringComparison.OrdinalIgnoreCase))
+        {
+            var openingFill = fills
+                .Where(x => string.Equals(x.Symbol, normalizedSymbol, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(x => x.TimestampUtc)
+                .FirstOrDefault();
+
+            var entryTimeUtc = openingFill?.TimestampUtc ?? timestampUtc;
+            var entryPrice = averagePrice > 0
+                ? averagePrice
+                : openingFill?.FillPrice ?? 0.0;
+
+            _stateBySymbol[normalizedSymbol] = new Ovl001PositionState(
+                EntryTimeUtc: entryTimeUtc,
+                EntryPrice: entryPrice,
+                Shares: shares,
+                Side: side,
+                PeakPrice: null,
+                TroughPrice: null,
+                PeakProfitUsd: 0.0,
+                TrailingActive: false);
+            return;
+        }
+
+        _stateBySymbol[normalizedSymbol] = current with
+        {
+            Shares = shares,
+            EntryPrice = averagePrice > 0 ? averagePrice : current.EntryPrice
+        };
+    }
+
+    public ReplayDayTradingDecision Evaluate(ReplayDayTradingContext context)
+    {
+        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(symbol) || context.MarkPrice <= 0 || Math.Abs(context.PositionQuantity) <= 1e-9)
+        {
+            return new ReplayDayTradingDecision([], false);
+        }
+
+        if (!_stateBySymbol.TryGetValue(symbol, out var state))
+        {
+            state = new Ovl001PositionState(
+                EntryTimeUtc: context.TimestampUtc,
+                EntryPrice: context.AveragePrice,
+                Shares: Math.Abs(context.PositionQuantity),
+                Side: context.PositionQuantity > 0 ? "LONG" : "SHORT",
+                PeakPrice: null,
+                TroughPrice: null,
+                PeakProfitUsd: 0.0,
+                TrailingActive: false);
+        }
+
+        var shares = Math.Max(1e-9, Math.Abs(context.PositionQuantity));
+        var side = context.PositionQuantity > 0 ? "LONG" : "SHORT";
+        state = state with
+        {
+            Shares = shares,
+            Side = side,
+            EntryPrice = context.AveragePrice > 0 ? context.AveragePrice : state.EntryPrice
+        };
+
+        var entryPrice = Math.Max(1e-9, state.EntryPrice);
+        var unrealizedPnl = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? (context.MarkPrice - entryPrice) * shares
+            : (entryPrice - context.MarkPrice) * shares;
+        var adverse = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? context.MarkPrice < entryPrice
+            : context.MarkPrice > entryPrice;
+
+        var ageSec = Math.Max(0, (context.TimestampUtc - state.EntryTimeUtc).TotalSeconds);
+        var adversePct = Math.Abs(context.MarkPrice - entryPrice) / entryPrice;
+        var immediatePctTriggered = _config.ImmediateAdverseMovePct > 0 && adversePct >= _config.ImmediateAdverseMovePct;
+        var immediateUsdTriggered = _config.ImmediateAdverseMoveUsd > 0 && unrealizedPnl <= -_config.ImmediateAdverseMoveUsd;
+        if (ageSec <= _config.ImmediateWindowSec && adverse && (immediatePctTriggered || immediateUsdTriggered))
+        {
+            _stateBySymbol[symbol] = state;
+            return BuildFlattenDecision(context, "immediate_reversal_flatten");
+        }
+
+        if (string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase))
+        {
+            var peakPrice = state.PeakPrice.HasValue
+                ? Math.Max(state.PeakPrice.Value, context.MarkPrice)
+                : context.MarkPrice;
+            var peakProfit = Math.Max(state.PeakProfitUsd, (peakPrice - entryPrice) * shares);
+            state = state with
+            {
+                PeakPrice = peakPrice,
+                PeakProfitUsd = peakProfit
+            };
+        }
+        else
+        {
+            var troughPrice = state.TroughPrice.HasValue
+                ? Math.Min(state.TroughPrice.Value, context.MarkPrice)
+                : context.MarkPrice;
+            var peakProfit = Math.Max(state.PeakProfitUsd, (entryPrice - troughPrice) * shares);
+            state = state with
+            {
+                TroughPrice = troughPrice,
+                PeakProfitUsd = peakProfit
+            };
+        }
+
+        var trailingActive = _config.TrailingActivatesOnlyAfterProfit
+            ? state.PeakProfitUsd > 0
+            : true;
+        state = state with { TrailingActive = trailingActive };
+
+        var positionNotional = entryPrice * shares;
+        var givebackLimitUsd = Math.Min(_config.GivebackPctOfNotional * positionNotional, _config.GivebackUsdCap);
+        var givebackUsd = string.Equals(side, "LONG", StringComparison.OrdinalIgnoreCase)
+            ? Math.Max(0.0, ((state.PeakPrice ?? context.MarkPrice) - context.MarkPrice) * shares)
+            : Math.Max(0.0, (context.MarkPrice - (state.TroughPrice ?? context.MarkPrice)) * shares);
+
+        _stateBySymbol[symbol] = state;
+
+        if (state.TrailingActive && givebackUsd >= givebackLimitUsd)
+        {
+            return BuildFlattenDecision(context, "giveback_cap_flatten");
+        }
+
+        return new ReplayDayTradingDecision([], false);
+    }
+
+    private ReplayDayTradingDecision BuildFlattenDecision(ReplayDayTradingContext context, string reason)
+    {
+        var symbol = context.Symbol.Trim().ToUpperInvariant();
+        var qty = Math.Abs(context.PositionQuantity);
+        if (qty <= 1e-9)
+        {
+            return new ReplayDayTradingDecision([], true);
+        }
+
+        var flattenSide = context.PositionQuantity > 0 ? "SELL" : "BUY";
+        var flattenOrderType = string.Equals(_config.FlattenOrderType, "MARKETABLE_LIMIT", StringComparison.OrdinalIgnoreCase)
+            ? "LMT"
+            : "MKT";
+        var flattenLimitPrice = flattenOrderType == "LMT"
+            ? (flattenSide == "BUY"
+                ? context.MarkPrice * 1.001
+                : context.MarkPrice * 0.999)
+            : (double?)null;
+
+        var cancelIntent = new ReplayOrderIntent(
+            TimestampUtc: context.TimestampUtc,
+            Symbol: symbol,
+            Side: "",
+            Quantity: 0,
+            OrderType: "CANCEL",
+            LimitPrice: null,
+            StopPrice: null,
+            TrailAmount: null,
+            TrailPercent: null,
+            TimeInForce: _config.FlattenTif,
+            ExpireAtUtc: null,
+            Source: $"{StrategyId}:{reason}:cancel",
+            OrderId: string.Empty,
+            ParentOrderId: string.Empty,
+            OcoGroup: string.Empty,
+            ComboGroupId: string.Empty,
+            Route: _config.FlattenRoute);
+
+        var flattenIntent = new ReplayOrderIntent(
+            TimestampUtc: context.TimestampUtc,
+            Symbol: symbol,
+            Side: flattenSide,
+            Quantity: qty,
+            OrderType: flattenOrderType,
+            LimitPrice: flattenLimitPrice,
+            StopPrice: null,
+            TrailAmount: null,
+            TrailPercent: null,
+            TimeInForce: _config.FlattenTif,
+            ExpireAtUtc: null,
+            Source: $"{StrategyId}:{reason}:flatten",
+            OrderId: string.Empty,
+            ParentOrderId: string.Empty,
+            OcoGroup: string.Empty,
+            ComboGroupId: string.Empty,
+            Route: _config.FlattenRoute);
+
+        return new ReplayDayTradingDecision([cancelIntent, flattenIntent], true);
+    }
+
+    private sealed record Ovl001PositionState(
+        DateTime EntryTimeUtc,
+        double EntryPrice,
+        double Shares,
+        string Side,
+        double? PeakPrice,
+        double? TroughPrice,
+        double PeakProfitUsd,
+        bool TrailingActive
+    );
+}
+
+public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
+{
+    private readonly HashSet<string> _submittedSymbols;
+    private readonly double _orderQuantity;
+    private readonly string _orderSide;
+    private readonly string _orderType;
+    private readonly string _timeInForce;
+    private readonly double _limitOffsetBps;
+
+    public ReplayScannerSingleShotEntryStrategy(
+        double orderQuantity,
+        string orderSide,
+        string orderType,
+        string timeInForce,
+        double limitOffsetBps)
+    {
+        _submittedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        _orderQuantity = Math.Max(0, orderQuantity);
+        _orderSide = NormalizeOrderSide(orderSide);
+        _orderType = NormalizeOrderType(orderType);
+        _timeInForce = NormalizeTimeInForce(timeInForce);
+        _limitOffsetBps = Math.Max(0, limitOffsetBps);
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context, ReplayScannerSymbolSelectionSnapshotRow selection)
+    {
+        if (_orderQuantity <= 0)
+        {
+            return [];
+        }
+
+        var symbol = context.Symbol.Trim().ToUpperInvariant();
+        if (!selection.SelectedSymbols.Contains(symbol, StringComparer.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        if (_submittedSymbols.Contains(symbol))
+        {
+            return [];
+        }
+
+        var side = ResolveOrderSide(context.PositionQuantity);
+        if (string.IsNullOrWhiteSpace(side))
+        {
+            _submittedSymbols.Add(symbol);
+            return [];
+        }
+
+        double? limitPrice = null;
+        if (string.Equals(_orderType, "LMT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (context.MarkPrice <= 0)
+            {
+                return [];
+            }
+
+            var offset = context.MarkPrice * (_limitOffsetBps / 10000.0);
+            limitPrice = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+                ? Math.Max(0.0001, context.MarkPrice - offset)
+                : context.MarkPrice + offset;
+        }
+
+        _submittedSymbols.Add(symbol);
+
+        return
+        [
+            new ReplayOrderIntent(
+                context.TimestampUtc,
+                symbol,
+                side,
+                _orderQuantity,
+                _orderType,
+                limitPrice,
+                null,
+                null,
+                null,
+                _timeInForce,
+                null,
+                "entry:scanner-candidate")
+        ];
+    }
+
+    private string ResolveOrderSide(double positionQuantity)
+    {
+        if (string.Equals(_orderSide, "AUTO", StringComparison.OrdinalIgnoreCase))
+        {
+            return positionQuantity > 1e-9 ? "SELL" : "BUY";
+        }
+
+        return _orderSide;
+    }
+
+    private static string NormalizeOrderSide(string value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? "BUY" : value.Trim().ToUpperInvariant();
+        return normalized is "BUY" or "SELL" or "AUTO"
+            ? normalized
+            : "BUY";
+    }
+
+    private static string NormalizeOrderType(string value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? "MKT" : value.Trim().ToUpperInvariant();
+        return normalized is "MKT" or "LMT"
+            ? normalized
+            : "MKT";
+    }
+
+    private static string NormalizeTimeInForce(string value)
+    {
+        var normalized = string.IsNullOrWhiteSpace(value) ? "DAY" : value.Trim().ToUpperInvariant();
+        return normalized is "DAY" or "DAY+" or "GTC" or "IOC" or "FOK"
+            ? normalized
+            : "DAY";
+    }
+}

@@ -1,17 +1,18 @@
-using System.Text.Json;
 using Harvester.App.IBKR.Runtime;
 
 namespace Harvester.App.Strategy;
 
-public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrderSignalSource
+public sealed class ScannerCandidateReplayRuntime :
+    IStrategyRuntime,
+    IReplayOrderSignalSource,
+    IReplaySimulationFeedbackSink,
+    IReplayScannerSelectionSource
 {
-    private readonly HashSet<string> _selectedSymbols;
-    private readonly HashSet<string> _submittedSymbols;
-    private readonly double _orderQuantity;
-    private readonly string _orderSide;
-    private readonly string _orderType;
-    private readonly string _timeInForce;
-    private readonly double _limitOffsetBps;
+    private readonly ReplayScannerSymbolSelectionSnapshotRow _selectionSnapshot;
+    private readonly Ovl001FlattenReversalAndGivebackCapStrategy _overlay;
+    private readonly ReplayDayTradingPipeline _pipeline;
+    private double _positionQuantity;
+    private double _averagePrice;
 
     public ScannerCandidateReplayRuntime(
         string candidatesInputPath,
@@ -23,46 +24,22 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
         string timeInForce,
         double limitOffsetBps)
     {
-        if (string.IsNullOrWhiteSpace(candidatesInputPath))
-        {
-            throw new ArgumentException("Replay scanner candidates input path is required.", nameof(candidatesInputPath));
-        }
-
-        var fullPath = Path.GetFullPath(candidatesInputPath);
-        if (!File.Exists(fullPath))
-        {
-            throw new FileNotFoundException($"Replay scanner candidates input not found: {fullPath}");
-        }
-
-        var rows = JsonSerializer.Deserialize<ScannerCandidateInputRow[]>(File.ReadAllText(fullPath), new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        }) ?? [];
-
-        _selectedSymbols = rows
-            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
-            .Where(x => x.Eligible is not false)
-            .Where(x => x.WeightedScore >= minScore)
-            .Select(x => new ScannerCandidateInputRow
-            {
-                Symbol = x.Symbol.Trim().ToUpperInvariant(),
-                WeightedScore = x.WeightedScore,
-                Eligible = x.Eligible,
-                AverageRank = x.AverageRank
-            })
-            .OrderByDescending(x => x.WeightedScore)
-            .ThenBy(x => x.AverageRank)
-            .Take(Math.Max(1, topN))
-            .Select(x => x.Symbol)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        _submittedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        _orderQuantity = Math.Max(0, orderQuantity);
-        _orderSide = NormalizeOrderSide(orderSide);
-        _orderType = NormalizeOrderType(orderType);
-        _timeInForce = NormalizeTimeInForce(timeInForce);
-        _limitOffsetBps = Math.Max(0, limitOffsetBps);
+        var selectionModule = new ReplayScannerSymbolSelectionModule(candidatesInputPath, topN, minScore);
+        _selectionSnapshot = selectionModule.GetSnapshot();
+        _overlay = new Ovl001FlattenReversalAndGivebackCapStrategy(BuildOverlayConfigFromEnvironment());
+        var entry = new ReplayScannerSingleShotEntryStrategy(
+            orderQuantity,
+            orderSide,
+            orderType,
+            timeInForce,
+            limitOffsetBps);
+        _pipeline = new ReplayDayTradingPipeline(
+            globalSafetyOverlays: [_overlay],
+            entryStrategies: [entry],
+            tradeManagementStrategies: [],
+            endOfDayStrategies: []);
+        _positionQuantity = 0;
+        _averagePrice = 0;
     }
 
     public Task InitializeAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
@@ -85,111 +62,141 @@ public sealed class ScannerCandidateReplayRuntime : IStrategyRuntime, IReplayOrd
         return Task.CompletedTask;
     }
 
+    public ReplayScannerSymbolSelectionSnapshotRow GetScannerSelectionSnapshot()
+    {
+        return _selectionSnapshot;
+    }
+
     public IReadOnlyList<ReplayOrderIntent> GetReplayOrderIntents(StrategyDataSlice dataSlice, StrategyRuntimeContext context)
     {
-        if (_orderQuantity <= 0)
-        {
-            return [];
-        }
-
         var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
         if (string.IsNullOrWhiteSpace(symbol))
         {
             return [];
         }
 
-        if (!_selectedSymbols.Contains(symbol) || _submittedSymbols.Contains(symbol))
+        if (!_selectionSnapshot.SelectedSymbols.Contains(symbol, StringComparer.OrdinalIgnoreCase))
         {
             return [];
         }
 
-        var side = ResolveOrderSide(symbol, dataSlice.Positions);
-        if (string.IsNullOrWhiteSpace(side))
+        var markPrice = ResolveMarkPrice(dataSlice);
+        if (markPrice <= 0)
         {
-            _submittedSymbols.Add(symbol);
             return [];
         }
 
-        var markPrice = dataSlice.HistoricalBars.LastOrDefault()?.Close
-            ?? dataSlice.TopTicks.LastOrDefault()?.Price
-            ?? 0;
+        var dayTradingContext = new ReplayDayTradingContext(
+            TimestampUtc: dataSlice.TimestampUtc,
+            Symbol: symbol,
+            MarkPrice: markPrice,
+            PositionQuantity: _positionQuantity,
+            AveragePrice: _averagePrice);
 
-        double? limitPrice = null;
-        if (_orderType == "LMT")
+        return _pipeline.Evaluate(dayTradingContext, _selectionSnapshot);
+    }
+
+    public void OnReplaySliceResult(StrategyDataSlice dataSlice, ReplaySliceSimulationResult result, string activeSymbol)
+    {
+        _positionQuantity = result.Portfolio.PositionQuantity;
+        _averagePrice = result.Portfolio.AveragePrice;
+        _overlay.OnPositionEvent(
+            activeSymbol,
+            result.Portfolio.TimestampUtc,
+            result.Portfolio.PositionQuantity,
+            result.Portfolio.AveragePrice,
+            result.Fills);
+    }
+
+    private static double ResolveMarkPrice(StrategyDataSlice dataSlice)
+    {
+        var last = dataSlice.TopTicks
+            .Where(x => x.Field == 4)
+            .Select(x => x.Price)
+            .LastOrDefault(x => x > 0);
+        if (last > 0)
         {
-            if (markPrice <= 0)
-            {
-                return [];
-            }
-
-            var offset = markPrice * (_limitOffsetBps / 10000.0);
-            limitPrice = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
-                ? Math.Max(0.0001, markPrice - offset)
-                : markPrice + offset;
+            return last;
         }
 
-        _submittedSymbols.Add(symbol);
-
-        return [
-            new ReplayOrderIntent(
-                dataSlice.TimestampUtc,
-                symbol,
-                side,
-                _orderQuantity,
-                _orderType,
-                limitPrice,
-                null,
-                null,
-                null,
-                _timeInForce,
-                null,
-                "scanner-candidate")
-        ];
-    }
-
-    private string ResolveOrderSide(string symbol, IReadOnlyList<PositionRow> positions)
-    {
-        if (string.Equals(_orderSide, "AUTO", StringComparison.OrdinalIgnoreCase))
+        var bid = dataSlice.TopTicks
+            .Where(x => x.Field == 1)
+            .Select(x => x.Price)
+            .LastOrDefault(x => x > 0);
+        var ask = dataSlice.TopTicks
+            .Where(x => x.Field == 2)
+            .Select(x => x.Price)
+            .LastOrDefault(x => x > 0);
+        if (bid > 0 && ask > 0)
         {
-            var positionQty = positions
-                .Where(x => string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase))
-                .Sum(x => x.Quantity);
-
-            return positionQty > 1e-9 ? "SELL" : "BUY";
+            return (bid + ask) / 2.0;
         }
 
-        return _orderSide;
+        return dataSlice.HistoricalBars.LastOrDefault()?.Close ?? 0;
     }
 
-    private static string NormalizeOrderSide(string value)
+    private static Ovl001FlattenConfig BuildOverlayConfigFromEnvironment()
     {
-        var normalized = string.IsNullOrWhiteSpace(value) ? "BUY" : value.Trim().ToUpperInvariant();
-        return normalized is "BUY" or "SELL" or "AUTO"
-            ? normalized
-            : "BUY";
+        return new Ovl001FlattenConfig(
+            ImmediateWindowSec: Math.Max(1, TryReadEnvironmentInt("OVL_001_IMMEDIATE_WINDOW_SEC", 5)),
+            ImmediateAdverseMovePct: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_IMMEDIATE_ADVERSE_MOVE_PCT", 0.002)),
+            ImmediateAdverseMoveUsd: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_IMMEDIATE_ADVERSE_MOVE_USD", 10.0)),
+            GivebackPctOfNotional: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_GIVEBACK_PCT_OF_NOTIONAL", 0.01)),
+            GivebackUsdCap: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_GIVEBACK_USD_CAP", 30.0)),
+            TrailingActivatesOnlyAfterProfit: TryReadEnvironmentBool("OVL_001_TRAILING_ACTIVATES_ONLY_AFTER_PROFIT", true),
+            FlattenRoute: TryReadEnvironmentString("OVL_001_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("OVL_001_FLATTEN_TIF", "DAY+"),
+            FlattenOrderType: TryReadEnvironmentString("OVL_001_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static string NormalizeOrderType(string value)
+    private static bool TryReadEnvironmentBool(string name, bool fallback)
     {
-        var normalized = string.IsNullOrWhiteSpace(value) ? "MKT" : value.Trim().ToUpperInvariant();
-        return normalized is "MKT" or "LMT"
-            ? normalized
-            : "MKT";
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        if (bool.TryParse(value, out var parsed))
+        {
+            return parsed;
+        }
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "1" or "Y" or "YES" or "TRUE" => true,
+            "0" or "N" or "NO" or "FALSE" => false,
+            _ => fallback
+        };
     }
 
-    private static string NormalizeTimeInForce(string value)
+    private static int TryReadEnvironmentInt(string name, int fallback)
     {
-        var normalized = string.IsNullOrWhiteSpace(value) ? "DAY" : value.Trim().ToUpperInvariant();
-        return normalized is "DAY" or "GTC" or "IOC" or "FOK"
-            ? normalized
-            : "DAY";
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        return int.TryParse(value, out var parsed) ? parsed : fallback;
     }
 
-    private sealed class ScannerCandidateInputRow
+    private static double TryReadEnvironmentDouble(string name, double fallback)
     {
-        public string Symbol { get; set; } = string.Empty;
-        public double WeightedScore { get; set; }
-        public bool? Eligible { get; set; }
-        public double AverageRank { get; set; }
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        return double.TryParse(value, out var parsed) ? parsed : fallback;
+    }
+
+    private static string TryReadEnvironmentString(string name, string fallback)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        return string.IsNullOrWhiteSpace(value)
+            ? fallback
+            : value.Trim();
     }
 }

@@ -19,7 +19,8 @@ public sealed record ReplayOrderIntent(
     string OrderId = "",
     string ParentOrderId = "",
     string OcoGroup = "",
-    string ComboGroupId = ""
+    string ComboGroupId = "",
+    string Route = ""
 );
 
 public sealed record ReplayFillRow(
@@ -423,6 +424,38 @@ public sealed class ReplayExecutionSimulator
 
         foreach (var intent in intents)
         {
+            var normalizedSymbol = string.IsNullOrWhiteSpace(intent.Symbol)
+                ? symbol
+                : intent.Symbol.Trim().ToUpperInvariant();
+            var normalizedSource = string.IsNullOrWhiteSpace(intent.Source) ? "strategy" : intent.Source;
+            var normalizedTif = string.IsNullOrWhiteSpace(intent.TimeInForce) ? "DAY" : intent.TimeInForce.ToUpperInvariant();
+            var normalizedRoute = string.IsNullOrWhiteSpace(intent.Route) ? string.Empty : intent.Route.Trim().ToUpperInvariant();
+            var normalizedOrderType = string.IsNullOrWhiteSpace(intent.OrderType)
+                ? string.Empty
+                : intent.OrderType.Trim().ToUpperInvariant();
+
+            if (IsCancelOrderIntent(normalizedOrderType))
+            {
+                accepted.Add(intent with
+                {
+                    TimestampUtc = intent.TimestampUtc == default ? slice.TimestampUtc : intent.TimestampUtc,
+                    Symbol = normalizedSymbol,
+                    Source = normalizedSource,
+                    TimeInForce = normalizedTif,
+                    OrderType = normalizedOrderType,
+                    Quantity = 0,
+                    Route = normalizedRoute
+                });
+
+                CancelActiveOrdersBySymbol(
+                    normalizedSymbol,
+                    slice.TimestampUtc,
+                    cancellations,
+                    comboEvents,
+                    "OVERLAY_CANCEL_CONFLICTING_ORDERS");
+                continue;
+            }
+
             if (intent.Quantity <= 0)
             {
                 continue;
@@ -432,15 +465,17 @@ public sealed class ReplayExecutionSimulator
             {
                 TimestampUtc = intent.TimestampUtc == default ? slice.TimestampUtc : intent.TimestampUtc,
                 Side = intent.Side.ToUpperInvariant(),
-                OrderType = intent.OrderType.ToUpperInvariant(),
+                OrderType = normalizedOrderType,
                 LimitPrice = QuantizeNullablePrice(intent.LimitPrice),
                 StopPrice = QuantizeNullablePrice(intent.StopPrice),
-                TimeInForce = string.IsNullOrWhiteSpace(intent.TimeInForce) ? "DAY" : intent.TimeInForce.ToUpperInvariant(),
+                TimeInForce = normalizedTif,
                 OrderId = ResolveOrderId(intent.OrderId),
                 ParentOrderId = string.IsNullOrWhiteSpace(intent.ParentOrderId) ? string.Empty : intent.ParentOrderId.Trim(),
                 OcoGroup = string.IsNullOrWhiteSpace(intent.OcoGroup) ? string.Empty : intent.OcoGroup.Trim(),
                 ComboGroupId = string.IsNullOrWhiteSpace(intent.ComboGroupId) ? string.Empty : intent.ComboGroupId.Trim(),
-                Source = string.IsNullOrWhiteSpace(intent.Source) ? "strategy" : intent.Source
+                Source = normalizedSource,
+                Symbol = normalizedSymbol,
+                Route = normalizedRoute
             };
 
             accepted.Add(normalized);
@@ -771,6 +806,43 @@ public sealed class ReplayExecutionSimulator
                 sibling.Intent.Source));
 
             _activeOrders.Remove(sibling);
+        }
+    }
+
+    private void CancelActiveOrdersBySymbol(
+        string symbol,
+        DateTime timestampUtc,
+        List<ReplayOrderCancellationRow> cancellations,
+        List<ReplayComboLifecycleRow> comboEvents,
+        string reason)
+    {
+        var target = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            return;
+        }
+
+        var matches = _activeOrders
+            .Where(x => x.RemainingQuantity > 1e-9)
+            .Where(x => string.Equals(x.Intent.Symbol, target, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        foreach (var active in matches)
+        {
+            cancellations.Add(new ReplayOrderCancellationRow(
+                timestampUtc,
+                active.Intent.Symbol,
+                active.Intent.Side,
+                active.RemainingQuantity,
+                active.Intent.OrderType,
+                active.Intent.TimeInForce,
+                active.SubmittedAtUtc,
+                active.Intent.ExpireAtUtc,
+                reason,
+                active.Intent.Source));
+
+            CancelComboSiblings(active, timestampUtc, cancellations, comboEvents, reason);
+            _activeOrders.Remove(active);
         }
     }
 
@@ -2213,6 +2285,17 @@ public sealed class ReplayExecutionSimulator
             "SELL" => -1,
             _ => 0
         };
+    }
+
+    private static bool IsCancelOrderIntent(string orderType)
+    {
+        if (string.IsNullOrWhiteSpace(orderType))
+        {
+            return false;
+        }
+
+        var normalized = orderType.Replace("_", string.Empty).Replace(" ", string.Empty).ToUpperInvariant();
+        return normalized is "CANCEL" or "CXL" or "CANCELALL";
     }
 
     private sealed record PendingSettlement(
