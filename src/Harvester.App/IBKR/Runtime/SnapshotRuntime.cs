@@ -1582,11 +1582,19 @@ public sealed class SnapshotRuntime
         var outputDir = EnsureOutputDir();
         var depthPath = Path.Combine(outputDir, $"depth_data_{_options.Symbol}_{timestamp}.json");
         var sanitizationPath = Path.Combine(outputDir, $"depth_data_sanitization_{_options.Symbol}_{timestamp}.json");
+        var l2CandlesPath = Path.Combine(outputDir, $"l2_candles_{_options.Symbol}_{timestamp}.json");
+        var l2SignalsPath = Path.Combine(outputDir, $"l2_strategy_signals_{_options.Symbol}_{timestamp}.json");
 
         WriteJson(depthPath, _wrapper.DepthRows.ToArray());
         WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
+        var l2Candles = BuildDefaultL2Candles(_wrapper.DepthRows.ToArray());
+        var l2Signals = L2MtfSignalStrategy.BuildSignals(_options.Symbol, l2Candles);
+        WriteJson(l2CandlesPath, l2Candles);
+        WriteJson(l2SignalsPath, l2Signals);
         Console.WriteLine($"[OK] Depth data export: {depthPath} (rows={_wrapper.DepthRows.Count})");
         Console.WriteLine($"[OK] Depth data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
+        Console.WriteLine($"[OK] L2 candlestick export: {l2CandlesPath} (rows={l2Candles.Count})");
+        Console.WriteLine($"[OK] L2 strategy signal export: {l2SignalsPath} (rows={l2Signals.Count})");
     }
 
     private async Task RunRealtimeBarsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -1650,6 +1658,8 @@ public sealed class SnapshotRuntime
         var typePath = Path.Combine(outputDir, $"top_data_type_{_options.Symbol}_{timestamp}.json");
         var depthPath = Path.Combine(outputDir, $"depth_data_{_options.Symbol}_{timestamp}.json");
         var barsPath = Path.Combine(outputDir, $"realtime_bars_{_options.Symbol}_{timestamp}.json");
+        var l2CandlesPath = Path.Combine(outputDir, $"l2_candles_{_options.Symbol}_{timestamp}.json");
+        var l2SignalsPath = Path.Combine(outputDir, $"l2_strategy_signals_{_options.Symbol}_{timestamp}.json");
         var sanitizationPath = Path.Combine(outputDir, $"market_data_sanitization_{_options.Symbol}_{timestamp}.json");
         var reportPath = Path.Combine(outputDir, $"market_data_report_{_options.Symbol}_{timestamp}.md");
 
@@ -1657,6 +1667,10 @@ public sealed class SnapshotRuntime
         WriteJson(typePath, _wrapper.MarketDataTypes.ToArray());
         WriteJson(depthPath, _wrapper.DepthRows.ToArray());
         WriteJson(barsPath, _wrapper.RealtimeBars.ToArray());
+        var l2Candles = BuildDefaultL2Candles(_wrapper.DepthRows.ToArray());
+        var l2Signals = L2MtfSignalStrategy.BuildSignals(_options.Symbol, l2Candles);
+        WriteJson(l2CandlesPath, l2Candles);
+        WriteJson(l2SignalsPath, l2Signals);
         WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
 
         var report =
@@ -1668,6 +1682,8 @@ public sealed class SnapshotRuntime
             + $"- Top ticks: {_wrapper.TopTicks.Count}\n"
             + $"- Depth rows: {_wrapper.DepthRows.Count}\n"
             + $"- Realtime bars: {_wrapper.RealtimeBars.Count}\n"
+            + $"- L2 candlesticks: {l2Candles.Count}\n"
+            + $"- L2 strategy signals: {l2Signals.Count}\n"
             + $"- Sanitization events: {_wrapper.MarketDataSanitizationRows.Count}\n"
             + "\n"
             + "## Files\n"
@@ -1675,6 +1691,8 @@ public sealed class SnapshotRuntime
             + $"- marketDataType: {typePath}\n"
             + $"- depth: {depthPath}\n"
             + $"- realtime bars: {barsPath}\n"
+            + $"- l2 candles: {l2CandlesPath}\n"
+            + $"- l2 strategy signals: {l2SignalsPath}\n"
             + $"- sanitization: {sanitizationPath}\n";
 
         File.WriteAllText(reportPath, report);
@@ -1683,8 +1701,24 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Market data type export: {typePath} (rows={_wrapper.MarketDataTypes.Count})");
         Console.WriteLine($"[OK] Depth data export: {depthPath} (rows={_wrapper.DepthRows.Count})");
         Console.WriteLine($"[OK] Realtime bars export: {barsPath} (rows={_wrapper.RealtimeBars.Count})");
+        Console.WriteLine($"[OK] L2 candlestick export: {l2CandlesPath} (rows={l2Candles.Count})");
+        Console.WriteLine($"[OK] L2 strategy signal export: {l2SignalsPath} (rows={l2Signals.Count})");
         Console.WriteLine($"[OK] Market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
         Console.WriteLine($"[OK] Market data report: {reportPath}");
+    }
+
+    private static IReadOnlyList<L2CandlestickRow> BuildDefaultL2Candles(IReadOnlyList<DepthRow> depthRows)
+    {
+        return L2CandlestickBuilder.BuildCandles(
+            depthRows,
+            [
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMinutes(1),
+                TimeSpan.FromMinutes(5),
+                TimeSpan.FromMinutes(15),
+                TimeSpan.FromHours(1),
+                TimeSpan.FromDays(1)
+            ]);
     }
 
     private async Task RunHistoricalBarsMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)

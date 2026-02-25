@@ -10,6 +10,7 @@ public sealed class ScannerCandidateReplayRuntime :
 {
     private readonly ReplayScannerSymbolSelectionSnapshotRow _selectionSnapshot;
     private readonly Ovl001FlattenReversalAndGivebackCapStrategy _overlay;
+    private readonly ReplayMtfCandleSignalEngine _mtfSignalEngine;
     private readonly ReplayDayTradingPipeline _pipeline;
     private double _positionQuantity;
     private double _averagePrice;
@@ -27,12 +28,15 @@ public sealed class ScannerCandidateReplayRuntime :
         var selectionModule = new ReplayScannerSymbolSelectionModule(candidatesInputPath, topN, minScore);
         _selectionSnapshot = selectionModule.GetSnapshot();
         _overlay = new Ovl001FlattenReversalAndGivebackCapStrategy(BuildOverlayConfigFromEnvironment());
+        _mtfSignalEngine = new ReplayMtfCandleSignalEngine();
         var entry = new ReplayScannerSingleShotEntryStrategy(
             orderQuantity,
             orderSide,
             orderType,
             timeInForce,
-            limitOffsetBps);
+            limitOffsetBps,
+            _mtfSignalEngine,
+            BuildScannerRequireMtfAlignmentFromEnvironment());
         var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
         var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
         var tradeManagementTrailing = new Tmg003TrailingProgressionStrategy(BuildTradeManagementTrailingConfigFromEnvironment());
@@ -80,11 +84,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementReboundPullbackRejectionConfirmFailRebound = new Tmg045ReboundPullbackRejectionConfirmFailReboundExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundConfigFromEnvironment());
         var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown = new Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfigFromEnvironment());
         var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm = new Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirmConfigFromEnvironment());
+        var tradeManagementMtfCandleReversal = new Tmg048MtfCandleReversalExitStrategy(_mtfSignalEngine, BuildTradeManagementMtfCandleReversalConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm, tradeManagementMtfCandleReversal],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -145,6 +150,8 @@ public sealed class ScannerCandidateReplayRuntime :
         {
             askPrice = markPrice;
         }
+
+        _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, markPrice);
 
         var dayTradingContext = new ReplayDayTradingContext(
             TimestampUtc: dataSlice.TimestampUtc,
@@ -226,6 +233,11 @@ public sealed class ScannerCandidateReplayRuntime :
             StopLossPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_STOP_LOSS_PCT", 0.003)),
             TakeProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_001_TAKE_PROFIT_PCT", 0.006)),
             TimeInForce: TryReadEnvironmentString("TMG_001_TIF", "DAY").ToUpperInvariant());
+    }
+
+    private static bool BuildScannerRequireMtfAlignmentFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_MTF_ALIGNMENT", false);
     }
 
     private static Tmg002BreakEvenConfig BuildTradeManagementBreakEvenConfigFromEnvironment()
@@ -899,6 +911,16 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenRoute: TryReadEnvironmentString("TMG_047_FLATTEN_ROUTE", "SMART"),
             FlattenTif: TryReadEnvironmentString("TMG_047_FLATTEN_TIF", "DAY").ToUpperInvariant(),
             FlattenOrderType: TryReadEnvironmentString("TMG_047_FLATTEN_ORDER_TYPE", "MARKET"));
+    }
+
+    private static Tmg048MtfCandleReversalExitConfig BuildTradeManagementMtfCandleReversalConfigFromEnvironment()
+    {
+        return new Tmg048MtfCandleReversalExitConfig(
+            Enabled: TryReadEnvironmentBool("TMG_048_ENABLED", false),
+            RequireAllTimeframes: TryReadEnvironmentBool("TMG_048_REQUIRE_ALL_TIMEFRAMES", true),
+            FlattenRoute: TryReadEnvironmentString("TMG_048_FLATTEN_ROUTE", "MARKET"),
+            FlattenTif: TryReadEnvironmentString("TMG_048_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_048_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()

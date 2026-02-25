@@ -1233,6 +1233,22 @@ public sealed record Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownCo
         FlattenOrderType: "MARKET");
 }
 
+public sealed record Tmg048MtfCandleReversalExitConfig(
+    bool Enabled,
+    bool RequireAllTimeframes,
+    string FlattenRoute,
+    string FlattenTif,
+    string FlattenOrderType
+)
+{
+    public static Tmg048MtfCandleReversalExitConfig Default { get; } = new(
+        Enabled: false,
+        RequireAllTimeframes: true,
+        FlattenRoute: "MARKET",
+        FlattenTif: "DAY",
+        FlattenOrderType: "MARKET");
+}
+
 public interface IReplayEndOfDayStrategy
 {
     IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context);
@@ -1655,13 +1671,17 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
     private readonly string _orderType;
     private readonly string _timeInForce;
     private readonly double _limitOffsetBps;
+    private readonly IReplayMtfSignalSource? _mtfSignalSource;
+    private readonly bool _requireMtfAlignment;
 
     public ReplayScannerSingleShotEntryStrategy(
         double orderQuantity,
         string orderSide,
         string orderType,
         string timeInForce,
-        double limitOffsetBps)
+        double limitOffsetBps,
+        IReplayMtfSignalSource? mtfSignalSource = null,
+        bool requireMtfAlignment = false)
     {
         _submittedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _orderQuantity = Math.Max(0, orderQuantity);
@@ -1669,6 +1689,8 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         _orderType = NormalizeOrderType(orderType);
         _timeInForce = NormalizeTimeInForce(timeInForce);
         _limitOffsetBps = Math.Max(0, limitOffsetBps);
+        _mtfSignalSource = mtfSignalSource;
+        _requireMtfAlignment = requireMtfAlignment;
     }
 
     public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context, ReplayScannerSymbolSelectionSnapshotRow selection)
@@ -1694,6 +1716,27 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         {
             _submittedSymbols.Add(symbol);
             return [];
+        }
+
+        if (_requireMtfAlignment && _mtfSignalSource is not null)
+        {
+            if (!_mtfSignalSource.TryGetSnapshot(symbol, out var mtfSnapshot)
+                || !mtfSnapshot.HasAllTimeframes)
+            {
+                return [];
+            }
+
+            if (string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+                && !mtfSnapshot.BullishEntryReady)
+            {
+                return [];
+            }
+
+            if (string.Equals(side, "SELL", StringComparison.OrdinalIgnoreCase)
+                && !mtfSnapshot.BearishEntryReady)
+            {
+                return [];
+            }
         }
 
         double? limitPrice = null;
@@ -1726,7 +1769,9 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
                 null,
                 _timeInForce,
                 null,
-                "entry:scanner-candidate")
+                _mtfSignalSource is null
+                    ? "entry:scanner-candidate"
+                    : "entry:scanner-candidate:mtf-aligned")
         ];
     }
 
@@ -9521,6 +9566,112 @@ public sealed class Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownCon
         IReadOnlyList<double> RecentSignedMovesPct,
         bool Triggered
     );
+}
+
+public sealed class Tmg048MtfCandleReversalExitStrategy : IReplayTradeManagementStrategy
+{
+    public const string StrategyId = "TMG_048_MTF_CANDLE_REVERSAL_EXIT";
+
+    private readonly Tmg048MtfCandleReversalExitConfig _config;
+    private readonly IReplayMtfSignalSource _mtfSignalSource;
+    private readonly HashSet<string> _triggeredSymbols;
+
+    public Tmg048MtfCandleReversalExitStrategy(
+        IReplayMtfSignalSource mtfSignalSource,
+        Tmg048MtfCandleReversalExitConfig? config = null)
+    {
+        _mtfSignalSource = mtfSignalSource;
+        _config = config ?? Tmg048MtfCandleReversalExitConfig.Default;
+        _triggeredSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context)
+    {
+        if (!_config.Enabled)
+        {
+            return [];
+        }
+
+        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            return [];
+        }
+
+        if (Math.Abs(context.PositionQuantity) <= 1e-9)
+        {
+            _triggeredSymbols.Remove(symbol);
+            return [];
+        }
+
+        if (_triggeredSymbols.Contains(symbol))
+        {
+            return [];
+        }
+
+        if (!_mtfSignalSource.TryGetSnapshot(symbol, out var snapshot))
+        {
+            return [];
+        }
+
+        if (_config.RequireAllTimeframes && !snapshot.HasAllTimeframes)
+        {
+            return [];
+        }
+
+        var isLong = context.PositionQuantity > 0;
+        var isShort = context.PositionQuantity < 0;
+        var shouldExit = (isLong && snapshot.ExitLongSignal) || (isShort && snapshot.ExitShortSignal);
+        if (!shouldExit)
+        {
+            return [];
+        }
+
+        _triggeredSymbols.Add(symbol);
+
+        var qty = Math.Abs(context.PositionQuantity);
+        var flattenSide = isLong ? "SELL" : "BUY";
+        var flattenOrderType = string.Equals(_config.FlattenOrderType, "MARKETABLE_LIMIT", StringComparison.OrdinalIgnoreCase)
+            ? "LMT"
+            : "MKT";
+        var flattenLimitPrice = flattenOrderType == "LMT"
+            ? (flattenSide == "BUY"
+                ? (context.AskPrice > 0 ? context.AskPrice : context.MarkPrice * 1.001)
+                : (context.BidPrice > 0 ? context.BidPrice : context.MarkPrice * 0.999))
+            : (double?)null;
+
+        return
+        [
+            new ReplayOrderIntent(
+                TimestampUtc: context.TimestampUtc,
+                Symbol: symbol,
+                Side: string.Empty,
+                Quantity: 0,
+                OrderType: "CANCEL",
+                LimitPrice: null,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"trade-management:{StrategyId}:mtf-reversal-cancel",
+                Route: _config.FlattenRoute),
+            new ReplayOrderIntent(
+                TimestampUtc: context.TimestampUtc,
+                Symbol: symbol,
+                Side: flattenSide,
+                Quantity: qty,
+                OrderType: flattenOrderType,
+                LimitPrice: flattenLimitPrice,
+                StopPrice: null,
+                TrailAmount: null,
+                TrailPercent: null,
+                TimeInForce: _config.FlattenTif,
+                ExpireAtUtc: null,
+                Source: $"trade-management:{StrategyId}:mtf-reversal-flatten",
+                Route: _config.FlattenRoute)
+        ];
+    }
 }
 
 public sealed class Eod001ForceFlatStrategy : IReplayEndOfDayStrategy
