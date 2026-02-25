@@ -39,11 +39,12 @@ public sealed class ScannerCandidateReplayRuntime :
         var tradeManagementPartialRunner = new Tmg004PartialTakeProfitRunnerTrailStrategy(BuildTradeManagementPartialRunnerConfigFromEnvironment());
         var tradeManagementTimeStop = new Tmg005TimeStopStrategy(BuildTradeManagementTimeStopConfigFromEnvironment());
         var tradeManagementAdaptive = new Tmg006VolatilityAdaptiveExitStrategy(BuildTradeManagementAdaptiveConfigFromEnvironment());
+        var tradeManagementDrawdownDerisk = new Tmg007DrawdownDeriskStrategy(BuildTradeManagementDrawdownDeriskConfigFromEnvironment());
         var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
         _pipeline = new ReplayDayTradingPipeline(
             globalSafetyOverlays: [_overlay],
             entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive],
+            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk],
             endOfDayStrategies: [endOfDay]);
         _positionQuantity = 0;
         _averagePrice = 0;
@@ -218,6 +219,18 @@ public sealed class ScannerCandidateReplayRuntime :
             HighStopLossPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_006_HIGH_STOP_LOSS_PCT", 0.004)),
             HighTakeProfitPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_006_HIGH_TAKE_PROFIT_PCT", 0.010)),
             TimeInForce: TryReadEnvironmentString("TMG_006_TIF", "DAY").ToUpperInvariant());
+    }
+
+    private static Tmg007DrawdownDeriskConfig BuildTradeManagementDrawdownDeriskConfigFromEnvironment()
+    {
+        return new Tmg007DrawdownDeriskConfig(
+            Enabled: TryReadEnvironmentBool("TMG_007_ENABLED", false),
+            DeriskDrawdownPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_007_DERISK_DRAWDOWN_PCT", 0.003)),
+            FlattenDrawdownPct: Math.Max(0.0, TryReadEnvironmentDouble("TMG_007_FLATTEN_DRAWDOWN_PCT", 0.006)),
+            DeriskFraction: Math.Clamp(TryReadEnvironmentDouble("TMG_007_DERISK_FRACTION", 0.5), 0.0, 1.0),
+            FlattenRoute: TryReadEnvironmentString("TMG_007_FLATTEN_ROUTE", "SMART"),
+            FlattenTif: TryReadEnvironmentString("TMG_007_FLATTEN_TIF", "DAY").ToUpperInvariant(),
+            FlattenOrderType: TryReadEnvironmentString("TMG_007_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
     private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
