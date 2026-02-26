@@ -17,6 +17,9 @@ param(
     [double]$MaxShares = 10,
     [double]$MaxPrice = 10,
     [string]$AllowedSymbols = "SIRI,SOFI,F,PLTR,PLTK",
+    [switch]$RelaxLiveQuoteSanity,
+    [switch]$DisableLiveMomentumGuard,
+    [switch]$PreTradeSessionWindowWarn,
     [switch]$RunOrderPlacement,
     [switch]$RunCancel,
     [int]$CancelOrderId = 0,
@@ -28,6 +31,7 @@ if ($args -contains '-?' -or $args -contains '/?') {
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\\ops\\run_paper_trading_activation.ps1 -Account <DU...> [options]"
     Write-Host "  Optional placement: -RunOrderPlacement"
+    Write-Host "    Relaxed placement flags: -RelaxLiveQuoteSanity -DisableLiveMomentumGuard -PreTradeSessionWindowWarn"
     Write-Host "  Optional cancel: -RunCancel -CancelOrderId <id>"
     Write-Host "  Safety overrides: -AllowNonPaperPort -AllowNonPaperAccount"
     return
@@ -114,7 +118,7 @@ Invoke-HarvesterMode -Title "Paper what-if order preview" -Args @(
 )
 
 if ($RunOrderPlacement) {
-    Invoke-HarvesterMode -Title "Paper order placement (guarded)" -Args @(
+    $placementArgs = @(
         "--mode", "orders-place-sim",
         "--host", $GatewayHost,
         "--port", "$Port",
@@ -132,6 +136,20 @@ if ($RunOrderPlacement) {
         "--max-price", "$MaxPrice",
         "--allowed-symbols", $AllowedSymbols
     )
+
+    if ($RelaxLiveQuoteSanity) {
+        $placementArgs += @("--live-price-sanity-require-quote", "false")
+    }
+
+    if ($DisableLiveMomentumGuard) {
+        $placementArgs += @("--live-momentum-guard", "false")
+    }
+
+    if ($PreTradeSessionWindowWarn) {
+        $placementArgs += @("--pretrade-controls", "max-notional=reject;max-qty=reject;max-daily-orders=reject;session-window=warn")
+    }
+
+    Invoke-HarvesterMode -Title "Paper order placement (guarded)" -Args $placementArgs
 }
 
 if ($RunCancel) {
@@ -159,9 +177,20 @@ Write-Host "Host/Port: ${GatewayHost}:$Port"
 Write-Host "Exports: $fullExportDir"
 Write-Host "Order placement executed: $RunOrderPlacement"
 Write-Host "Cancel executed: $RunCancel"
+Write-Host "Relax quote sanity: $RelaxLiveQuoteSanity"
+Write-Host "Disable momentum guard: $DisableLiveMomentumGuard"
+Write-Host "Session-window warn mode: $PreTradeSessionWindowWarn"
+
+Write-Host "`nRuntime notes:" -ForegroundColor Yellow
+Write-Host "- What-if may complete with ApiPending and no margin rows; this is treated as non-fatal fallback when no blocking API errors are present."
+Write-Host "- IBKR code 399 (exchange deferral outside session) is treated as informational/non-blocking."
+Write-Host "- Inspect exports for details: whatif_status_*.json, whatif_errors_*.json, api_error_normalization_*.json."
 
 Write-Host "`nLaunch command (safe baseline, no placement):" -ForegroundColor Yellow
 Write-Host ".\ops\run_paper_trading_activation.ps1 -GatewayHost $GatewayHost -Port $Port -ClientId $ClientId -Account $normalizedAccount -Symbol $Symbol -PrimaryExchange $PrimaryExchange -ExportDir `"$fullExportDir`" -TimeoutSeconds $TimeoutSeconds -MarketDataType $MarketDataType -CaptureSeconds $CaptureSeconds -DepthRows $DepthRows -OrderAction $normalizedAction -OrderQuantity $OrderQuantity -OrderLimit $OrderLimit"
 
 Write-Host "`nTo place one guarded paper order:" -ForegroundColor Yellow
 Write-Host ".\ops\run_paper_trading_activation.ps1 -GatewayHost $GatewayHost -Port $Port -ClientId $ClientId -Account $normalizedAccount -Symbol $Symbol -PrimaryExchange $PrimaryExchange -ExportDir `"$fullExportDir`" -RunOrderPlacement -OrderAction $normalizedAction -OrderQuantity $OrderQuantity -OrderLimit $OrderLimit -MaxNotional $MaxNotional -MaxShares $MaxShares -MaxPrice $MaxPrice -AllowedSymbols `"$AllowedSymbols`""
+
+Write-Host "`nTo place with relaxed local guards (market-close/deferral validation):" -ForegroundColor Yellow
+Write-Host ".\ops\run_paper_trading_activation.ps1 -GatewayHost $GatewayHost -Port $Port -ClientId $ClientId -Account $normalizedAccount -Symbol $Symbol -PrimaryExchange $PrimaryExchange -ExportDir `"$fullExportDir`" -RunOrderPlacement -OrderAction $normalizedAction -OrderQuantity $OrderQuantity -OrderLimit $OrderLimit -MaxNotional $MaxNotional -MaxShares $MaxShares -MaxPrice $MaxPrice -AllowedSymbols `"$AllowedSymbols`" -RelaxLiveQuoteSanity -DisableLiveMomentumGuard -PreTradeSessionWindowWarn"

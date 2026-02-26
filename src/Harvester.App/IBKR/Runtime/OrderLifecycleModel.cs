@@ -204,6 +204,14 @@ public static class OrderLifecycleModel
 
     public static ApiErrorClassification ClassifyApiError(IbApiError error, AppOptions options, IbErrorPolicy errorPolicy)
     {
+        if (IsExchangeDeferralWarning(error))
+        {
+            return new ApiErrorClassification(
+                ApiErrorDisposition.NonBlocking,
+                IbErrorAction.Warn,
+                "exchange deferral warning (order accepted for next session window)");
+        }
+
         if (IsSoftenedCancelNotFoundError(error, options))
         {
             return new ApiErrorClassification(
@@ -231,6 +239,17 @@ public static class OrderLifecycleModel
         };
 
         return new ApiErrorClassification(disposition, decision.Action, decision.Reason);
+    }
+
+    private static bool IsExchangeDeferralWarning(IbApiError error)
+    {
+        if (error.Code != 399)
+        {
+            return false;
+        }
+
+        return error.Message.Contains("will not be placed at the exchange until", StringComparison.OrdinalIgnoreCase)
+            || error.Message.Contains("outside regular trading hours", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsSoftenedCancelNotFoundError(IbApiError error, AppOptions options)

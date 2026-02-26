@@ -12,6 +12,9 @@ public sealed class ScannerCandidateReplayRuntime :
     private readonly Ovl001FlattenReversalAndGivebackCapStrategy _overlay;
     private readonly ReplayMtfCandleSignalEngine _mtfSignalEngine;
     private readonly ReplayDayTradingPipeline _pipeline;
+    private readonly ReplayRamSessionState _ramSessionState;
+    private readonly ReplayTradeEpisodeRecorder _episodeRecorder;
+    private readonly Dictionary<string, double> _positionBySymbol;
     private double _positionQuantity;
     private double _averagePrice;
 
@@ -92,6 +95,9 @@ public sealed class ScannerCandidateReplayRuntime :
             entryStrategies: [entry],
             tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm, tradeManagementMtfCandleReversal, tradeManagementMtfRegimeAtr],
             endOfDayStrategies: [endOfDay]);
+        _ramSessionState = new ReplayRamSessionState(maxBarsPerSymbol: 2000, maxBucketMinutes: 60, imbalanceTopN: 5);
+        _episodeRecorder = new ReplayTradeEpisodeRecorder(Path.Combine(Directory.GetCurrentDirectory(), "temp", "episodes"));
+        _positionBySymbol = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         _positionQuantity = 0;
         _averagePrice = 0;
     }
@@ -172,16 +178,32 @@ public sealed class ScannerCandidateReplayRuntime :
             AskPrice: askPrice,
             PositionQuantity: _positionQuantity,
             AveragePrice: _averagePrice);
+        var intents = _pipeline.Evaluate(dayTradingContext, _selectionSnapshot);
 
-        return _pipeline.Evaluate(dayTradingContext, _selectionSnapshot);
+        var gateCodes = intents
+            .Select(x => x.Source)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        _ramSessionState.UpdateSlice(symbol, dataSlice, gateCodes);
+
+        return intents;
     }
 
     public void OnReplaySliceResult(StrategyDataSlice dataSlice, ReplaySliceSimulationResult result, string activeSymbol)
     {
         _positionQuantity = result.Portfolio.PositionQuantity;
         _averagePrice = result.Portfolio.AveragePrice;
+
+        var symbol = (activeSymbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (!string.IsNullOrWhiteSpace(symbol))
+        {
+            _positionBySymbol[symbol] = result.Portfolio.PositionQuantity;
+            _episodeRecorder.ProcessSlice(symbol, result, _ramSessionState.GetBuckets(symbol));
+        }
+
         _overlay.OnPositionEvent(
-            activeSymbol,
+            symbol,
             result.Portfolio.TimestampUtc,
             result.Portfolio.PositionQuantity,
             result.Portfolio.AveragePrice,

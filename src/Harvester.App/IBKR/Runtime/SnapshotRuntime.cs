@@ -1513,6 +1513,17 @@ public sealed class SnapshotRuntime
 
         if (_wrapper.WhatIfOrderStates.IsEmpty)
         {
+            var hasApiPendingStatus = _wrapper.OrderStatusRows.Any(row =>
+                row.Contains("status=ApiPending", StringComparison.OrdinalIgnoreCase));
+            var hasBlockingApiError = _wrapper.ApiErrors.Any(ShouldTreatAsBlockingApiError);
+
+            if (hasApiPendingStatus && !hasBlockingApiError)
+            {
+                Console.WriteLine("[WARN] What-if order state was not returned and status remained ApiPending; continuing as non-fatal timeout.");
+                Console.WriteLine("[INFO] What-if fallback: verify TWS order preview permissions if margin fields are required.");
+                return;
+            }
+
             throw new InvalidOperationException("What-if response not returned by TWS for this request. Check TWS/API permissions and account route settings.");
         }
 

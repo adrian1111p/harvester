@@ -58,9 +58,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\ops\run_internal_batch20_
 
 ## 5) Trade Episodes (RAM-first + temp files)
 
+Phase 2 runtime integration status: implemented in-app.
+
+- `ScannerCandidateReplayRuntime` now updates in-memory RAM session state per replay slice.
+- 1-second microstructure buckets are built from top/depth updates (spread, imbalance, top sizes, tape aggression, volatility proxy, gate codes).
+- Closed trades are recorded as compact episode JSON files by `ReplayTradeEpisodeRecorder`.
+
 Recommended temporary layout:
 
 - `temp/episodes/<yyyy-MM-dd>/<symbol>/<trade_id>.json`
+- optional per-second series sidecar: `temp/episodes/<yyyy-MM-dd>/<symbol>/<trade_id>.series.jsonl`
 
 Episode payload should include:
 
@@ -68,7 +75,13 @@ Episode payload should include:
 - during-trade aggregated series,
 - fills/execution,
 - labels (`pnl_usd`, `mae`, `mfe`, `exit_reason`),
-- decision trace (`entry_reason`, risk metadata).
+- labels (`pnl_usd`, `r_multiple`, `mae`, `mfe`, `exit_reason`, `win_loss`),
+- decision trace (`entry_reason`, `exit_reason`, risk metadata).
+
+Optional export toggles (environment variables):
+
+- `HARVESTER_EPISODE_EPOCH_MS=true` → serialize timestamps as Unix epoch milliseconds.
+- `HARVESTER_EPISODE_SERIES_JSONL=true` → emit per-trade `.series.jsonl` (one line per second bucket).
 
 ## 6) End-of-Day Learning + Cleanup
 
