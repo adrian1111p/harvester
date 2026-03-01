@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Harvester.App.IBKR.Runtime;
 
 namespace Harvester.App.Strategy;
@@ -9,6 +10,7 @@ public sealed class ScannerCandidateReplayRuntime :
     IReplayScannerSelectionSource
 {
     private readonly ReplayScannerSymbolSelectionSnapshotRow _selectionSnapshot;
+    private readonly ScannerV2SelectionSnapshot? _selectionSnapshotV2;
     private readonly Ovl001FlattenReversalAndGivebackCapStrategy _overlay;
     private readonly ReplayMtfCandleSignalEngine _mtfSignalEngine;
     private readonly ReplayDayTradingPipeline _pipeline;
@@ -28,8 +30,59 @@ public sealed class ScannerCandidateReplayRuntime :
         string timeInForce,
         double limitOffsetBps)
     {
+        // ── V1 selection (backward compat) ──────────────────────────
         var selectionModule = new ReplayScannerSymbolSelectionModule(candidatesInputPath, topN, minScore);
-        _selectionSnapshot = selectionModule.GetSnapshot();
+        var v1Snapshot = selectionModule.GetSnapshot();
+
+        // ── V2 selection engine (alongside V1) ──────────────────────
+        var v2Config = BuildScannerSelectionV2ConfigFromEnvironment(topN, minScore);
+        var useV2 = TryReadEnvironmentBool("SCN_V2_ENABLED", false);
+        if (useV2)
+        {
+            var v2Engine = new ScannerSelectionEngineV2(v2Config);
+            var fileCandidates = v1Snapshot.RankedSymbols
+                .Select(r => new ScannerV2CandidateFileRow
+                {
+                    Symbol = r.Symbol,
+                    WeightedScore = r.WeightedScore,
+                    Eligible = r.Eligible,
+                    AverageRank = r.AverageRank
+                })
+                .ToList();
+
+            // Load self-learning V2 bias store if it exists
+            var biasEntries = LoadScannerV2BiasEntries();
+
+            // In replay mode we don't have live L1/L2, so pass empty maps.
+            // The V2 engine gracefully falls back to neutral sub-scores.
+            var emptyL1 = new Dictionary<string, ScannerV2L1Snapshot>();
+            var emptyL2 = new Dictionary<string, ScannerV2L2DepthSnapshot>();
+
+            _selectionSnapshotV2 = v2Engine.Evaluate(
+                fileCandidates,
+                emptyL1,
+                emptyL2,
+                biasEntries,
+                sessionOpenUtc: DateTime.MinValue,
+                sessionCloseUtc: DateTime.MinValue,
+                nowUtc: DateTime.UtcNow,
+                sourcePath: candidatesInputPath);
+
+            // Use V2 output (converted to V1 format) as the primary selection
+            _selectionSnapshot = ScannerSelectionEngineV2.ToV1Snapshot(_selectionSnapshotV2);
+
+            Console.WriteLine($"[INFO] Scanner Selection V2.0: {_selectionSnapshotV2.SelectedCount} selected " +
+                $"from {_selectionSnapshotV2.TotalCandidates} candidates " +
+                $"({_selectionSnapshotV2.EligibleCandidates} eligible, phase={_selectionSnapshotV2.SessionPhase})");
+
+            // Export V2 snapshot for diagnostics
+            ExportScannerV2Snapshot(_selectionSnapshotV2);
+        }
+        else
+        {
+            _selectionSnapshot = v1Snapshot;
+            _selectionSnapshotV2 = null;
+        }
         _overlay = new Ovl001FlattenReversalAndGivebackCapStrategy(BuildOverlayConfigFromEnvironment());
         _mtfSignalEngine = new ReplayMtfCandleSignalEngine();
         var entry = new ReplayScannerSingleShotEntryStrategy(
@@ -39,7 +92,9 @@ public sealed class ScannerCandidateReplayRuntime :
             timeInForce,
             limitOffsetBps,
             _mtfSignalEngine,
-            BuildScannerRequireMtfAlignmentFromEnvironment());
+            BuildScannerRequireMtfAlignmentFromEnvironment(),
+            BuildScannerRequireBuySetupConfirmationFromEnvironment(),
+            BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment());
         var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
         var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
         var tradeManagementTrailing = new Tmg003TrailingProgressionStrategy(BuildTradeManagementTrailingConfigFromEnvironment());
@@ -170,6 +225,8 @@ public sealed class ScannerCandidateReplayRuntime :
             _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, markPrice);
         }
 
+        var latestBar = dataSlice.HistoricalBars.LastOrDefault();
+
         var dayTradingContext = new ReplayDayTradingContext(
             TimestampUtc: dataSlice.TimestampUtc,
             Symbol: symbol,
@@ -177,7 +234,12 @@ public sealed class ScannerCandidateReplayRuntime :
             BidPrice: bidPrice,
             AskPrice: askPrice,
             PositionQuantity: _positionQuantity,
-            AveragePrice: _averagePrice);
+            AveragePrice: _averagePrice,
+            BarOpen: latestBar?.Open ?? markPrice,
+            BarHigh: latestBar?.High ?? markPrice,
+            BarLow: latestBar?.Low ?? markPrice,
+            BarClose: latestBar?.Close ?? markPrice,
+            BarVolume: latestBar is null ? 0.0 : (double)latestBar.Volume);
         var intents = _pipeline.Evaluate(dayTradingContext, _selectionSnapshot);
 
         var gateCodes = intents
@@ -293,6 +355,16 @@ public sealed class ScannerCandidateReplayRuntime :
     private static bool BuildScannerRequireMtfAlignmentFromEnvironment()
     {
         return TryReadEnvironmentBool("SCN_001_REQUIRE_MTF_ALIGNMENT", false);
+    }
+
+    private static bool BuildScannerRequireBuySetupConfirmationFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_BUY_SETUP_CONFIRMATION", false);
+    }
+
+    private static bool BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_ENHANCED_BUY_SETUP_CONFIRMATION", false);
     }
 
     private static Tmg002BreakEvenConfig BuildTradeManagementBreakEvenConfigFromEnvironment()
@@ -1057,5 +1129,101 @@ public sealed class ScannerCandidateReplayRuntime :
         return string.IsNullOrWhiteSpace(value)
             ? fallback
             : value.Trim();
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SCANNER SELECTION V2 HELPERS
+    // ─────────────────────────────────────────────────────────────────
+
+    private static ScannerSelectionV2Config BuildScannerSelectionV2ConfigFromEnvironment(int topN, double minScore)
+    {
+        return new ScannerSelectionV2Config
+        {
+            TopN = Math.Max(1, TryReadEnvironmentInt("SCN_V2_TOP_N", topN)),
+            MinFileScore = TryReadEnvironmentDouble("SCN_V2_MIN_FILE_SCORE", minScore),
+            MinPrice = TryReadEnvironmentDouble("SCN_V2_MIN_PRICE", 0.50),
+            MaxPrice = TryReadEnvironmentDouble("SCN_V2_MAX_PRICE", 10.0),
+            MaxSpreadPct = TryReadEnvironmentDouble("SCN_V2_MAX_SPREAD_PCT", 0.03),
+            MinVolume = TryReadEnvironmentDouble("SCN_V2_MIN_VOLUME", 1000),
+            MinBidDepthShares = TryReadEnvironmentDouble("SCN_V2_MIN_BID_DEPTH", 500),
+            MinAskDepthShares = TryReadEnvironmentDouble("SCN_V2_MIN_ASK_DEPTH", 500),
+            DepthLevels = Math.Max(1, TryReadEnvironmentInt("SCN_V2_DEPTH_LEVELS", 5)),
+            MaxAdverseMomentumBps = TryReadEnvironmentDouble("SCN_V2_MAX_ADVERSE_MOMENTUM_BPS", 50.0),
+            MaxBiasShift = TryReadEnvironmentDouble("SCN_V2_MAX_BIAS_SHIFT", 20.0),
+            OpenPhaseMinutes = Math.Max(0, TryReadEnvironmentInt("SCN_V2_OPEN_PHASE_MINUTES", 15)),
+            ClosePhaseMinutes = Math.Max(0, TryReadEnvironmentInt("SCN_V2_CLOSE_PHASE_MINUTES", 30)),
+            OpenPhaseScoreMultiplier = TryReadEnvironmentDouble("SCN_V2_OPEN_PHASE_MULTIPLIER", 0.90),
+            ClosePhaseScoreMultiplier = TryReadEnvironmentDouble("SCN_V2_CLOSE_PHASE_MULTIPLIER", 0.85),
+            MaxExchangeConcentration = Math.Clamp(TryReadEnvironmentDouble("SCN_V2_MAX_EXCHANGE_CONCENTRATION", 0.60), 0.0, 1.0),
+            // Weights (must sum to ~1.0)
+            FileScoreWeight = TryReadEnvironmentDouble("SCN_V2_W_FILE_SCORE", 0.25),
+            SpreadWeight = TryReadEnvironmentDouble("SCN_V2_W_SPREAD", 0.15),
+            VolumeWeight = TryReadEnvironmentDouble("SCN_V2_W_VOLUME", 0.10),
+            DepthWeight = TryReadEnvironmentDouble("SCN_V2_W_DEPTH", 0.10),
+            MomentumWeight = TryReadEnvironmentDouble("SCN_V2_W_MOMENTUM", 0.10),
+            BiasWeight = TryReadEnvironmentDouble("SCN_V2_W_BIAS", 0.10),
+            TimeOfDayWeight = TryReadEnvironmentDouble("SCN_V2_W_TIME_OF_DAY", 0.05),
+            DiversificationWeight = TryReadEnvironmentDouble("SCN_V2_W_DIVERSIFICATION", 0.05),
+            ConsistencyWeight = TryReadEnvironmentDouble("SCN_V2_W_CONSISTENCY", 0.10)
+        };
+    }
+
+    private static IReadOnlyList<ScannerV2SymbolBias> LoadScannerV2BiasEntries()
+    {
+        var biasPath = Environment.GetEnvironmentVariable("SCN_V2_BIAS_STORE_PATH");
+        if (string.IsNullOrWhiteSpace(biasPath))
+        {
+            // Try default path
+            biasPath = Path.Combine(Directory.GetCurrentDirectory(), "temp", "scanner_v2_bias_store.json");
+        }
+
+        if (!File.Exists(biasPath))
+        {
+            return Array.Empty<ScannerV2SymbolBias>();
+        }
+
+        try
+        {
+            var json = File.ReadAllText(biasPath);
+            return JsonSerializer.Deserialize<ScannerV2SymbolBias[]>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            }) ?? Array.Empty<ScannerV2SymbolBias>();
+        }
+        catch
+        {
+            Console.WriteLine($"[WARN] Failed to load scanner V2 bias store from {biasPath}; using empty bias.");
+            return Array.Empty<ScannerV2SymbolBias>();
+        }
+    }
+
+    private static void ExportScannerV2Snapshot(ScannerV2SelectionSnapshot snapshot)
+    {
+        try
+        {
+            var dir = Path.Combine(Directory.GetCurrentDirectory(), "temp", "scanner_v2");
+            Directory.CreateDirectory(dir);
+            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+            var path = Path.Combine(dir, $"scanner_v2_selection_{timestamp}.json");
+            var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            });
+            File.WriteAllText(path, json);
+            Console.WriteLine($"[OK] Scanner V2 selection export: {path}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Failed to export scanner V2 snapshot: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Returns the V2 selection snapshot if V2 is enabled, null otherwise.
+    /// </summary>
+    public ScannerV2SelectionSnapshot? GetScannerSelectionSnapshotV2()
+    {
+        return _selectionSnapshotV2;
     }
 }

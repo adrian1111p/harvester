@@ -259,7 +259,7 @@ public static class OrderLifecycleModel
             return false;
         }
 
-        if (error.Code != 10147)
+        if (error.Code is not (10147 or 10148))
         {
             return false;
         }
@@ -270,7 +270,8 @@ public static class OrderLifecycleModel
         }
 
         return error.Message.Contains("needs to be cancelled is not found", StringComparison.OrdinalIgnoreCase)
-            || error.Message.Contains("not found", StringComparison.OrdinalIgnoreCase);
+            || error.Message.Contains("not found", StringComparison.OrdinalIgnoreCase)
+            || error.Message.Contains("cannot be cancelled, state: Filled", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsCancelSuccessConfirmation(IbApiError error, AppOptions options)

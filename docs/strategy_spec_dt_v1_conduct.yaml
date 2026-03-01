@@ -1,0 +1,150 @@
+spec_version: "1.1"
+engine_compat: "gpt-5.3-codex"
+strategy:
+  id: DT_V1.1_CONDUCT
+  description: >
+    Entry-filled conduct engine with layered exit rules, adaptive trailing,
+    hard stop, break-even ratchet, profit-lock floor, and event-driven flattening.
+    V1.1 improvements: hard stop, break-even/profit-lock, cancel-before-flatten,
+    position qty refresh, EMA ATR, ATR warmup guard, unified exit priority.
+  cadence:
+    on_second_tick: true
+    on_order_event: true
+    on_position_event: true
+
+config:
+  data_freshness:
+    l1_stale_sec: 3
+    l2_stale_sec: 2                       # reserved for future L2 integration
+
+  immediate_reversal:
+    window_sec: 5
+    adverse_move_pct: 0.002               # 0.20%
+    adverse_move_usd_static: 10.0
+    adverse_move_usd_dynamic:
+      mode: "min(static, 0.35R)"
+
+  giveback_cap:
+    pct_of_notional: 0.01                 # 1%
+    usd_cap: 30.0                         # max $30
+
+  hard_stop:                              # V1.1 addition
+    distance_multiplier: 2.0              # 2x giveback cap from entry
+    min_distance_pct: 0.03                # at least 3% from entry price
+    note: "abs max loss — fires before trailing or drawdown cap"
+
+  max_drawdown:                           # renamed from dynamic_reversal
+    initial_pct: 0.01                     # 1% drawdown from peak position value
+    tighten_trigger_win_pct: 0.01         # tighten after +1% favorable
+    tightened_pct: 0.005                  # 0.5% after tightening
+    scope: "pre-trailing only — once trailing activates, trailing supersedes"
+
+  trailing_activation:
+    min_profit_usd: 10.0
+    min_profit_r_multiple: 0.5
+
+  trailing_noise_floor:
+    k_spread: 2.0
+    k_ticks: 3
+    k_atr_1m: 0.10                        # 10% of ATR
+    atr_source: "EMA of 1s absolute price changes (alpha=0.1)"
+    atr_window_size: 120
+    atr_warmup_min_samples: 10            # V1.1: noise floor disabled until warmup met
+
+  break_even_ratchet:                     # V1.1 addition
+    activation_r: 1.0                     # after peak PnL >= 1R, floor moves to entry
+    note: "converts partial winners into guaranteed-flat-or-better"
+
+  profit_lock:                            # V1.1 addition
+    activation_r: 2.0                     # after peak PnL >= 2R
+    guarantee_r: 0.5                      # guarantee at least 0.5R profit
+    note: "prevents round-trip losses on strong moves"
+
+  time_stop:
+    time_stop_sec: 90
+    min_progress_r: 0.5
+
+  eod:
+    enabled: true
+    flatten_time_exchange_tz: "15:55"
+
+  execution:
+    flatten_order_type: "MARKET"
+    tif: "DAY+"
+    route: "SMART"
+
+  position_management:                    # V1.1 addition
+    recheck_interval_sec: 15              # re-check broker position for external closes
+    cancel_before_flatten: true           # cancel conflicting orders before exit
+    flatten_verify: true                  # verify position closed after flatten
+    flatten_retry: true                   # retry if position not fully closed
+
+state:
+  track:
+    - symbol
+    - side (is_long)
+    - filled_quantity (mutable — updated on external partial close)
+    - entry_price
+    - loop_start_utc
+    - peak_price
+    - trough_price
+    - peak_unreal_pnl_usd
+    - mfe_usd
+    - mae_usd
+    - trailing_active
+    - tightened_rule_active
+    - active_max_drawdown_pct
+    - break_even_active                    # V1.1
+    - profit_locked                        # V1.1
+    - floor_price_per_share                # V1.1
+    - l1_last_fresh_utc
+    - time_stop_deadline_utc
+    - mark_history (Queue<double>)
+    - ticks_since_position_recheck         # V1.1
+
+exit_priority:
+  E1: { reason: "L1_STALE",           when: "no L1 > 3s" }
+  E2: { reason: "IMMEDIATE_REVERSAL", when: "first 5s, adverse >= 0.2% or dynamic USD" }
+  E3: { reason: "HARD_STOP",          when: "price breaches absolute stop level (V1.1)" }
+  E4: { reason: "BREAKEVEN_FLOOR|PROFIT_LOCK_FLOOR", when: "price breaches ratcheted floor (V1.1)" }
+  E5: { reason: "TRAIL_STOP",         when: "trailing active, mark pulls back > trail distance" }
+  E6: { reason: "MAX_DRAWDOWN",       when: "pre-trailing, drawdown from peak > max_drawdown_pct" }
+  E7: { reason: "TIME_STOP",          when: "after 90s, MFE < 0.5R" }
+  E8: { reason: "EOD",                when: "15:55 ET" }
+  E0: { reason: "EXTERNAL_CLOSE",     when: "position qty refresh detects 0" }
+
+flatten_procedure:
+  steps:
+    - "cancel all open orders for symbol (avoid OCA conflicts)"
+    - "submit MKT exit for full remaining qty"
+    - "wait 2s, verify position closed"
+    - "if position remains: retry MKT for remaining qty"
+    - "order_ref format: CONDUCT_V1.1_{REASON}_{timestamp}"
+
+diagnostics:
+  periodic_log_interval_ticks: 30         # log full state every 30s
+  fields_logged:
+    - mark, peak, trough, unreal, mfe, mae, peakPnl
+    - trailing, breakeven, locked, floor, atr, spread
+
+v1_to_v1.1_changelog:
+  removed:
+    - "GIVEBACK_REVERSAL exit (redundant with MAX_DRAWDOWN + trailing)"
+    - "Simple average ATR proxy (replaced with EMA)"
+    - "Local function SubmitFlattenExitAsync (replaced with ConductFlattenAsync)"
+  added:
+    - "HARD_STOP (absolute max-loss price level)"
+    - "BREAKEVEN_FLOOR (floor ratchets to entry after 1R)"
+    - "PROFIT_LOCK_FLOOR (guarantee 0.5R after 2R peak)"
+    - "MAX_DRAWDOWN (unified pre-trailing drawdown cap)"
+    - "Cancel conflicting orders before flatten"
+    - "Flatten verification + retry"
+    - "Position qty refresh (detect external closes)"
+    - "EMA-based ATR proxy with warmup guard"
+    - "ConductExitConfig record (structured, overrideable defaults)"
+    - "ConductPositionState class (mutable state tracking)"
+    - "Periodic diagnostics logging (every 30 ticks)"
+  improved:
+    - "Trailing noise floor skips ATR component until 10+ samples (warmup)"
+    - "All config centralized in ConductExitConfig instead of method-local constants"
+    - "OrderRef prefix changed from HARVESTER_EXIT to CONDUCT_V1.1"

@@ -114,6 +114,15 @@ public sealed class SnapshotRuntime
                 case RunMode.Positions:
                     await RunPositionsMode(client, brokerAdapter, runtimeCts.Token);
                     break;
+                case RunMode.PositionsMonitor1Pct:
+                    await RunPositionsMonitor1PctMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
+                case RunMode.PositionsMonitor1PctLoop:
+                    await RunPositionsMonitor1PctLoopMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
+                case RunMode.PositionsAutoReplaceScanLoop:
+                    await RunPositionsAutoReplaceScanLoopMode(client, brokerAdapter, runtimeCts.Token);
+                    break;
                 case RunMode.SnapshotAll:
                     await RunSnapshotAllMode(client, brokerAdapter, runtimeCts.Token);
                     break;
@@ -750,6 +759,255 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Positions export: {positionsPath} (rows={_wrapper.Positions.Count})");
     }
 
+    private async Task RunPositionsMonitor1PctMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        var activePositions = await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsMonitor1PctMode));
+
+        if (activePositions.Length == 0)
+        {
+            Console.WriteLine("[INFO] Positions monitor: no active positions to monitor.");
+            return;
+        }
+
+        Console.WriteLine($"[INFO] Positions monitor: arming 1% reversal monitor for {activePositions.Length} active position(s).");
+
+        var monitorTasks = new List<Task>(activePositions.Length);
+        for (var i = 0; i < activePositions.Length; i++)
+        {
+            var position = activePositions[i];
+            var livePlan = new LiveOrderPlacementPlan(
+                position.Symbol,
+                position.EntryAction,
+                position.Quantity,
+                position.SeedLimit,
+                "positions-monitor-1pct");
+            var requestIdSeed = 9960 + (i * 100);
+            monitorTasks.Add(TryApplyPeakDrawdownExitAsync(client, brokerAdapter, livePlan, position.Quantity, token, requestIdSeed));
+        }
+
+        await Task.WhenAll(monitorTasks);
+
+        brokerAdapter.RequestOpenOrders(client);
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var positionsPath = Path.Combine(outputDir, $"positions_monitor_1pct_positions_{timestamp}.json");
+        var openOrdersPath = Path.Combine(outputDir, $"positions_monitor_1pct_open_orders_{timestamp}.json");
+        WriteJson(positionsPath, _wrapper.Positions.ToArray());
+        WriteJson(openOrdersPath, _wrapper.OpenOrders.ToArray());
+
+        Console.WriteLine($"[OK] Positions monitor positions export: {positionsPath} (rows={_wrapper.Positions.Count})");
+        Console.WriteLine($"[OK] Positions monitor open-orders export: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
+    }
+
+    private async Task RunPositionsMonitor1PctLoopMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        var cycle = 0;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                cycle++;
+                var activePositions = await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsMonitor1PctLoopMode));
+                if (activePositions.Length == 0)
+                {
+                    Console.WriteLine("[OK] Positions monitor loop: all monitored positions are closed.");
+                    break;
+                }
+
+                Console.WriteLine($"[INFO] Positions monitor loop: cycle={cycle} activePositions={activePositions.Length}.");
+
+                var monitorTasks = new List<Task>(activePositions.Length);
+                for (var i = 0; i < activePositions.Length; i++)
+                {
+                    var position = activePositions[i];
+                    var livePlan = new LiveOrderPlacementPlan(
+                        position.Symbol,
+                        position.EntryAction,
+                        position.Quantity,
+                        position.SeedLimit,
+                        "positions-monitor-1pct-loop");
+                    var requestIdSeed = 10960 + (cycle * 1000) + (i * 100);
+                    monitorTasks.Add(TryApplyPeakDrawdownExitAsync(client, brokerAdapter, livePlan, position.Quantity, token, requestIdSeed));
+                }
+
+                await Task.WhenAll(monitorTasks);
+                await Task.Delay(TimeSpan.FromSeconds(1), token);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            Console.WriteLine("[WARN] Positions monitor loop ended due to command timeout/cancellation.");
+            return;
+        }
+
+        brokerAdapter.RequestOpenOrders(client);
+        await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var positionsPath = Path.Combine(outputDir, $"positions_monitor_1pct_loop_positions_{timestamp}.json");
+        var openOrdersPath = Path.Combine(outputDir, $"positions_monitor_1pct_loop_open_orders_{timestamp}.json");
+        WriteJson(positionsPath, _wrapper.Positions.ToArray());
+        WriteJson(openOrdersPath, _wrapper.OpenOrders.ToArray());
+
+        Console.WriteLine($"[OK] Positions monitor loop positions export: {positionsPath} (rows={_wrapper.Positions.Count})");
+        Console.WriteLine($"[OK] Positions monitor loop open-orders export: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
+    }
+
+    private async Task RunPositionsAutoReplaceScanLoopMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        EnsureSteadyStateForOrderRoute(nameof(RunPositionsAutoReplaceScanLoopMode));
+
+        var allowed = _options.AllowedSymbols
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Select(x => x.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (allowed.Count == 0)
+        {
+            throw new InvalidOperationException("positions-auto-replace-scan-loop mode requires --allowed-symbols with at least one symbol.");
+        }
+
+        var initialPlans = (await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsAutoReplaceScanLoopMode)))
+            .Where(p => allowed.Contains(p.Symbol))
+            .ToArray();
+        var targetSlots = initialPlans.Length > 0
+            ? initialPlans.Length
+            : Math.Min(5, allowed.Count);
+
+        Console.WriteLine($"[INFO] Auto-replace loop: allowedSymbols={allowed.Count} targetSlots={targetSlots}.");
+
+        var previousBySymbol = initialPlans
+            .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.Last())
+            .ToDictionary(p => p.Symbol, p => p, StringComparer.OrdinalIgnoreCase);
+
+        var cycle = 0;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                cycle++;
+
+                var currentPlans = (await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsAutoReplaceScanLoopMode)))
+                    .Where(p => allowed.Contains(p.Symbol))
+                    .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.Last())
+                    .ToArray();
+                var currentBySymbol = currentPlans.ToDictionary(p => p.Symbol, p => p, StringComparer.OrdinalIgnoreCase);
+                var currentSymbols = currentBySymbol.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var closedSymbols = previousBySymbol.Keys
+                    .Where(symbol => !currentSymbols.Contains(symbol))
+                    .ToArray();
+                if (closedSymbols.Length > 0)
+                {
+                    Console.WriteLine($"[INFO] Auto-replace loop: detected closed symbol(s): {string.Join(",", closedSymbols)}.");
+                }
+
+                var replacementQuantityQueue = new Queue<double>(
+                    closedSymbols
+                        .Select(symbol => previousBySymbol.TryGetValue(symbol, out var plan)
+                            ? Math.Max(0, plan.Quantity)
+                            : Math.Max(0, _options.LiveQuantity))
+                        .Where(quantity => quantity > 0));
+
+                var missingSlots = Math.Max(0, targetSlots - currentSymbols.Count);
+                if (missingSlots > 0)
+                {
+                    Console.WriteLine($"[INFO] Auto-replace loop: cycle={cycle} missingSlots={missingSlots} active={currentSymbols.Count} target={targetSlots}.");
+                }
+
+                for (var slot = 0; slot < missingSlots && !token.IsCancellationRequested; slot++)
+                {
+                    var excluded = new HashSet<string>(currentSymbols, StringComparer.OrdinalIgnoreCase);
+                    foreach (var closedSymbol in closedSymbols)
+                    {
+                        excluded.Add(closedSymbol);
+                    }
+
+                    var replacementQuantity = replacementQuantityQueue.Count > 0
+                        ? replacementQuantityQueue.Dequeue()
+                        : Math.Max(1, _options.LiveQuantity);
+
+                    LiveOrderPlacementPlan replacementPlan;
+                    try
+                    {
+                        replacementPlan = ResolveLiveOrderPlacementPlan(
+                            actionOverride: "BUY",
+                            excludedSymbols: excluded,
+                            quantityOverride: replacementQuantity);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[WARN] Auto-replace loop: scanner selection blocked for slot {slot + 1}/{missingSlots}. reason={ex.Message}");
+                        break;
+                    }
+
+                    try
+                    {
+                        await ExecuteLiveOrderPlacementPlanAsync(
+                            client,
+                            brokerAdapter,
+                            replacementPlan,
+                            nameof(RunPositionsAutoReplaceScanLoopMode),
+                            token,
+                            quoteRequestSeed: 12917 + (cycle * 100) + (slot * 10));
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[WARN] Auto-replace loop: replacement placement failed for {replacementPlan.Symbol}. reason={ex.Message}");
+                    }
+
+                    currentPlans = (await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsAutoReplaceScanLoopMode)))
+                        .Where(p => allowed.Contains(p.Symbol))
+                        .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
+                        .Select(g => g.Last())
+                        .ToArray();
+                    currentBySymbol = currentPlans.ToDictionary(p => p.Symbol, p => p, StringComparer.OrdinalIgnoreCase);
+                    currentSymbols = currentBySymbol.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+                }
+
+                previousBySymbol = currentBySymbol;
+                await Task.Delay(TimeSpan.FromSeconds(1), token);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            Console.WriteLine("[WARN] Auto-replace loop ended due to command timeout/cancellation.");
+            return;
+        }
+    }
+
+    private async Task<PositionMonitorPlan[]> LoadActivePositionMonitorPlansAsync(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token, string origin)
+    {
+        brokerAdapter.RequestPositions(client);
+        await AwaitTrackedWithTimeout(
+            _wrapper.PositionEndTask,
+            token,
+            stage: "positionEnd",
+            requestId: null,
+            requestType: "reqPositions",
+            origin: origin);
+        brokerAdapter.CancelPositions(client);
+
+        var latestBySymbol = _wrapper.Positions
+            .Where(p => !string.IsNullOrWhiteSpace(p.Symbol))
+            .GroupBy(p => p.Symbol.Trim().ToUpperInvariant())
+            .Select(g => g.Last())
+            .Where(p => Math.Abs(p.Quantity) > 0)
+            .Select(p => new PositionMonitorPlan(
+                p.Symbol.Trim().ToUpperInvariant(),
+                p.Quantity > 0 ? "BUY" : "SELL",
+                Math.Abs(p.Quantity),
+                p.AverageCost > 0 ? p.AverageCost : 1.0))
+            .ToArray();
+
+        return latestBySymbol;
+    }
+
     private async Task RunSnapshotAllMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
@@ -931,12 +1189,37 @@ public sealed class SnapshotRuntime
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
         var livePlan = ResolveLiveOrderPlacementPlan();
-        var quoteSnapshot = await FetchLiveQuoteSnapshotAsync(client, brokerAdapter, livePlan.Symbol, 9917, token);
-        livePlan = ApplyLiveDefaultLimitFromQuote(livePlan, quoteSnapshot);
-        ValidateLiveSafetyInputs(livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, livePlan.Symbol);
-        ValidateLivePriceSanity(livePlan, quoteSnapshot);
+        await ExecuteLiveOrderPlacementPlanAsync(client, brokerAdapter, livePlan, nameof(RunOrdersPlaceSimMode), token, quoteRequestSeed: 9917);
+    }
 
-        var notional = livePlan.Quantity * livePlan.LimitPrice;
+    private async Task<LiveOrderExecutionResult> ExecuteLiveOrderPlacementPlanAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        LiveOrderPlacementPlan requestedPlan,
+        string route,
+        CancellationToken token,
+        int quoteRequestSeed)
+    {
+        var livePlan = requestedPlan;
+        var liveOrderType = NormalizeLiveOrderType(_options.LiveOrderType);
+        var quoteSnapshot = await FetchLiveQuoteSnapshotAsync(client, brokerAdapter, livePlan.Symbol, quoteRequestSeed, token);
+        if (liveOrderType == "LMT")
+        {
+            livePlan = ApplyLiveDefaultLimitFromQuote(livePlan, quoteSnapshot);
+        }
+
+        ValidateLiveSafetyInputs(livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, livePlan.Symbol, liveOrderType);
+        ValidateLivePriceSanity(livePlan, quoteSnapshot, liveOrderType);
+
+        var notionalReferencePrice = liveOrderType == "LMT"
+            ? livePlan.LimitPrice
+            : ResolveObservedPriceForExit(livePlan.Symbol, quoteSnapshot, livePlan.Action);
+        if (notionalReferencePrice <= 0)
+        {
+            notionalReferencePrice = _options.MaxPrice;
+        }
+
+        var notional = livePlan.Quantity * notionalReferencePrice;
         if (notional > _options.MaxNotional)
         {
             throw new InvalidOperationException($"Live order blocked: notional {notional:F2} exceeds max-notional {_options.MaxNotional:F2}.");
@@ -947,8 +1230,19 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Live order blocked: set --enable-live true to allow transmission.");
         }
 
+        var currentPositionQty = await GetCurrentPositionQuantityAsync(client, brokerAdapter, livePlan.Symbol, token);
+        var closesExistingPosition =
+            (string.Equals(livePlan.Action, "SELL", StringComparison.OrdinalIgnoreCase) && currentPositionQty > 0)
+            || (string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase) && currentPositionQty < 0);
+
+        if (string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase) && currentPositionQty > 0)
+        {
+            throw new InvalidOperationException(
+                $"Live order blocked: existing long position detected for {livePlan.Symbol} (qty={currentPositionQty:F4}). Close/reduce before placing another BUY.");
+        }
+
         EvaluatePreTradeControls(
-            route: nameof(RunOrdersPlaceSimMode),
+            route: route,
             symbol: livePlan.Symbol,
             action: livePlan.Action,
             quantity: livePlan.Quantity,
@@ -963,27 +1257,54 @@ public sealed class SnapshotRuntime
             _options.PrimaryExchange));
         var order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
             livePlan.Action,
-            "LMT",
+            liveOrderType,
             livePlan.Quantity,
-            LimitPrice: livePlan.LimitPrice));
+            LimitPrice: liveOrderType == "LMT" ? livePlan.LimitPrice : null));
         var nextOrderId = await _wrapper.NextValidIdTask;
         order.OrderId = nextOrderId;
         order.OrderRef = $"HARVESTER_SIM_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
         order.Transmit = true;
-        RegisterPreTradeCostEstimate(order.OrderId, nameof(RunOrdersPlaceSimMode), livePlan.Symbol, livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, order.OrderRef);
+        RegisterPreTradeCostEstimate(order.OrderId, route, livePlan.Symbol, livePlan.Action, livePlan.Quantity, livePlan.LimitPrice, order.OrderRef);
 
         brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
         MarkOrderTransmitted();
-        Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={livePlan.Symbol} action={livePlan.Action} qty={livePlan.Quantity} lmt={livePlan.LimitPrice} source={livePlan.Source}");
+        Console.WriteLine($"[OK] Sim order transmitted: orderId={order.OrderId} symbol={livePlan.Symbol} action={livePlan.Action} type={liveOrderType} qty={livePlan.Quantity} lmt={(liveOrderType == "LMT" ? livePlan.LimitPrice.ToString(CultureInfo.InvariantCulture) : "n/a")} source={livePlan.Source} route={route}");
 
         await Task.Delay(TimeSpan.FromSeconds(4), token);
         brokerAdapter.RequestOpenOrders(client);
         await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
 
+        var filledQuantity = ResolveFilledQuantityForOrder(order.OrderId);
+        if (filledQuantity > 0)
+        {
+            await TryApplyPeakDrawdownExitAsync(client, brokerAdapter, livePlan, filledQuantity, token, entryOrderId: order.OrderId);
+            brokerAdapter.RequestOpenOrders(client);
+            await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+        }
+        else
+        {
+            if (string.Equals(liveOrderType, "MKT", StringComparison.OrdinalIgnoreCase) && closesExistingPosition)
+            {
+                Console.WriteLine($"[INFO] Unfilled close MKT order left working intentionally: orderId={order.OrderId} symbol={livePlan.Symbol} action={livePlan.Action} status=awaiting-market.");
+            }
+            else
+            {
+                await TryRepriceOrCancelUnfilledLiveOrderAsync(client, brokerAdapter, livePlan, contract, order.OrderId, order.OrderRef, token);
+            }
+
+            brokerAdapter.RequestOpenOrders(client);
+            await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+        }
+
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
         var outputDir = EnsureOutputDir();
-        var placementPath = Path.Combine(outputDir, $"sim_order_{timestamp}.json");
-        var statusPath = Path.Combine(outputDir, $"sim_order_status_{timestamp}.json");
+        var routeTag = string.Equals(route, nameof(RunOrdersPlaceSimMode), StringComparison.Ordinal)
+            ? "sim_order"
+            : $"sim_order_{route.ToLowerInvariant()}";
+        var placementPath = Path.Combine(outputDir, $"{routeTag}_{timestamp}.json");
+        var statusPath = string.Equals(route, nameof(RunOrdersPlaceSimMode), StringComparison.Ordinal)
+            ? Path.Combine(outputDir, $"sim_order_status_{timestamp}.json")
+            : Path.Combine(outputDir, $"sim_order_status_{route.ToLowerInvariant()}_{timestamp}.json");
 
         var placement = new LiveOrderPlacementRow(
             timestamp,
@@ -1004,6 +1325,1289 @@ public sealed class SnapshotRuntime
 
         Console.WriteLine($"[OK] Sim placement export: {placementPath}");
         Console.WriteLine($"[OK] Sim status export: {statusPath} (rows={_wrapper.OrderStatusRows.Count})");
+
+        return new LiveOrderExecutionResult(livePlan.Symbol, livePlan.Quantity, filledQuantity, true);
+    }
+
+    private async Task<double> GetCurrentPositionQuantityAsync(EClientSocket client, IBrokerAdapter brokerAdapter, string symbol, CancellationToken token)
+    {
+        brokerAdapter.RequestPositions(client);
+        await AwaitWithTimeout(_wrapper.PositionEndTask, token, "positionEnd");
+        brokerAdapter.CancelPositions(client);
+
+        var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return 0.0;
+        }
+
+        return _wrapper.Positions
+            .Where(p => string.Equals(p.Symbol, normalized, StringComparison.OrdinalIgnoreCase))
+            .Select(p => p.Quantity)
+            .DefaultIfEmpty(0.0)
+            .Sum();
+    }
+
+    private double ResolveFilledQuantityForOrder(int orderId)
+    {
+        var filledFromCanonical = _wrapper.CanonicalOrderEvents
+            .Where(e => e.OrderId == orderId)
+            .Select(e => e.Filled)
+            .DefaultIfEmpty(0.0)
+            .Max();
+        if (filledFromCanonical > 0)
+        {
+            return filledFromCanonical;
+        }
+
+        var filledFromExecutions = _wrapper.Executions
+            .Where(e => e.OrderId == orderId)
+            .Select(e => e.Shares)
+            .DefaultIfEmpty(0.0)
+            .Sum();
+
+        return Math.Max(0.0, filledFromExecutions);
+    }
+
+    private async Task TryRepriceOrCancelUnfilledLiveOrderAsync(EClientSocket client, IBrokerAdapter brokerAdapter, LiveOrderPlacementPlan livePlan, Contract contract, int orderId, string? orderRef, CancellationToken token)
+    {
+        var latestEvent = _wrapper.CanonicalOrderEvents
+            .Where(e => e.OrderId == orderId)
+            .OrderByDescending(e => e.TimestampUtc)
+            .FirstOrDefault();
+
+        if (latestEvent is null)
+        {
+            return;
+        }
+
+        if (IsTerminalOrderStatus(latestEvent.Status))
+        {
+            return;
+        }
+
+        var remainingQuantity = latestEvent.Remaining > 0
+            ? latestEvent.Remaining
+            : Math.Max(0.0, livePlan.Quantity - latestEvent.Filled);
+        if (remainingQuantity <= 0)
+        {
+            return;
+        }
+
+        var requestId = 9970 + Math.Abs(orderId % 1000);
+        var refreshedQuote = await FetchLiveQuoteSnapshotAsync(client, brokerAdapter, livePlan.Symbol, requestId, token);
+        if (refreshedQuote.Bid <= 0 && refreshedQuote.Ask <= 0 && refreshedQuote.Last <= 0)
+        {
+            brokerAdapter.CancelOrder(client, orderId, string.Empty);
+            Console.WriteLine($"[WARN] Unfilled order canceled due to missing refreshed quote context: orderId={orderId} symbol={livePlan.Symbol} status={latestEvent.Status}.");
+            return;
+        }
+
+        var updatedPlan = ApplyLiveDefaultLimitFromQuote(livePlan with { Quantity = remainingQuantity }, refreshedQuote);
+
+        try
+        {
+            ValidateLiveSafetyInputs(updatedPlan.Action, updatedPlan.Quantity, updatedPlan.LimitPrice, updatedPlan.Symbol, "LMT");
+            ValidateLivePriceSanity(updatedPlan, refreshedQuote, "LMT");
+        }
+        catch (Exception ex)
+        {
+            brokerAdapter.CancelOrder(client, orderId, string.Empty);
+            Console.WriteLine($"[WARN] Unfilled order canceled due to invalid refreshed context: orderId={orderId} symbol={livePlan.Symbol} status={latestEvent.Status} reason={ex.Message}");
+            return;
+        }
+
+        var currentOpenLimit = _wrapper.OpenOrders
+            .Where(o => o.OrderId == orderId)
+            .Select(o => o.LimitPrice)
+            .DefaultIfEmpty(livePlan.LimitPrice)
+            .Last();
+
+        if (Math.Abs(updatedPlan.LimitPrice - currentOpenLimit) < 0.0001)
+        {
+            Console.WriteLine($"[INFO] Unfilled order remains unchanged: orderId={orderId} symbol={livePlan.Symbol} status={latestEvent.Status} remaining={remainingQuantity:F4} lmt={currentOpenLimit:F4}.");
+            return;
+        }
+
+        var amendedOrder = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+            updatedPlan.Action,
+            "LMT",
+            updatedPlan.Quantity,
+            LimitPrice: updatedPlan.LimitPrice));
+        amendedOrder.OrderId = orderId;
+        amendedOrder.OrderRef = string.IsNullOrWhiteSpace(orderRef)
+            ? $"HARVESTER_SIM_ADJUST_{DateTime.UtcNow:yyyyMMdd_HHmmss}"
+            : orderRef;
+        amendedOrder.Transmit = true;
+
+        brokerAdapter.PlaceOrder(client, orderId, contract, amendedOrder);
+        MarkOrderTransmitted();
+
+        Console.WriteLine($"[OK] Unfilled order repriced: orderId={orderId} symbol={updatedPlan.Symbol} action={updatedPlan.Action} qty={updatedPlan.Quantity:F4} oldLmt={currentOpenLimit:F4} newLmt={updatedPlan.LimitPrice:F4} status={latestEvent.Status}.");
+    }
+
+    private static bool IsTerminalOrderStatus(string? status)
+    {
+        var normalized = (status ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return false;
+        }
+
+        return normalized.Equals("Filled", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("Cancelled", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("ApiCancelled", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("Inactive", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// DT_V1.1_CONDUCT exit engine. Manages an open position from entry-fill to close
+    /// with layered exit rules checked every second in strict priority order.
+    ///
+    /// V1.1 improvements over V1.0:
+    ///   - Hard stop (absolute max-loss at 2× giveback cap from entry)
+    ///   - Break-even ratchet (floor→entry after peak PnL ≥ 1R)
+    ///   - Profit-lock floor (guarantee ≥ 0.5R after peak PnL ≥ 2R)
+    ///   - Cancel open orders before flatten (avoid OCA conflicts)
+    ///   - Position qty refresh every 15s (detect external closes)
+    ///   - EMA-based ATR proxy (faster volatility adaptation)
+    ///   - ATR warmup guard (noise floor disabled until ≥ 10 samples)
+    ///   - Unified exit priority (removed redundant GIVEBACK_REVERSAL)
+    ///   - Structured state tracking with diagnostics snapshot
+    ///
+    /// V1.2 additions:
+    ///   - SAFETY overlay (kill switch file, daily loss limit, disconnect flatten)
+    ///   - ENSURE_EXITS (broker-managed STP order + repair)
+    ///   - Take-profit scaling (TP1/TP2 with OCA reconciliation)
+    ///   - 1-minute candle maintenance with real ATR(14)
+    ///   - TradeEpisode journal output on every close
+    /// </summary>
+    private async Task TryApplyPeakDrawdownExitAsync(EClientSocket client, IBrokerAdapter brokerAdapter, LiveOrderPlacementPlan livePlan, double filledQuantity, CancellationToken token, int requestIdSeed = 9960, int? entryOrderId = null)
+    {
+        // ── V1.2 Config ──────────────────────────────────────────────────
+        var cfg = new ConductExitConfig();
+        const int monitorSafetyBufferSeconds = 5;
+        var monitorSeconds = Math.Max(0, _options.TimeoutSeconds - monitorSafetyBufferSeconds);
+        if (monitorSeconds <= 0 || filledQuantity <= 0)
+        {
+            return;
+        }
+
+        var isLong = string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase);
+        var isShort = string.Equals(livePlan.Action, "SELL", StringComparison.OrdinalIgnoreCase);
+        if (!isLong && !isShort)
+        {
+            return;
+        }
+
+        // ── Derived risk parameters ──────────────────────────────────────
+        var entryPrice = Math.Max(0.0001, Math.Abs(livePlan.LimitPrice));
+        var entryCommission = entryOrderId.HasValue
+            ? ResolveEntryCommissionForOrder(entryOrderId.Value, filledQuantity)
+            : ResolveEntryCommissionForPosition(livePlan.Symbol, livePlan.Action, filledQuantity);
+        var estimatedExitCommission = EstimateCommissionPerOrder(filledQuantity);
+        var roundTripCommission = entryCommission + estimatedExitCommission;
+        var entryNotional = entryPrice * filledQuantity;
+        var givebackLimitUsd = Math.Min(cfg.GivebackPctOfNotional * entryNotional, cfg.GivebackUsdCap);
+        var riskPerTradeUsd = Math.Max(0.01, givebackLimitUsd);
+        var trailingActivationUsd = Math.Max(cfg.TrailingProfitMinUsd, cfg.TrailingProfitMinRMultiple * riskPerTradeUsd);
+        var givebackPerShare = givebackLimitUsd / filledQuantity;
+        var immediateAdverseUsdDynamic = Math.Min(cfg.ImmediateAdverseMoveUsd, Math.Max(1.0, 0.35 * riskPerTradeUsd));
+
+        // Hard stop: absolute max-loss distance (V1.1)
+        var hardStopDistance = Math.Max(givebackPerShare * cfg.HardStopDistanceMultiplier, entryPrice * 0.03);
+        var hardStopPrice = isLong
+            ? entryPrice - hardStopDistance
+            : entryPrice + hardStopDistance;
+
+        // Break-even and profit-lock thresholds (V1.1)
+        var breakEvenActivationUsd = cfg.BreakEvenActivationR * riskPerTradeUsd;
+        var profitLockActivationUsd = cfg.ProfitLockActivationR * riskPerTradeUsd;
+        var profitLockGuaranteeUsd = cfg.ProfitLockGuaranteeR * riskPerTradeUsd;
+
+        // Take-profit prices (V1.2)
+        var tp1Price = isLong
+            ? entryPrice + (cfg.Tp1RMultiple * riskPerTradeUsd / filledQuantity)
+            : entryPrice - (cfg.Tp1RMultiple * riskPerTradeUsd / filledQuantity);
+        var tp2Price = isLong
+            ? entryPrice + (cfg.Tp2RMultiple * riskPerTradeUsd / filledQuantity)
+            : entryPrice - (cfg.Tp2RMultiple * riskPerTradeUsd / filledQuantity);
+        var tp1Qty = Math.Max(1, Math.Floor(filledQuantity * cfg.Tp1ScaleOutPct));
+        var tp2Qty = Math.Max(0, filledQuantity - tp1Qty);
+
+        // ── Initialize state ─────────────────────────────────────────────
+        var state = new ConductPositionState
+        {
+            Symbol = livePlan.Symbol,
+            IsLong = isLong,
+            FilledQuantity = filledQuantity,
+            EntryPrice = entryPrice,
+            LoopStartUtc = DateTime.UtcNow,
+            PeakPrice = entryPrice,
+            TroughPrice = entryPrice,
+            ActiveMaxDrawdownPct = cfg.InitialMaxDrawdownPct,
+            FloorPricePerShare = isLong ? 0.0 : double.MaxValue,
+            LastFreshL1Utc = DateTime.UtcNow,
+            TimeStopDeadlineUtc = DateTime.UtcNow.AddSeconds(cfg.TimeStopSec),
+            OriginalFilledQuantity = filledQuantity,
+            RiskPerTradeUsd = riskPerTradeUsd,
+            RoundTripCommission = roundTripCommission,
+        };
+
+        Console.WriteLine($"[INFO] Conduct V1.2 monitor armed: symbol={state.Symbol} side={livePlan.Action} qty={filledQuantity:F4} entry={entryPrice:F4} hardStop={hardStopPrice:F4} maxDrawdown={state.ActiveMaxDrawdownPct:P2} window={monitorSeconds}s riskUsd={riskPerTradeUsd:F2} trailingActivation={trailingActivationUsd:F2} breakEvenAt={breakEvenActivationUsd:F2} profitLockAt={profitLockActivationUsd:F2} safety={cfg.SafetyOverlayEnabled} ensureExits={cfg.EnsureExitsEnabled} tp={cfg.TakeProfitEnabled} candles={cfg.CandleMaintenanceEnabled} journal={cfg.TradeEpisodeJournalEnabled}.");
+
+        // ── Step 3.2: ENSURE_EXITS — place protective bracket (V1.2) ────
+        if (cfg.EnsureExitsEnabled)
+        {
+            await ConductEnsureExitsAsync(client, brokerAdapter, livePlan, state, cfg, hardStopPrice, tp1Price, tp2Price, tp1Qty, tp2Qty, token);
+        }
+
+        var deadlineUtc = DateTime.UtcNow.AddSeconds(monitorSeconds);
+        var requestId = requestIdSeed;
+        var loopIteration = 0;
+
+        try
+        {
+            while (DateTime.UtcNow < deadlineUtc && !token.IsCancellationRequested)
+            {
+                loopIteration++;
+
+                // ── E0: SAFETY OVERLAY (V1.2) ───────────────────────────
+                if (cfg.SafetyOverlayEnabled)
+                {
+                    state.LastConnectedUtc = _hasConnectivityFailure ? state.LastConnectedUtc : DateTime.UtcNow;
+                    var safetyReason = ConductCheckSafetyOverlay(state, cfg);
+                    if (safetyReason != null)
+                    {
+                        var safetyRefPrice = state.PeakPrice > 0 ? state.PeakPrice : entryPrice;
+                        await ConductFlattenAsync(client, brokerAdapter, livePlan, state, safetyRefPrice, safetyReason, token, loopIteration);
+                        return;
+                    }
+                }
+
+                // ── Periodic position refresh (V1.1) ────────────────────
+                if (cfg.PositionRecheckIntervalSec > 0
+                    && state.TicksSincePositionRecheck >= cfg.PositionRecheckIntervalSec)
+                {
+                    state.TicksSincePositionRecheck = 0;
+                    var currentQty = await GetCurrentPositionQuantityAsync(client, brokerAdapter, livePlan.Symbol, token);
+                    if (Math.Abs(currentQty) < 0.0001)
+                    {
+                        Console.WriteLine($"[INFO] Conduct V1.1: position externally closed. symbol={state.Symbol} reason=EXTERNAL_CLOSE.");
+                        return;
+                    }
+
+                    if (Math.Abs(currentQty) < state.FilledQuantity * 0.99)
+                    {
+                        Console.WriteLine($"[INFO] Conduct V1.1: position partially reduced externally. symbol={state.Symbol} prev={state.FilledQuantity:F4} now={Math.Abs(currentQty):F4}.");
+                        state.FilledQuantity = Math.Abs(currentQty);
+                    }
+                }
+
+                state.TicksSincePositionRecheck++;
+
+                // ── Fetch market data ────────────────────────────────────
+                var quoteSnapshot = await FetchLiveQuoteSnapshotAsync(client, brokerAdapter, livePlan.Symbol, requestId++, token);
+                var observed = ResolveObservedPriceForExit(livePlan.Symbol, quoteSnapshot, livePlan.Action);
+                var hasFreshL1 = observed > 0 && (quoteSnapshot.Bid > 0 || quoteSnapshot.Ask > 0 || quoteSnapshot.Last > 0);
+                if (hasFreshL1)
+                {
+                    state.LastFreshL1Utc = DateTime.UtcNow;
+                }
+
+                // ── E1: L1 STALE GUARD ───────────────────────────────────
+                if ((DateTime.UtcNow - state.LastFreshL1Utc).TotalSeconds > cfg.L1StaleSec)
+                {
+                    var staleRef = observed > 0 ? observed : entryPrice;
+                    await ConductFlattenAsync(client, brokerAdapter, livePlan, state, staleRef, "L1_STALE", token, loopIteration);
+                    return;
+                }
+
+                if (observed <= 0)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(cfg.MonitorPollSeconds), token);
+                    continue;
+                }
+
+                // ── Update market metrics ────────────────────────────────
+                var spread = quoteSnapshot.Bid > 0 && quoteSnapshot.Ask > 0
+                    ? Math.Max(0, quoteSnapshot.Ask - quoteSnapshot.Bid)
+                    : 0.0;
+                var tickSize = observed < 1 ? 0.0001 : 0.01;
+
+                state.MarkHistory.Enqueue(observed);
+                while (state.MarkHistory.Count > cfg.AtrWindowSize)
+                {
+                    _ = state.MarkHistory.Dequeue();
+                }
+
+                var atrProxy = ComputeEmaAtrProxy(state.MarkHistory, cfg.AtrEmaAlpha);
+
+                // ── Candle maintenance (V1.2) ────────────────────────
+                if (cfg.CandleMaintenanceEnabled && observed > 0)
+                {
+                    ConductUpdateCandle(state, observed, DateTime.UtcNow);
+                    if (state.CandleBars1M.Count >= cfg.AtrCandlePeriod)
+                    {
+                        state.Atr1M = ConductComputeAtr1M(state.CandleBars1M, cfg.AtrCandlePeriod);
+                    }
+                }
+
+                // ── Update peak/trough + MFE/MAE ─────────────────────────
+                var unrealUsd = isLong
+                    ? (observed - entryPrice) * state.FilledQuantity
+                    : (entryPrice - observed) * state.FilledQuantity;
+
+                state.MfeUsd = Math.Max(state.MfeUsd, unrealUsd);
+                state.MaeUsd = Math.Min(state.MaeUsd, unrealUsd);
+
+                if (isLong)
+                {
+                    state.PeakPrice = Math.Max(state.PeakPrice, observed);
+                    state.PeakUnrealPnlUsd = Math.Max(state.PeakUnrealPnlUsd, (state.PeakPrice - entryPrice) * state.FilledQuantity);
+                }
+                else
+                {
+                    state.TroughPrice = Math.Min(state.TroughPrice, observed);
+                    state.PeakUnrealPnlUsd = Math.Max(state.PeakUnrealPnlUsd, (entryPrice - state.TroughPrice) * state.FilledQuantity);
+                }
+
+                // ── E2: IMMEDIATE REVERSAL (first N seconds) ────────────
+                if ((DateTime.UtcNow - state.LoopStartUtc).TotalSeconds <= cfg.ImmediateWindowSec)
+                {
+                    var adversePct = Math.Abs(observed - entryPrice) / Math.Max(0.0001, entryPrice);
+                    var adverseForLong = isLong && observed < entryPrice;
+                    var adverseForShort = isShort && observed > entryPrice;
+                    if ((adverseForLong || adverseForShort)
+                        && (adversePct >= cfg.ImmediateAdverseMovePct || unrealUsd <= -immediateAdverseUsdDynamic))
+                    {
+                        await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "IMMEDIATE_REVERSAL", token, loopIteration);
+                        return;
+                    }
+                }
+
+                // ── E3: HARD STOP (absolute price floor/ceiling) V1.1 ───
+                var hardStopHit = isLong
+                    ? observed <= hardStopPrice
+                    : observed >= hardStopPrice;
+                if (hardStopHit)
+                {
+                    await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "HARD_STOP", token, loopIteration);
+                    return;
+                }
+
+                // ── Adaptive drawdown tightening ─────────────────────────
+                if (!state.TightenedRuleActive)
+                {
+                    var favorableWinPct = isLong
+                        ? (observed * state.FilledQuantity - entryNotional) / entryNotional
+                        : (entryNotional - observed * state.FilledQuantity) / entryNotional;
+                    if (favorableWinPct >= cfg.TightenTriggerWinPct)
+                    {
+                        state.TightenedRuleActive = true;
+                        state.ActiveMaxDrawdownPct = cfg.TightenedMaxDrawdownPct;
+                        Console.WriteLine($"[INFO] Conduct V1.1 drawdown tightened: symbol={state.Symbol} winPct={favorableWinPct:P2} newMaxDD={state.ActiveMaxDrawdownPct:P2}.");
+                    }
+                }
+
+                // ── Break-even ratchet (V1.1) ────────────────────────────
+                if (!state.BreakEvenActive && state.PeakUnrealPnlUsd >= breakEvenActivationUsd)
+                {
+                    state.BreakEvenActive = true;
+                    if (isLong)
+                    {
+                        state.FloorPricePerShare = Math.Max(state.FloorPricePerShare, entryPrice);
+                    }
+                    else
+                    {
+                        state.FloorPricePerShare = Math.Min(state.FloorPricePerShare, entryPrice);
+                    }
+
+                    Console.WriteLine($"[INFO] Conduct V1.1 break-even ratchet: symbol={state.Symbol} peakPnl={state.PeakUnrealPnlUsd:F2} floor={state.FloorPricePerShare:F4}.");
+                }
+
+                // ── Profit-lock floor (V1.1) ─────────────────────────────
+                if (!state.ProfitLocked && state.PeakUnrealPnlUsd >= profitLockActivationUsd)
+                {
+                    state.ProfitLocked = true;
+                    var lockPerShare = profitLockGuaranteeUsd / state.FilledQuantity;
+                    if (isLong)
+                    {
+                        state.FloorPricePerShare = Math.Max(state.FloorPricePerShare, entryPrice + lockPerShare);
+                    }
+                    else
+                    {
+                        state.FloorPricePerShare = Math.Min(state.FloorPricePerShare, entryPrice - lockPerShare);
+                    }
+
+                    Console.WriteLine($"[INFO] Conduct V1.1 profit locked: symbol={state.Symbol} peakPnl={state.PeakUnrealPnlUsd:F2} guaranteedFloor={state.FloorPricePerShare:F4} lockPerShare={lockPerShare:F4}.");
+                }
+
+                // ── E4: FLOOR BREACH (break-even / profit-lock) V1.1 ────
+                if (state.BreakEvenActive || state.ProfitLocked)
+                {
+                    var floorBreached = isLong
+                        ? observed <= state.FloorPricePerShare
+                        : observed >= state.FloorPricePerShare;
+                    if (floorBreached)
+                    {
+                        var reason = state.ProfitLocked ? "PROFIT_LOCK_FLOOR" : "BREAKEVEN_FLOOR";
+                        await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, reason, token, loopIteration);
+                        return;
+                    }
+                }
+
+                // ── E5: TRAILING STOP ────────────────────────────────────
+                if (!state.TrailingActive && state.PeakUnrealPnlUsd >= trailingActivationUsd)
+                {
+                    state.TrailingActive = true;
+                    Console.WriteLine($"[INFO] Conduct V1.1 trailing activated: symbol={state.Symbol} peakUnreal={state.PeakUnrealPnlUsd:F2} activation={trailingActivationUsd:F2}.");
+                }
+
+                if (state.TrailingActive)
+                {
+                    var noiseFloorPerShare = state.MarkHistory.Count >= cfg.AtrWarmupMinSamples
+                        ? Math.Max(
+                            Math.Max(cfg.TrailKSpread * spread, cfg.TrailKTicks * tickSize),
+                            cfg.TrailKAtr * atrProxy)
+                        : Math.Max(cfg.TrailKSpread * spread, cfg.TrailKTicks * tickSize);
+                    var trailPerShare = Math.Max(givebackPerShare, noiseFloorPerShare);
+
+                    var trailTriggered = isLong
+                        ? observed <= state.PeakPrice - trailPerShare
+                        : observed >= state.TroughPrice + trailPerShare;
+
+                    if (trailTriggered)
+                    {
+                        await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "TRAIL_STOP", token, loopIteration);
+                        return;
+                    }
+                }
+
+                // ── ENSURE_EXITS RECHECK (V1.2) ─────────────────────
+                if (cfg.EnsureExitsEnabled)
+                {
+                    state.TicksSinceExitRecheck++;
+                    if (state.TicksSinceExitRecheck >= (int)(cfg.ExitRecheckIntervalSec / cfg.MonitorPollSeconds))
+                    {
+                        state.TicksSinceExitRecheck = 0;
+                        await ConductReconcileExitsAsync(client, brokerAdapter, livePlan, state, cfg, hardStopPrice, token);
+                    }
+                }
+
+                // ── E6: MAX DRAWDOWN CAP (pre-trailing fallback) ─────────
+                // When trailing is NOT yet active, enforce percentage-based max drawdown
+                // from peak position value (subsumes the old GIVEBACK_REVERSAL).
+                if (!state.TrailingActive)
+                {
+                    var peakPositionValue = isLong
+                        ? state.PeakPrice * state.FilledQuantity
+                        : entryPrice * state.FilledQuantity;
+                    var currentPositionValue = observed * state.FilledQuantity;
+                    var drawdownFromPeak = isLong
+                        ? (peakPositionValue - currentPositionValue) / Math.Max(0.0001, peakPositionValue)
+                        : (currentPositionValue - peakPositionValue) / Math.Max(0.0001, peakPositionValue);
+
+                    if (drawdownFromPeak >= state.ActiveMaxDrawdownPct)
+                    {
+                        await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "MAX_DRAWDOWN", token, loopIteration);
+                        return;
+                    }
+                }
+
+                // ── E7: TIME STOP ────────────────────────────────────────
+                if (DateTime.UtcNow >= state.TimeStopDeadlineUtc && state.MfeUsd < (cfg.MinProgressR * riskPerTradeUsd))
+                {
+                    await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "TIME_STOP", token, loopIteration);
+                    return;
+                }
+
+                // ── E8: EOD FLATTEN ──────────────────────────────────────
+                var nyTime = TimeZoneInfo.ConvertTimeBySystemTimeZoneId(DateTime.UtcNow, "Eastern Standard Time");
+                if (nyTime.TimeOfDay >= TimeSpan.Parse(cfg.EodFlattenTimeET))
+                {
+                    await ConductFlattenAsync(client, brokerAdapter, livePlan, state, observed, "EOD", token, loopIteration);
+                    return;
+                }
+
+                // ── Periodic diagnostics ─────────────────────────────────
+                if (loopIteration % 30 == 0)
+                {
+                    Console.WriteLine($"[DIAG] Conduct V1.2: symbol={state.Symbol} tick={loopIteration} mark={observed:F4} peak={state.PeakPrice:F4} trough={state.TroughPrice:F4} unreal={unrealUsd:F2} mfe={state.MfeUsd:F2} mae={state.MaeUsd:F2} peakPnl={state.PeakUnrealPnlUsd:F2} trailing={state.TrailingActive} breakeven={state.BreakEvenActive} locked={state.ProfitLocked} floor={state.FloorPricePerShare:F4} atr={atrProxy:F6} atr1m={state.Atr1M:F6} candles={state.CandleBars1M.Count} spread={spread:F4} stopOrd={state.StopOrderId} tp1Ord={state.Tp1OrderId} tp1Done={state.Tp1Done}.");
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(cfg.MonitorPollSeconds), token);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            Console.WriteLine($"[WARN] Conduct V1.2 monitor ended (cancellation): symbol={state.Symbol} ticks={loopIteration} mfe={state.MfeUsd:F2} mae={state.MaeUsd:F2}.");
+            return;
+        }
+
+        Console.WriteLine($"[INFO] Conduct V1.2 monitor window elapsed: symbol={state.Symbol} ticks={loopIteration} mfe={state.MfeUsd:F2} mae={state.MaeUsd:F2} peakPnl={state.PeakUnrealPnlUsd:F2} trailing={state.TrailingActive} breakeven={state.BreakEvenActive} locked={state.ProfitLocked}.");
+    }
+
+    /// <summary>
+    /// V1.2 flatten procedure: cancel broker-managed exits, cancel conflicting orders,
+    /// submit MKT exit, verify, and write TradeEpisode journal.
+    /// </summary>
+    private async Task ConductFlattenAsync(EClientSocket client, IBrokerAdapter brokerAdapter, LiveOrderPlacementPlan plan, ConductPositionState state, double referencePrice, string reasonCode, CancellationToken token, int loopIteration = 0)
+    {
+        Console.WriteLine($"[INFO] Conduct V1.2 flatten triggered: symbol={state.Symbol} reason={reasonCode} mark={referencePrice:F4} mfe={state.MfeUsd:F2} mae={state.MaeUsd:F2} peakPnl={state.PeakUnrealPnlUsd:F2} trailing={state.TrailingActive} breakeven={state.BreakEvenActive} locked={state.ProfitLocked}.");
+
+        // Step 1: Cancel any existing open orders for this symbol (including broker-managed exits)
+        try
+        {
+            brokerAdapter.RequestOpenOrders(client);
+            await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+            var symbolOrders = _wrapper.OpenOrders
+                .Where(o => string.Equals(o.Symbol, state.Symbol, StringComparison.OrdinalIgnoreCase))
+                .Where(o => !IsTerminalOrderStatus(o.Status))
+                .ToArray();
+            foreach (var existingOrder in symbolOrders)
+            {
+                brokerAdapter.CancelOrder(client, existingOrder.OrderId, string.Empty);
+                Console.WriteLine($"[INFO] Conduct V1.2: canceled order before flatten: orderId={existingOrder.OrderId} symbol={state.Symbol} status={existingOrder.Status}.");
+            }
+
+            if (symbolOrders.Length > 0)
+            {
+                await Task.Delay(500, token);
+            }
+
+            // Clear tracked exit order IDs
+            state.StopOrderId = null;
+            state.Tp1OrderId = null;
+            state.Tp2OrderId = null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Conduct V1.2: failed to cancel orders for {state.Symbol}: {ex.Message}");
+        }
+
+        // Step 2: Submit MKT flatten order
+        var exitAction = state.IsLong ? "SELL" : "BUY";
+        var exitContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            plan.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+
+        var exitOrder = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+            exitAction,
+            "MKT",
+            state.FilledQuantity,
+            LimitPrice: null));
+
+        var nextOrderId = await _wrapper.NextValidIdTask;
+        exitOrder.OrderId = nextOrderId;
+        exitOrder.OrderRef = $"CONDUCT_V1.2_{reasonCode}_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+        exitOrder.Transmit = true;
+
+        brokerAdapter.PlaceOrder(client, exitOrder.OrderId, exitContract, exitOrder);
+        MarkOrderTransmitted();
+
+        Console.WriteLine($"[OK] Conduct V1.2 exit transmitted: orderId={exitOrder.OrderId} symbol={plan.Symbol} action={exitAction} type=MKT qty={state.FilledQuantity:F4} reason={reasonCode} refPx={referencePrice:F4}.");
+
+        // Step 3: Verify flatten — wait briefly and check position
+        double exitPrice = referencePrice;
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            var remainingQty = await GetCurrentPositionQuantityAsync(client, brokerAdapter, plan.Symbol, token);
+            if (Math.Abs(remainingQty) > 0.0001)
+            {
+                Console.WriteLine($"[WARN] Conduct V1.2: position not fully closed. symbol={plan.Symbol} reason={reasonCode} remaining={remainingQty:F4}. Will retry.");
+                var retryOrder = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                    exitAction,
+                    "MKT",
+                    Math.Abs(remainingQty),
+                    LimitPrice: null));
+                var retryOrderId = await _wrapper.NextValidIdTask;
+                retryOrder.OrderId = retryOrderId;
+                retryOrder.OrderRef = $"CONDUCT_V1.2_{reasonCode}_RETRY_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                retryOrder.Transmit = true;
+                brokerAdapter.PlaceOrder(client, retryOrder.OrderId, exitContract, retryOrder);
+                MarkOrderTransmitted();
+                Console.WriteLine($"[OK] Conduct V1.2 retry exit transmitted: orderId={retryOrder.OrderId} symbol={plan.Symbol} remaining={Math.Abs(remainingQty):F4} reason={reasonCode}_RETRY.");
+            }
+            else
+            {
+                Console.WriteLine($"[OK] Conduct V1.2: position fully closed. symbol={plan.Symbol} reason={reasonCode}.");
+            }
+
+            // Try to get actual fill price from executions
+            var exitExec = _wrapper.Executions
+                .Where(e => e.OrderId == exitOrder.OrderId && e.Price > 0)
+                .OrderByDescending(e => e.Time)
+                .FirstOrDefault();
+            if (exitExec != null && exitExec.Price > 0)
+            {
+                exitPrice = exitExec.Price;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Conduct V1.2: flatten verification failed for {plan.Symbol}: {ex.Message}");
+        }
+
+        // Step 4: Write TradeEpisode journal (V1.2)
+        if (new ConductExitConfig().TradeEpisodeJournalEnabled)
+        {
+            try
+            {
+                WriteConductTradeEpisode(state, exitPrice, reasonCode, loopIteration);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Conduct V1.2: failed to write trade episode for {plan.Symbol}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Compute ATR proxy using exponential moving average of absolute price changes.
+    /// More responsive to recent volatility than simple average. (V1.1)
+    /// </summary>
+    private static double ComputeEmaAtrProxy(Queue<double> markHistory, double alpha)
+    {
+        if (markHistory.Count < 2)
+        {
+            return 0.0;
+        }
+
+        var marks = markHistory.ToArray();
+        var ema = Math.Abs(marks[1] - marks[0]);
+        for (var i = 2; i < marks.Length; i++)
+        {
+            var absDiff = Math.Abs(marks[i] - marks[i - 1]);
+            ema = alpha * absDiff + (1 - alpha) * ema;
+        }
+
+        return Math.Max(0.0, ema);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // V1.2 HELPER METHODS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// SAFETY OVERLAY (V1.2): Check kill switch file, daily loss limit, and disconnect timeout.
+    /// Returns a reason code string if we should flatten, or null if safe.
+    /// </summary>
+    private string? ConductCheckSafetyOverlay(ConductPositionState state, ConductExitConfig cfg)
+    {
+        // Kill switch: if a specific file exists on disk, flatten everything
+        if (!string.IsNullOrWhiteSpace(cfg.KillSwitchFilePath))
+        {
+            try
+            {
+                if (File.Exists(cfg.KillSwitchFilePath))
+                {
+                    Console.WriteLine($"[ALERT] Conduct V1.2 SAFETY: kill switch file detected: {cfg.KillSwitchFilePath}. Flattening {state.Symbol}.");
+                    return "SAFETY_KILL_SWITCH";
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Conduct V1.2 SAFETY: kill switch file check failed: {ex.Message}");
+            }
+        }
+
+        // Daily loss limit: if session realized PnL exceeds maximum, flatten
+        if (cfg.DailyMaxLossUsd > 0 && state.SessionRealizedPnlUsd <= -cfg.DailyMaxLossUsd)
+        {
+            Console.WriteLine($"[ALERT] Conduct V1.2 SAFETY: daily loss limit breached: realizedPnl={state.SessionRealizedPnlUsd:F2} limit=-{cfg.DailyMaxLossUsd:F2}. Flattening {state.Symbol}.");
+            return "SAFETY_DAILY_LOSS";
+        }
+
+        // Disconnect detection: if we haven't had connectivity for N seconds, flatten
+        if (cfg.DisconnectFlattenSec > 0 && _hasConnectivityFailure)
+        {
+            var disconnectedSec = (DateTime.UtcNow - state.LastConnectedUtc).TotalSeconds;
+            if (disconnectedSec >= cfg.DisconnectFlattenSec)
+            {
+                Console.WriteLine($"[ALERT] Conduct V1.2 SAFETY: disconnect timeout: disconnectedSec={disconnectedSec:F1} limit={cfg.DisconnectFlattenSec}. Flattening {state.Symbol}.");
+                return "SAFETY_DISCONNECT";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// CANDLE MAINTENANCE (V1.2): Update the building 1-minute bar with the latest tick.
+    /// When a new minute starts, finalize the previous bar and start a new one.
+    /// </summary>
+    private static void ConductUpdateCandle(ConductPositionState state, double price, DateTime utcNow)
+    {
+        // Truncate to minute boundary
+        var minuteUtc = new DateTime(utcNow.Year, utcNow.Month, utcNow.Day, utcNow.Hour, utcNow.Minute, 0, DateTimeKind.Utc);
+
+        if (state.CurrentCandle == null || state.CurrentCandle.MinuteUtc != minuteUtc)
+        {
+            // Finalize previous candle if exists
+            if (state.CurrentCandle != null)
+            {
+                var completed = state.CurrentCandle.Finalize();
+                state.CandleBars1M.Add(completed);
+
+                // Keep at most 120 bars (2 hours of 1m data)
+                while (state.CandleBars1M.Count > 120)
+                {
+                    state.CandleBars1M.RemoveAt(0);
+                }
+            }
+
+            // Start new building bar
+            state.CurrentCandle = new ConductCandleBarBuilder
+            {
+                MinuteUtc = minuteUtc,
+                Open = price,
+                High = price,
+                Low = price,
+                Close = price,
+                Volume = 1,
+                TickCount = 1,
+            };
+        }
+        else
+        {
+            // Update existing building bar
+            state.CurrentCandle.High = Math.Max(state.CurrentCandle.High, price);
+            state.CurrentCandle.Low = Math.Min(state.CurrentCandle.Low, price);
+            state.CurrentCandle.Close = price;
+            state.CurrentCandle.Volume++;
+            state.CurrentCandle.TickCount++;
+        }
+    }
+
+    /// <summary>
+    /// ATR(N) from completed 1-minute bars using True Range (V1.2).
+    /// Returns 0 if insufficient bars.
+    /// </summary>
+    private static double ConductComputeAtr1M(List<ConductCandleBar> bars, int period)
+    {
+        if (bars.Count < period + 1)
+        {
+            return 0.0;
+        }
+
+        // Use the last `period` bars (skip the oldest for previous close reference)
+        var startIndex = bars.Count - period;
+        double atr = 0;
+        for (var i = startIndex; i < bars.Count; i++)
+        {
+            var current = bars[i];
+            var prevClose = bars[i - 1].Close;
+            var trueRange = Math.Max(
+                current.High - current.Low,
+                Math.Max(
+                    Math.Abs(current.High - prevClose),
+                    Math.Abs(current.Low - prevClose)));
+            atr += trueRange;
+        }
+
+        return Math.Max(0.0, atr / period);
+    }
+
+    /// <summary>
+    /// ENSURE_EXITS (V1.2): Place initial protective bracket — STP stop-loss order
+    /// and optionally TP1/TP2 limit take-profit orders.
+    /// </summary>
+    private async Task ConductEnsureExitsAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        LiveOrderPlacementPlan plan,
+        ConductPositionState state,
+        ConductExitConfig cfg,
+        double stopPrice,
+        double tp1Price,
+        double tp2Price,
+        double tp1Qty,
+        double tp2Qty,
+        CancellationToken token)
+    {
+        var exitAction = state.IsLong ? "SELL" : "BUY";
+        var exitContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            plan.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+
+        // Place STP (stop-loss) order
+        try
+        {
+            var stopOrder = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                exitAction,
+                "STP",
+                state.FilledQuantity,
+                LimitPrice: null));
+            stopOrder.AuxPrice = Math.Round(stopPrice, 2);
+            var stopOrderId = await _wrapper.NextValidIdTask;
+            stopOrder.OrderId = stopOrderId;
+            stopOrder.OrderRef = $"CONDUCT_V1.2_STOP_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+            stopOrder.Transmit = true;
+            stopOrder.OutsideRth = true;
+
+            brokerAdapter.PlaceOrder(client, stopOrder.OrderId, exitContract, stopOrder);
+            MarkOrderTransmitted();
+            state.StopOrderId = stopOrderId;
+            Console.WriteLine($"[OK] Conduct V1.2 ENSURE_EXITS: STP placed: orderId={stopOrderId} symbol={plan.Symbol} action={exitAction} stopPx={stopPrice:F4} qty={state.FilledQuantity:F4}.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Conduct V1.2 ENSURE_EXITS: failed to place STP for {plan.Symbol}: {ex.Message}");
+        }
+
+        // Place TP1 (take-profit 1) if enabled
+        if (cfg.TakeProfitEnabled && tp1Qty > 0)
+        {
+            try
+            {
+                var tp1Order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                    exitAction,
+                    "LMT",
+                    tp1Qty,
+                    LimitPrice: Math.Round(tp1Price, 2)));
+                var tp1OrderId = await _wrapper.NextValidIdTask;
+                tp1Order.OrderId = tp1OrderId;
+                tp1Order.OrderRef = $"CONDUCT_V1.2_TP1_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                tp1Order.Transmit = true;
+                tp1Order.OutsideRth = true;
+
+                brokerAdapter.PlaceOrder(client, tp1Order.OrderId, exitContract, tp1Order);
+                MarkOrderTransmitted();
+                state.Tp1OrderId = tp1OrderId;
+                Console.WriteLine($"[OK] Conduct V1.2 ENSURE_EXITS: TP1 placed: orderId={tp1OrderId} symbol={plan.Symbol} action={exitAction} limitPx={tp1Price:F4} qty={tp1Qty:F0}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Conduct V1.2 ENSURE_EXITS: failed to place TP1 for {plan.Symbol}: {ex.Message}");
+            }
+        }
+
+        // Place TP2 (take-profit 2) if enabled
+        if (cfg.TakeProfitEnabled && tp2Qty > 0)
+        {
+            try
+            {
+                var tp2Order = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                    exitAction,
+                    "LMT",
+                    tp2Qty,
+                    LimitPrice: Math.Round(tp2Price, 2)));
+                var tp2OrderId = await _wrapper.NextValidIdTask;
+                tp2Order.OrderId = tp2OrderId;
+                tp2Order.OrderRef = $"CONDUCT_V1.2_TP2_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                tp2Order.Transmit = true;
+                tp2Order.OutsideRth = true;
+
+                brokerAdapter.PlaceOrder(client, tp2Order.OrderId, exitContract, tp2Order);
+                MarkOrderTransmitted();
+                state.Tp2OrderId = tp2OrderId;
+                Console.WriteLine($"[OK] Conduct V1.2 ENSURE_EXITS: TP2 placed: orderId={tp2OrderId} symbol={plan.Symbol} action={exitAction} limitPx={tp2Price:F4} qty={tp2Qty:F0}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] Conduct V1.2 ENSURE_EXITS: failed to place TP2 for {plan.Symbol}: {ex.Message}");
+            }
+        }
+
+        await Task.Delay(500, token); // Brief pause for order acknowledgment
+    }
+
+    /// <summary>
+    /// ENSURE_EXITS RECONCILIATION (V1.2): Periodically verify broker-managed exit orders
+    /// still exist (haven't been cancelled externally). Repair if missing.
+    /// Also detect TP1/TP2 fills and adjust position tracking.
+    /// </summary>
+    private async Task ConductReconcileExitsAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        LiveOrderPlacementPlan plan,
+        ConductPositionState state,
+        ConductExitConfig cfg,
+        double stopPrice,
+        CancellationToken token)
+    {
+        try
+        {
+            brokerAdapter.RequestOpenOrders(client);
+            await AwaitWithTimeout(_wrapper.OpenOrderEndTask, token, "openOrderEnd");
+
+            var symbolOrders = _wrapper.OpenOrders
+                .Where(o => string.Equals(o.Symbol, state.Symbol, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+
+            // Check if TP1 has filled (order no longer open but was tracked)
+            if (state.Tp1OrderId.HasValue && !state.Tp1Done)
+            {
+                var tp1Alive = symbolOrders.Any(o => o.OrderId == state.Tp1OrderId.Value && !IsTerminalOrderStatus(o.Status));
+                if (!tp1Alive)
+                {
+                    // Check if it actually filled (vs cancelled)
+                    var tp1Filled = _wrapper.Executions.Any(e => e.OrderId == state.Tp1OrderId.Value);
+                    var tp1Status = symbolOrders.FirstOrDefault(o => o.OrderId == state.Tp1OrderId.Value)?.Status;
+                    var isFilled = tp1Filled || string.Equals(tp1Status, "Filled", StringComparison.OrdinalIgnoreCase);
+
+                    if (isFilled)
+                    {
+                        state.Tp1Done = true;
+                        // Reduce tracked position quantity
+                        var tp1ScaledQty = Math.Max(1, Math.Floor(state.OriginalFilledQuantity * cfg.Tp1ScaleOutPct));
+                        state.FilledQuantity = Math.Max(0, state.FilledQuantity - tp1ScaledQty);
+                        Console.WriteLine($"[INFO] Conduct V1.2 RECONCILE: TP1 filled for {state.Symbol}. Reduced qty by {tp1ScaledQty:F0}, remaining={state.FilledQuantity:F4}.");
+
+                        // If position fully closed by TPs, we're done
+                        if (state.FilledQuantity < 0.0001)
+                        {
+                            Console.WriteLine($"[INFO] Conduct V1.2 RECONCILE: position fully closed by TPs for {state.Symbol}.");
+                            return;
+                        }
+
+                        // Adjust stop order quantity if stop is still alive
+                        if (state.StopOrderId.HasValue)
+                        {
+                            var stopAlive = symbolOrders.Any(o => o.OrderId == state.StopOrderId.Value && !IsTerminalOrderStatus(o.Status));
+                            if (stopAlive && state.FilledQuantity > 0)
+                            {
+                                // Cancel and replace stop with new quantity
+                                brokerAdapter.CancelOrder(client, state.StopOrderId.Value, string.Empty);
+                                await Task.Delay(300, token);
+
+                                var exitAction = state.IsLong ? "SELL" : "BUY";
+                                var exitContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                                    BrokerAssetType.Stock, plan.Symbol, "SMART", "USD", _options.PrimaryExchange));
+                                var newStopOrder = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                                    exitAction, "STP", state.FilledQuantity, LimitPrice: null));
+                                newStopOrder.AuxPrice = Math.Round(stopPrice, 2);
+                                var newStopId = await _wrapper.NextValidIdTask;
+                                newStopOrder.OrderId = newStopId;
+                                newStopOrder.OrderRef = $"CONDUCT_V1.2_STOP_RESIZE_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                                newStopOrder.Transmit = true;
+                                newStopOrder.OutsideRth = true;
+                                brokerAdapter.PlaceOrder(client, newStopOrder.OrderId, exitContract, newStopOrder);
+                                MarkOrderTransmitted();
+                                state.StopOrderId = newStopId;
+                                Console.WriteLine($"[OK] Conduct V1.2 RECONCILE: stop resized for {state.Symbol}: newOrderId={newStopId} qty={state.FilledQuantity:F4}.");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // TP1 was cancelled, not filled — clear tracking
+                        Console.WriteLine($"[WARN] Conduct V1.2 RECONCILE: TP1 order {state.Tp1OrderId} for {state.Symbol} is gone (cancelled, not filled).");
+                        state.Tp1OrderId = null;
+                    }
+                }
+            }
+
+            // Check if STP order is still alive — repair if missing
+            if (state.StopOrderId.HasValue)
+            {
+                var stopAlive = symbolOrders.Any(o => o.OrderId == state.StopOrderId.Value && !IsTerminalOrderStatus(o.Status));
+                if (!stopAlive)
+                {
+                    // Check if stop was filled (position gone)
+                    var stopFilled = _wrapper.Executions.Any(e => e.OrderId == state.StopOrderId.Value);
+                    if (stopFilled)
+                    {
+                        Console.WriteLine($"[INFO] Conduct V1.2 RECONCILE: STP order filled for {state.Symbol}. Position should be flat.");
+                        return;
+                    }
+
+                    // Stop disappeared — repair
+                    if (state.ExitsRepairAttempts < cfg.ExitRepairRetries)
+                    {
+                        state.ExitsRepairAttempts++;
+                        Console.WriteLine($"[WARN] Conduct V1.2 RECONCILE: STP order {state.StopOrderId} missing for {state.Symbol}. Repairing (attempt {state.ExitsRepairAttempts}/{cfg.ExitRepairRetries}).");
+
+                        var exitAction = state.IsLong ? "SELL" : "BUY";
+                        var exitContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                            BrokerAssetType.Stock, plan.Symbol, "SMART", "USD", _options.PrimaryExchange));
+                        var repairStop = brokerAdapter.BuildOrder(new BrokerOrderIntent(
+                            exitAction, "STP", state.FilledQuantity, LimitPrice: null));
+                        repairStop.AuxPrice = Math.Round(stopPrice, 2);
+                        var repairId = await _wrapper.NextValidIdTask;
+                        repairStop.OrderId = repairId;
+                        repairStop.OrderRef = $"CONDUCT_V1.2_STOP_REPAIR_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+                        repairStop.Transmit = true;
+                        repairStop.OutsideRth = true;
+                        brokerAdapter.PlaceOrder(client, repairStop.OrderId, exitContract, repairStop);
+                        MarkOrderTransmitted();
+                        state.StopOrderId = repairId;
+                        Console.WriteLine($"[OK] Conduct V1.2 RECONCILE: STP repaired for {state.Symbol}: newOrderId={repairId}.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[ERROR] Conduct V1.2 RECONCILE: STP repair exhausted for {state.Symbol}. Max retries={cfg.ExitRepairRetries}. Position is UNPROTECTED.");
+                    }
+                }
+                else
+                {
+                    state.ExitsVerifiedCount++;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] Conduct V1.2 RECONCILE: failed for {state.Symbol}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// TRADE EPISODE JOURNAL (V1.2): Write a structured JSON record capturing
+    /// all details of a completed trade for post-session analysis.
+    /// </summary>
+    private void WriteConductTradeEpisode(ConductPositionState state, double exitPrice, string reasonCode, int loopIteration)
+    {
+        var elapsed = DateTime.UtcNow - state.LoopStartUtc;
+        var realizedPnlPerShare = state.IsLong
+            ? exitPrice - state.EntryPrice
+            : state.EntryPrice - exitPrice;
+        var realizedPnlUsd = realizedPnlPerShare * state.OriginalFilledQuantity;
+        var realizedPnlR = state.RiskPerTradeUsd > 0
+            ? realizedPnlUsd / state.RiskPerTradeUsd
+            : 0;
+
+        var episode = new ConductTradeEpisode
+        {
+            TradeId = $"{state.Symbol}_{state.LoopStartUtc:yyyyMMdd_HHmmss}",
+            Symbol = state.Symbol,
+            Side = state.IsLong ? "LONG" : "SHORT",
+            EntryPrice = state.EntryPrice,
+            ExitPrice = exitPrice,
+            Quantity = state.OriginalFilledQuantity,
+            EntryUtc = state.LoopStartUtc,
+            ExitUtc = DateTime.UtcNow,
+            HoldDurationSec = elapsed.TotalSeconds,
+            ExitReason = reasonCode,
+            RealizedPnlUsd = realizedPnlUsd,
+            RealizedPnlR = realizedPnlR,
+            MfeUsd = state.MfeUsd,
+            MaeUsd = state.MaeUsd,
+            PeakUnrealPnlUsd = state.PeakUnrealPnlUsd,
+            RiskPerTradeUsd = state.RiskPerTradeUsd,
+            CommissionUsd = state.RoundTripCommission,
+            PeakPrice = state.PeakPrice,
+            TroughPrice = state.TroughPrice,
+            TrailingActivated = state.TrailingActive,
+            BreakEvenActivated = state.BreakEvenActive,
+            ProfitLocked = state.ProfitLocked,
+            Tp1Done = state.Tp1Done,
+            FinalFloorPrice = state.FloorPricePerShare,
+            Atr1MAtExit = state.Atr1M,
+            CandleBarCount = state.CandleBars1M.Count,
+            LoopIterations = loopIteration,
+            EngineVersion = "V1.2",
+        };
+
+        var dir = Path.Combine(EnsureOutputDir(), "trade_episodes");
+        Directory.CreateDirectory(dir);
+        var fileName = $"{episode.TradeId}.json";
+        var filePath = Path.Combine(dir, fileName);
+        var jsonOpts = new System.Text.Json.JsonSerializerOptions { WriteIndented = true };
+        File.WriteAllText(filePath, System.Text.Json.JsonSerializer.Serialize(episode, jsonOpts));
+        Console.WriteLine($"[OK] Conduct V1.2 JOURNAL: trade episode written: {filePath} pnl={realizedPnlUsd:F2} r={realizedPnlR:F2} reason={reasonCode}.");
+    }
+
+    private double ResolveEntryCommissionForOrder(int orderId, double quantity)
+    {
+        var execIds = _wrapper.Executions
+            .Where(e => e.OrderId == orderId)
+            .Select(e => e.ExecId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (execIds.Count > 0)
+        {
+            var commission = _wrapper.Commissions
+                .Where(c => execIds.Contains(c.ExecId))
+                .Select(c => Math.Abs(c.Commission))
+                .Sum();
+            if (commission > 0)
+            {
+                return commission;
+            }
+        }
+
+        return EstimateCommissionPerOrder(quantity);
+    }
+
+    private double ResolveEntryCommissionForPosition(string symbol, string entryAction, double quantity)
+    {
+        var normalizedSymbol = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedSymbol) || quantity <= 0)
+        {
+            return EstimateCommissionPerOrder(quantity);
+        }
+
+        var targetQuantity = Math.Abs(quantity);
+        var executions = _wrapper.Executions
+            .Where(e => string.Equals(e.Symbol, normalizedSymbol, StringComparison.OrdinalIgnoreCase))
+            .Where(e => IsExecutionMatchingEntrySide(e.Side, entryAction))
+            .Reverse()
+            .ToArray();
+
+        if (executions.Length == 0)
+        {
+            return EstimateCommissionPerOrder(quantity);
+        }
+
+        var covered = 0.0;
+        var execIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var execution in executions)
+        {
+            var shares = Math.Abs(execution.Shares);
+            if (shares <= 0)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(execution.ExecId))
+            {
+                execIds.Add(execution.ExecId);
+            }
+
+            covered += shares;
+            if (covered >= targetQuantity)
+            {
+                break;
+            }
+        }
+
+        if (execIds.Count == 0)
+        {
+            return EstimateCommissionPerOrder(quantity);
+        }
+
+        var commission = _wrapper.Commissions
+            .Where(c => execIds.Contains(c.ExecId))
+            .Select(c => Math.Abs(c.Commission))
+            .Sum();
+
+        return commission > 0
+            ? commission
+            : EstimateCommissionPerOrder(quantity);
+    }
+
+    private static bool IsExecutionMatchingEntrySide(string executionSide, string entryAction)
+    {
+        var side = (executionSide ?? string.Empty).Trim().ToUpperInvariant();
+        var action = (entryAction ?? string.Empty).Trim().ToUpperInvariant();
+
+        if (action == "BUY")
+        {
+            return side is "BOT" or "BUY";
+        }
+
+        if (action == "SELL")
+        {
+            return side is "SLD" or "SELL";
+        }
+
+        return false;
+    }
+
+    private double EstimateCommissionPerOrder(double quantity)
+    {
+        var normalizedQuantity = Math.Max(0, quantity);
+        var perUnit = Math.Max(0, _options.PreTradeCommissionPerUnit);
+        var minPerOrder = Math.Max(0, _options.PreTradeMinCommissionPerOrder);
+        var estimate = normalizedQuantity * perUnit;
+        if (minPerOrder > 0)
+        {
+            estimate = Math.Max(estimate, minPerOrder);
+        }
+
+        return estimate;
+    }
+
+    private double ResolveObservedPriceForExit(string symbol, LiveQuoteSnapshot quoteSnapshot, string action)
+    {
+        var isShortEntry = string.Equals(action, "SELL", StringComparison.OrdinalIgnoreCase);
+
+        if (!isShortEntry && quoteSnapshot.Bid > 0)
+        {
+            return quoteSnapshot.Bid;
+        }
+
+        if (isShortEntry && quoteSnapshot.Ask > 0)
+        {
+            return quoteSnapshot.Ask;
+        }
+
+        if (quoteSnapshot.Last > 0)
+        {
+            return quoteSnapshot.Last;
+        }
+
+        if (!isShortEntry && quoteSnapshot.Ask > 0)
+        {
+            return quoteSnapshot.Ask;
+        }
+
+        if (isShortEntry && quoteSnapshot.Bid > 0)
+        {
+            return quoteSnapshot.Bid;
+        }
+
+        var scannerInputPath = ResolveLiveScannerInputPath(action);
+        if (string.IsNullOrWhiteSpace(scannerInputPath))
+        {
+            return 0;
+        }
+
+        try
+        {
+            var fullPath = Path.GetFullPath(scannerInputPath);
+            if (!File.Exists(fullPath))
+            {
+                return 0;
+            }
+
+            var row = LoadLiveScannerCandidateRows(fullPath)
+                .FirstOrDefault(x => string.Equals(x.Symbol, symbol, StringComparison.OrdinalIgnoreCase));
+            if (row is null)
+            {
+                return 0;
+            }
+
+            if (row.Bid > 0)
+            {
+                return row.Bid;
+            }
+
+            if (isShortEntry && row.Ask > 0)
+            {
+                return row.Ask;
+            }
+
+            if (row.Mark > 0)
+            {
+                return row.Mark;
+            }
+
+            if (!isShortEntry && row.Ask > 0)
+            {
+                return row.Ask;
+            }
+
+            if (isShortEntry && row.Bid > 0)
+            {
+                return row.Bid;
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+
+        return 0;
     }
 
     private async Task RunOrdersCancelSimMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -1058,16 +2662,46 @@ public sealed class SnapshotRuntime
             return livePlan with { LimitPrice = quoteSnapshot.Bid };
         }
 
+        if (string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase))
+        {
+            var ask = quoteSnapshot.Ask;
+            var last = quoteSnapshot.Last;
+
+            if (ask > 0 && last > 0)
+            {
+                var syntheticBid = Math.Max(0.0001, Math.Min(last, (2 * last) - ask));
+                if (syntheticBid > 0)
+                {
+                    Console.WriteLine($"[WARN] Live default limit: bid unavailable; using synthetic bid {syntheticBid:F4} from ask={ask:F4} and last={last:F4}.");
+                    return livePlan with { LimitPrice = syntheticBid };
+                }
+            }
+
+            if (last > 0)
+            {
+                Console.WriteLine($"[WARN] Live default limit: bid unavailable; using last trade {last:F4}.");
+                return livePlan with { LimitPrice = last };
+            }
+
+            if (ask > 0)
+            {
+                Console.WriteLine($"[WARN] Live default limit: bid unavailable; using ask fallback {ask:F4}.");
+                return livePlan with { LimitPrice = ask };
+            }
+        }
+
         Console.WriteLine($"[WARN] Live default limit: no bid quote available; falling back to --live-limit value {livePlan.LimitPrice:F4}.");
         return livePlan;
     }
 
-    private void ValidateLivePriceSanity(LiveOrderPlacementPlan livePlan, LiveQuoteSnapshot quoteSnapshot)
+    private void ValidateLivePriceSanity(LiveOrderPlacementPlan livePlan, LiveQuoteSnapshot quoteSnapshot, string liveOrderType)
     {
         if (!string.Equals(livePlan.Action, "BUY", StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
+
+        var temporaryNoL1L2BypassActive = IsTemporaryNoL1L2BypassActiveUtc(DateTime.UtcNow);
 
         var ticks = quoteSnapshot.Ticks;
         var bid = quoteSnapshot.Bid;
@@ -1076,6 +2710,12 @@ public sealed class SnapshotRuntime
         var reference = ask > 0 ? ask : last;
         if (reference <= 0)
         {
+            if (temporaryNoL1L2BypassActive)
+            {
+                Console.WriteLine("[WARN] Live price sanity: no L1/L2 reference (ask/last unavailable). Temporarily bypassing quote requirement for 2026-02-26..2026-02-27 UTC.");
+                return;
+            }
+
             if (!_options.LivePriceSanityRequireQuote)
             {
                 Console.WriteLine("[WARN] Live price sanity: no ask/last reference price returned; continuing because --live-price-sanity-require-quote=false.");
@@ -1092,11 +2732,14 @@ public sealed class SnapshotRuntime
                 $"Live order blocked: current reference price {reference:F2} exceeds configured max-price {_options.MaxPrice:F2}.");
         }
 
-        var minReasonableBuyLimit = Math.Round(reference * 0.8, 4);
-        if (livePlan.LimitPrice < minReasonableBuyLimit)
+        if (string.Equals(liveOrderType, "LMT", StringComparison.OrdinalIgnoreCase))
         {
-            throw new InvalidOperationException(
-                $"Live order blocked: buy limit {livePlan.LimitPrice:F2} is too far below market reference {reference:F2}. Minimum allowed by sanity gate is {minReasonableBuyLimit:F2}.");
+            var minReasonableBuyLimit = Math.Round(reference * 0.8, 4);
+            if (livePlan.LimitPrice < minReasonableBuyLimit)
+            {
+                throw new InvalidOperationException(
+                    $"Live order blocked: buy limit {livePlan.LimitPrice:F2} is too far below market reference {reference:F2}. Minimum allowed by sanity gate is {minReasonableBuyLimit:F2}.");
+            }
         }
 
         if (!_options.LiveMomentumGuardEnabled)
@@ -1130,6 +2773,14 @@ public sealed class SnapshotRuntime
         {
             Console.WriteLine("[WARN] Live momentum guard: insufficient last-trade samples; skipping momentum trend test.");
         }
+    }
+
+    private static bool IsTemporaryNoL1L2BypassActiveUtc(DateTime utcNow)
+    {
+        var date = DateOnly.FromDateTime(utcNow);
+        var start = new DateOnly(2026, 2, 26);
+        var end = new DateOnly(2026, 2, 27);
+        return date >= start && date <= end;
     }
 
     private async Task<LiveQuoteSnapshot> FetchLiveQuoteSnapshotAsync(EClientSocket client, IBrokerAdapter brokerAdapter, string symbol, int requestId, CancellationToken token)
@@ -1167,15 +2818,32 @@ public sealed class SnapshotRuntime
 
     private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan()
     {
+        return ResolveLiveOrderPlacementPlan(_options.LiveAction, excludedSymbols: null, quantityOverride: null);
+    }
+
+    private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan(string actionOverride, IReadOnlySet<string>? excludedSymbols, double? quantityOverride)
+    {
         var symbol = _options.LiveSymbol;
-        var action = _options.LiveAction;
+        var action = actionOverride;
         var quantity = _options.LiveQuantity;
         var limitPrice = _options.LiveLimitPrice;
         var source = "manual";
 
+        if (quantityOverride is > 0)
+        {
+            quantity = quantityOverride.Value;
+        }
+
+        var excluded = excludedSymbols ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         var scannerInputPath = ResolveLiveScannerInputPath(action);
         if (string.IsNullOrWhiteSpace(scannerInputPath))
         {
+            if (excluded.Contains(symbol))
+            {
+                throw new InvalidOperationException($"Live handoff blocked: manual symbol '{symbol}' is excluded for replacement.");
+            }
+
             return new LiveOrderPlacementPlan(symbol, action, quantity, limitPrice, source);
         }
 
@@ -1204,22 +2872,92 @@ public sealed class SnapshotRuntime
 
         var rows = LoadLiveScannerCandidateRows(fullPath);
 
-        var selected = rows
-            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
-            .Where(x => x.Eligible is not false)
-            .Where(x => x.WeightedScore >= _options.LiveScannerMinScore)
-            .Select(x => new LiveScannerCandidateRow
+        // ── V2 scanner selection engine (optional, alongside V1) ────
+        var useV2Scanner = string.Equals(
+            Environment.GetEnvironmentVariable("SCN_V2_ENABLED") ?? "false",
+            "true", StringComparison.OrdinalIgnoreCase);
+
+        LiveScannerCandidateRow[] selected;
+        if (useV2Scanner)
+        {
+            var v2Config = new Strategy.ScannerSelectionV2Config
             {
-                Symbol = x.Symbol.Trim().ToUpperInvariant(),
-                WeightedScore = x.WeightedScore,
-                Eligible = x.Eligible,
-                AverageRank = x.AverageRank
-            })
-            .Where(x => _options.AllowedSymbols.Any(s => string.Equals(s, x.Symbol, StringComparison.OrdinalIgnoreCase)))
-            .OrderByDescending(x => x.WeightedScore)
-            .ThenBy(x => x.AverageRank)
-            .Take(Math.Max(1, _options.LiveScannerTopN))
-            .ToArray();
+                TopN = Math.Max(1, _options.LiveScannerTopN),
+                MinFileScore = _options.LiveScannerMinScore,
+                MinPrice = 0.50,
+                MaxPrice = _options.MaxPrice
+            };
+            var v2Engine = new Strategy.ScannerSelectionEngineV2(v2Config);
+            var fileCandidates = rows
+                .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+                .Select(x => new Strategy.ScannerV2CandidateFileRow
+                {
+                    Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                    WeightedScore = x.WeightedScore,
+                    Eligible = x.Eligible is not false,
+                    AverageRank = x.AverageRank,
+                    Bid = x.Bid,
+                    Ask = x.Ask,
+                    Mark = x.Mark
+                })
+                .Where(x => _options.AllowedSymbols.Any(s => string.Equals(s, x.Symbol, StringComparison.OrdinalIgnoreCase)))
+                .Where(x => !excluded.Contains(x.Symbol))
+                .ToList();
+
+            var emptyL1 = new Dictionary<string, Strategy.ScannerV2L1Snapshot>();
+            var emptyL2 = new Dictionary<string, Strategy.ScannerV2L2DepthSnapshot>();
+            var biasEntries = Array.Empty<Strategy.ScannerV2SymbolBias>();
+            var v2Snapshot = v2Engine.Evaluate(
+                fileCandidates, emptyL1, emptyL2, biasEntries,
+                DateTime.MinValue, DateTime.MinValue, DateTime.UtcNow, fullPath);
+
+            Console.WriteLine($"[INFO] Live Scanner V2.0: {v2Snapshot.SelectedCount} selected " +
+                $"from {v2Snapshot.TotalCandidates} candidates " +
+                $"({v2Snapshot.EligibleCandidates} eligible)");
+
+            // Map V2 ranked output back to LiveScannerCandidateRow for downstream compatibility
+            var v2SymbolOrder = v2Snapshot.SelectedSymbols
+                .Select((sym, idx) => (sym, idx))
+                .ToDictionary(x => x.sym, x => x.idx, StringComparer.OrdinalIgnoreCase);
+            selected = rows
+                .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+                .Where(x => v2SymbolOrder.ContainsKey(x.Symbol.Trim().ToUpperInvariant()))
+                .Select(x => new LiveScannerCandidateRow
+                {
+                    Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                    WeightedScore = x.WeightedScore,
+                    Eligible = x.Eligible,
+                    AverageRank = x.AverageRank,
+                    Bid = x.Bid,
+                    Ask = x.Ask,
+                    Mark = x.Mark
+                })
+                .OrderBy(x => v2SymbolOrder.GetValueOrDefault(x.Symbol, int.MaxValue))
+                .ToArray();
+        }
+        else
+        {
+            selected = rows
+                .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+                .Where(x => x.Eligible is not false)
+                .Where(x => x.WeightedScore >= _options.LiveScannerMinScore)
+                .Select(x => new LiveScannerCandidateRow
+                {
+                    Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                    WeightedScore = x.WeightedScore,
+                    Eligible = x.Eligible,
+                    AverageRank = x.AverageRank,
+                    Bid = x.Bid,
+                    Ask = x.Ask,
+                    Mark = x.Mark
+                })
+                .Where(x => _options.AllowedSymbols.Any(s => string.Equals(s, x.Symbol, StringComparison.OrdinalIgnoreCase)))
+                .Where(x => !excluded.Contains(x.Symbol))
+                .OrderByDescending(x => x.WeightedScore)
+                .ThenBy(x => x.AverageRank)
+                .Take(Math.Max(1, _options.LiveScannerTopN))
+                .ToArray();
+        }
 
         if (selected.Length == 0)
         {
@@ -1236,6 +2974,31 @@ public sealed class SnapshotRuntime
         var chosen = selected[0];
         symbol = chosen.Symbol;
         source = "scanner-candidate";
+
+        if (string.Equals(action, "BUY", StringComparison.OrdinalIgnoreCase))
+        {
+            var scannerLimitHint = 0.0;
+            if (chosen.Bid > 0)
+            {
+                scannerLimitHint = chosen.Bid;
+                Console.WriteLine($"[INFO] Live scanner hint: using scanner bid {scannerLimitHint:F4} for BUY limit seed.");
+            }
+            else if (chosen.Ask > 0 && chosen.Mark > 0)
+            {
+                scannerLimitHint = Math.Max(0.0001, Math.Min(chosen.Mark, (2 * chosen.Mark) - chosen.Ask));
+                Console.WriteLine($"[WARN] Live scanner hint: bid missing; using synthetic scanner bid {scannerLimitHint:F4} from ask={chosen.Ask:F4} mark={chosen.Mark:F4}.");
+            }
+            else if (chosen.Mark > 0)
+            {
+                scannerLimitHint = chosen.Mark;
+                Console.WriteLine($"[WARN] Live scanner hint: bid missing; using scanner mark {scannerLimitHint:F4} for BUY limit seed.");
+            }
+
+            if (scannerLimitHint > 0)
+            {
+                limitPrice = scannerLimitHint;
+            }
+        }
 
         if (_options.LiveAllocationBudget > 0)
         {
@@ -1350,7 +3113,9 @@ public sealed class SnapshotRuntime
         }
 
         var headerMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var headerRow = usedRange.FirstRowUsed();
+        var headerRow = usedRange.RowsUsed()
+            .FirstOrDefault(r => r.CellsUsed().Any(c => string.Equals(c.GetString().Trim(), "Symbol", StringComparison.OrdinalIgnoreCase)))
+            ?? usedRange.FirstRowUsed();
         foreach (var cell in headerRow.CellsUsed())
         {
             var key = cell.GetString().Trim();
@@ -1364,9 +3129,12 @@ public sealed class SnapshotRuntime
         var scoreColumn = ResolveHeaderColumn(headerMap, "WeightedScore", fallbackColumn: 2, alternateHeaders: ["Score", "Weighted Score"]);
         var eligibleColumn = ResolveHeaderColumn(headerMap, "Eligible", fallbackColumn: 3);
         var rankColumn = ResolveHeaderColumn(headerMap, "AverageRank", fallbackColumn: 4, alternateHeaders: ["AvgRank", "Average Rank"]);
+        var bidColumn = ResolveHeaderColumn(headerMap, "Bid", fallbackColumn: 7, alternateHeaders: ["Bid Price"]);
+        var askColumn = ResolveHeaderColumn(headerMap, "Ask", fallbackColumn: 8, alternateHeaders: ["Ask Price"]);
+        var markColumn = ResolveHeaderColumn(headerMap, "Mark", fallbackColumn: 3, alternateHeaders: ["Last", "Price", "Mark Price", "Mark %Change"]);
 
         var rows = new List<LiveScannerCandidateRow>();
-        foreach (var row in usedRange.RowsUsed().Skip(1))
+        foreach (var row in usedRange.RowsUsed().Where(r => r.RowNumber() > headerRow.RowNumber()))
         {
             var symbol = row.Cell(symbolColumn).GetString().Trim().ToUpperInvariant();
             if (string.IsNullOrWhiteSpace(symbol))
@@ -1377,13 +3145,19 @@ public sealed class SnapshotRuntime
             var weightedScore = TryReadDouble(row.Cell(scoreColumn));
             var eligible = TryReadBoolean(row.Cell(eligibleColumn));
             var averageRank = TryReadDouble(row.Cell(rankColumn));
+            var bid = TryReadDouble(row.Cell(bidColumn));
+            var ask = TryReadDouble(row.Cell(askColumn));
+            var mark = TryReadDouble(row.Cell(markColumn));
 
             rows.Add(new LiveScannerCandidateRow
             {
                 Symbol = symbol,
                 WeightedScore = weightedScore,
                 Eligible = eligible,
-                AverageRank = averageRank
+                AverageRank = averageRank,
+                Bid = bid,
+                Ask = ask,
+                Mark = mark
             });
         }
 
@@ -4002,6 +5776,12 @@ public sealed class SnapshotRuntime
         var replaySelfLearningStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_store.json");
         var replaySelfLearningLifecycleStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_lifecycle.json");
         var replaySelfLearningModelRegistryStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_model_registry.json");
+        // V2 self-learning engine paths
+        var replaySelfLearningV2SamplesPath = Path.Combine(outputDir, $"strategy_replay_self_learning_v2_samples_{timestamp}.json");
+        var replaySelfLearningV2PredictionsPath = Path.Combine(outputDir, $"strategy_replay_self_learning_v2_predictions_{timestamp}.json");
+        var replaySelfLearningV2SummaryPath = Path.Combine(outputDir, $"strategy_replay_self_learning_v2_summary_{timestamp}.json");
+        var replaySelfLearningV2RecommendationsPath = Path.Combine(outputDir, $"strategy_replay_self_learning_v2_recommendations_{timestamp}.json");
+        var replaySelfLearningV2BiasStorePath = Path.Combine(outputDir, "strategy_replay_self_learning_v2_bias_store.json");
 
         var replayFeeBreakdownRows = replayFillRows
             .Select(fill =>
@@ -4107,6 +5887,12 @@ public sealed class SnapshotRuntime
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
         var selfLearningAnalyzer = new ReplaySelfLearningAnalyzer();
         var selfLearning = selfLearningAnalyzer.Analyze(replayFillRows, replayCostDeltaRows, performance.Packets);
+        // V2 self-learning engine
+        var selfLearningEngineV2 = new ReplaySelfLearningEngine();
+        var selfLearningV2 = selfLearningEngineV2.Analyze(replayFillRows, replayCostDeltaRows, performance.Packets);
+        var existingV2BiasStore = LoadSelfLearningV2BiasStore(replaySelfLearningV2BiasStorePath);
+        var selfLearningV2Recommendations = ReplaySelfLearningEngine.BuildRecommendations(selfLearningV2, existingV2BiasStore);
+        var selfLearningV2BiasStore = ReplaySelfLearningEngine.UpdateSymbolBiasStore(existingV2BiasStore, replayFillRows);
         var selfLearningStore = UpdateReplaySelfLearningStore(replaySelfLearningStorePath, replayFillRows, strategyContext.Symbol);
         var selfLearningPostprocess = BuildReplaySelfLearningPostprocessReport(selfLearningStore, replayFillRows);
         var selfLearningGovernance = BuildReplaySelfLearningPromotionGovernanceReport(selfLearningStore, replayFillRows, strategyContext.Symbol);
@@ -4199,6 +5985,12 @@ public sealed class SnapshotRuntime
         WriteJson(replaySelfLearningGovernancePath, new[] { selfLearningGovernance });
         WriteJson(replaySelfLearningLifecycleSnapshotPath, new[] { selfLearningLifecycleAndRegistry.Lifecycle });
         WriteJson(replaySelfLearningModelRegistrySnapshotPath, new[] { selfLearningLifecycleAndRegistry.Registry });
+        // V2 self-learning engine outputs
+        WriteJson(replaySelfLearningV2SamplesPath, selfLearningV2.Samples);
+        WriteJson(replaySelfLearningV2PredictionsPath, selfLearningV2.Predictions);
+        WriteJson(replaySelfLearningV2SummaryPath, new[] { selfLearningV2.Summary });
+        WriteJson(replaySelfLearningV2RecommendationsPath, new[] { selfLearningV2Recommendations });
+        WriteSelfLearningV2BiasStore(replaySelfLearningV2BiasStorePath, selfLearningV2BiasStore);
         Console.WriteLine($"[OK] Strategy replay slices export: {replayPath} (rows={slices.Count})");
         Console.WriteLine($"[OK] Strategy replay orders export: {replayOrdersPath} (rows={replayOrderRows.Count})");
         Console.WriteLine($"[OK] Strategy replay fills export: {replayFillsPath} (rows={replayFillRows.Count})");
@@ -4241,6 +6033,44 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay self-learning promotion governance export: {replaySelfLearningGovernancePath}");
         Console.WriteLine($"[OK] Strategy replay self-learning lifecycle export: {replaySelfLearningLifecycleSnapshotPath}");
         Console.WriteLine($"[OK] Strategy replay self-learning model registry export: {replaySelfLearningModelRegistrySnapshotPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning V2 samples export: {replaySelfLearningV2SamplesPath} (rows={selfLearningV2.Samples.Count})");
+        Console.WriteLine($"[OK] Strategy replay self-learning V2 predictions export: {replaySelfLearningV2PredictionsPath} (rows={selfLearningV2.Predictions.Count})");
+        Console.WriteLine($"[OK] Strategy replay self-learning V2 summary export: {replaySelfLearningV2SummaryPath} (engine={ReplaySelfLearningEngine.Version} features={selfLearningV2.Summary.FeatureCount} oosSamples={selfLearningV2.Summary.WalkForwardOosSamples})");
+        Console.WriteLine($"[OK] Strategy replay self-learning V2 recommendations export: {replaySelfLearningV2RecommendationsPath}");
+        Console.WriteLine($"[OK] Strategy replay self-learning V2 bias store export: {replaySelfLearningV2BiasStorePath} (symbols={selfLearningV2BiasStore.Count})");
+    }
+
+    // ── V2 Self-Learning Bias Store persistence ──────────────────────
+
+    private static Dictionary<string, SelfLearningV2SymbolBiasRow>? LoadSelfLearningV2BiasStore(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            return JsonSerializer.Deserialize<Dictionary<string, SelfLearningV2SymbolBiasRow>>(
+                json,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void WriteSelfLearningV2BiasStore(
+        string path,
+        IReadOnlyDictionary<string, SelfLearningV2SymbolBiasRow> store)
+    {
+        var ordered = store
+            .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
+        var json = JsonSerializer.Serialize(ordered, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(path, json);
     }
 
     private ReplaySelfLearningStoreRow UpdateReplaySelfLearningStore(
@@ -5400,7 +7230,7 @@ public sealed class SnapshotRuntime
         };
     }
 
-    private void ValidateLiveSafetyInputs(string action, double quantity, double limitPrice, string symbol)
+    private void ValidateLiveSafetyInputs(string action, double quantity, double limitPrice, string symbol, string liveOrderType)
     {
         var normalizedAction = action.ToUpperInvariant();
         if (normalizedAction is not ("BUY" or "SELL"))
@@ -5408,12 +7238,17 @@ public sealed class SnapshotRuntime
             throw new InvalidOperationException("Live order blocked: --live-action must be BUY or SELL.");
         }
 
+        if (liveOrderType is not ("LMT" or "MKT"))
+        {
+            throw new InvalidOperationException("Live order blocked: --live-order-type must be LMT or MKT.");
+        }
+
         if (quantity <= 0 || quantity > _options.MaxShares)
         {
             throw new InvalidOperationException($"Live order blocked: qty must be >0 and <= max-shares ({_options.MaxShares}).");
         }
 
-        if (limitPrice <= 0 || limitPrice > _options.MaxPrice)
+        if (liveOrderType == "LMT" && (limitPrice <= 0 || limitPrice > _options.MaxPrice))
         {
             throw new InvalidOperationException($"Live order blocked: limit must be >0 and <= max-price ({_options.MaxPrice}).");
         }
@@ -5429,6 +7264,17 @@ public sealed class SnapshotRuntime
         {
             throw new InvalidOperationException($"Live order blocked: primary exchange '{_options.PrimaryExchange}' is not allowed. Use NYSE or NSDQ.");
         }
+    }
+
+    private static string NormalizeLiveOrderType(string value)
+    {
+        var normalized = (value ?? string.Empty).Trim().ToUpperInvariant();
+        return normalized switch
+        {
+            "MARKET" => "MKT",
+            "MKT" => "MKT",
+            _ => "LMT"
+        };
     }
 
     private void EnforceFaRoutingStrictness()
@@ -6410,6 +8256,7 @@ public sealed record AppOptions(
     bool EnableLive,
     string LiveSymbol,
     string LiveAction,
+    string LiveOrderType,
     double LiveQuantity,
     double LiveLimitPrice,
     bool LivePriceSanityRequireQuote,
@@ -6509,6 +8356,7 @@ public sealed record AppOptions(
     int MarketCloseWarningMinutes,
     PreTradeCostProfile PreTradeCostProfile,
     double PreTradeCommissionPerUnit,
+    double PreTradeMinCommissionPerOrder,
     double PreTradeSlippageBps,
     string FundamentalReportType,
     string WshFilterJson,
@@ -6590,6 +8438,7 @@ public sealed record AppOptions(
         var enableLive = false;
         var liveSymbol = "SIRI";
         var liveAction = "BUY";
+        var liveOrderType = "LMT";
         var liveQuantity = 1.0;
         var liveLimitPrice = 5.00;
         var livePriceSanityRequireQuote = true;
@@ -6688,6 +8537,7 @@ public sealed record AppOptions(
         var marketCloseWarningMinutes = 15;
         var preTradeCostProfile = PreTradeCostProfile.MicroEquity;
         var preTradeCommissionPerUnit = 0.0035;
+        var preTradeMinCommissionPerOrder = 0.0;
         var preTradeSlippageBps = 4.0;
         var fundamentalReportType = "ReportSnapshot";
         var wshFilterJson = "{}";
@@ -6796,6 +8646,9 @@ public sealed record AppOptions(
                     break;
                 case "--live-action" when i + 1 < args.Length:
                     liveAction = args[++i].ToUpperInvariant();
+                    break;
+                case "--live-order-type" when i + 1 < args.Length:
+                    liveOrderType = args[++i].ToUpperInvariant();
                     break;
                 case "--live-qty" when i + 1 < args.Length && double.TryParse(args[i + 1], out var q):
                     liveQuantity = q;
@@ -7136,6 +8989,10 @@ public sealed record AppOptions(
                     preTradeCommissionPerUnit = ptcpu;
                     i++;
                     break;
+                case "--pretrade-min-commission-per-order" when i + 1 < args.Length && double.TryParse(args[i + 1], out var ptmc):
+                    preTradeMinCommissionPerOrder = Math.Max(0, ptmc);
+                    i++;
+                    break;
                 case "--pretrade-slippage-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var ptsb):
                     preTradeSlippageBps = ptsb;
                     i++;
@@ -7385,6 +9242,7 @@ public sealed record AppOptions(
             enableLive,
             liveSymbol,
             liveAction,
+            liveOrderType,
             liveQuantity,
             liveLimitPrice,
             livePriceSanityRequireQuote,
@@ -7483,6 +9341,7 @@ public sealed record AppOptions(
             marketCloseWarningMinutes,
             preTradeCostProfile,
             preTradeCommissionPerUnit,
+            preTradeMinCommissionPerOrder,
             preTradeSlippageBps,
             fundamentalReportType,
             wshFilterJson,
@@ -7618,6 +9477,9 @@ public sealed record AppOptions(
             "orders" => RunMode.Orders,
             "orders-all-open" => RunMode.OrdersAllOpen,
             "positions" => RunMode.Positions,
+            "positions-monitor-1pct" => RunMode.PositionsMonitor1Pct,
+            "positions-monitor-1pct-loop" => RunMode.PositionsMonitor1PctLoop,
+            "positions-auto-replace-scan-loop" => RunMode.PositionsAutoReplaceScanLoop,
             "snapshot-all" => RunMode.SnapshotAll,
             "contracts-validate" => RunMode.ContractsValidate,
             "orders-dryrun" => RunMode.OrdersDryRun,
@@ -7667,7 +9529,7 @@ public sealed record AppOptions(
             "display-groups-update" => RunMode.DisplayGroupsUpdate,
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
             "strategy-replay" => RunMode.StrategyReplay,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
         };
     }
 }
@@ -7692,6 +9554,9 @@ public enum RunMode
     Orders,
     OrdersAllOpen,
     Positions,
+    PositionsMonitor1Pct,
+    PositionsMonitor1PctLoop,
+    PositionsAutoReplaceScanLoop,
     SnapshotAll,
     ContractsValidate,
     OrdersDryRun,
@@ -7809,6 +9674,234 @@ internal sealed class LiveScannerCandidateRow
     public double WeightedScore { get; set; }
     public bool? Eligible { get; set; }
     public double AverageRank { get; set; }
+    public double Bid { get; set; }
+    public double Ask { get; set; }
+    public double Mark { get; set; }
+}
+
+internal sealed record PositionMonitorPlan(
+    string Symbol,
+    string EntryAction,
+    double Quantity,
+    double SeedLimit
+);
+
+internal sealed record LiveOrderExecutionResult(
+    string Symbol,
+    double RequestedQuantity,
+    double FilledQuantity,
+    bool PlacementAccepted
+);
+
+/// <summary>
+/// DT_V1.1_CONDUCT configuration record. All tuneable parameters for the conduct exit engine.
+/// Instantiate with defaults using <c>new ConductExitConfig()</c>, override via <c>with { ... }</c>.
+/// </summary>
+internal sealed record ConductExitConfig
+{
+    // ── Data freshness ───────────────────────────────────────────
+    public int L1StaleSec { get; init; } = 3;
+
+    // ── Loop cadence ─────────────────────────────────────────────
+    public int MonitorPollSeconds { get; init; } = 1;
+
+    // ── Immediate reversal overlay ───────────────────────────────
+    public int ImmediateWindowSec { get; init; } = 5;
+    public double ImmediateAdverseMovePct { get; init; } = 0.002;   // 0.20%
+    public double ImmediateAdverseMoveUsd { get; init; } = 10.0;
+
+    // ── Giveback cap (mandatory) ─────────────────────────────────
+    public double GivebackPctOfNotional { get; init; } = 0.01;      // 1%
+    public double GivebackUsdCap { get; init; } = 30.0;
+
+    // ── Hard stop (V1.1) ─────────────────────────────────────────
+    public double HardStopDistanceMultiplier { get; init; } = 2.0;  // 2× giveback cap distance
+
+    // ── Max drawdown (replaces legacy GIVEBACK_REVERSAL) ─────────
+    public double InitialMaxDrawdownPct { get; init; } = 0.01;      // 1%
+    public double TightenedMaxDrawdownPct { get; init; } = 0.005;   // 0.5%
+    public double TightenTriggerWinPct { get; init; } = 0.01;       // tighten after +1% favorable
+
+    // ── Trailing activation ──────────────────────────────────────
+    public double TrailingProfitMinUsd { get; init; } = 10.0;
+    public double TrailingProfitMinRMultiple { get; init; } = 0.5;
+
+    // ── Trailing noise floor ─────────────────────────────────────
+    public double TrailKSpread { get; init; } = 2.0;
+    public double TrailKTicks { get; init; } = 3;
+    public double TrailKAtr { get; init; } = 0.10;                  // 10% of ATR
+    public int AtrWindowSize { get; init; } = 120;
+    public double AtrEmaAlpha { get; init; } = 0.1;                 // EMA smoothing factor
+    public int AtrWarmupMinSamples { get; init; } = 10;
+
+    // ── Break-even ratchet (V1.1) ────────────────────────────────
+    public double BreakEvenActivationR { get; init; } = 1.0;        // ratchet floor→entry after 1R
+
+    // ── Profit-lock (V1.1) ───────────────────────────────────────
+    public double ProfitLockActivationR { get; init; } = 2.0;       // lock profit after 2R
+    public double ProfitLockGuaranteeR { get; init; } = 0.5;        // guarantee at least 0.5R
+
+    // ── Time stop ────────────────────────────────────────────────
+    public int TimeStopSec { get; init; } = 90;
+    public double MinProgressR { get; init; } = 0.5;
+
+    // ── EOD ──────────────────────────────────────────────────────
+    public string EodFlattenTimeET { get; init; } = "15:55";
+
+    // ── Position refresh (V1.1) ──────────────────────────────────
+    public int PositionRecheckIntervalSec { get; init; } = 15;
+
+    // ── SAFETY overlay (V1.2) ────────────────────────────────────
+    public bool SafetyOverlayEnabled { get; init; } = true;
+    public string KillSwitchFilePath { get; init; } = "kill_switch.txt";  // file presence = halt
+    public double DailyMaxLossUsd { get; init; } = 200.0;                // daily PnL floor
+    public int DisconnectFlattenSec { get; init; } = 10;                 // flatten after N seconds disconnected
+
+    // ── ENSURE_EXITS: broker-managed stop orders (V1.2) ──────────
+    public bool EnsureExitsEnabled { get; init; } = true;
+    public int ExitAckTimeoutSec { get; init; } = 2;
+    public int ExitRepairRetries { get; init; } = 2;
+    public int ExitRecheckIntervalSec { get; init; } = 30;               // re-verify exits every N seconds
+
+    // ── Take-profit scaling (V1.2) ───────────────────────────────
+    public bool TakeProfitEnabled { get; init; } = false;                // disabled by default until user configures prices
+    public double Tp1RMultiple { get; init; } = 1.0;                     // TP1 at +1R from entry
+    public double Tp1ScaleOutPct { get; init; } = 0.50;                  // close 50% at TP1
+    public double Tp2RMultiple { get; init; } = 2.0;                     // TP2 at +2R from entry
+
+    // ── 1m candle maintenance (V1.2) ─────────────────────────────
+    public bool CandleMaintenanceEnabled { get; init; } = true;
+    public int AtrCandlePeriod { get; init; } = 14;                      // ATR(14) on 1m bars
+
+    // ── Trade episode journal (V1.2) ─────────────────────────────
+    public bool TradeEpisodeJournalEnabled { get; init; } = true;
+}
+
+/// <summary>
+/// Mutable per-symbol state tracked by the V1.1 conduct exit engine during position monitoring.
+/// </summary>
+internal sealed class ConductPositionState
+{
+    public required string Symbol { get; init; }
+    public required bool IsLong { get; init; }
+    public required double FilledQuantity { get; set; }
+    public required double EntryPrice { get; init; }
+    public required DateTime LoopStartUtc { get; init; }
+
+    // Peak / trough
+    public double PeakPrice { get; set; }
+    public double TroughPrice { get; set; }
+    public double PeakUnrealPnlUsd { get; set; }
+    public double MfeUsd { get; set; }
+    public double MaeUsd { get; set; }
+
+    // Trailing
+    public bool TrailingActive { get; set; }
+
+    // Drawdown tightening
+    public bool TightenedRuleActive { get; set; }
+    public double ActiveMaxDrawdownPct { get; set; }
+
+    // Break-even / profit-lock (V1.1)
+    public bool BreakEvenActive { get; set; }
+    public bool ProfitLocked { get; set; }
+    public double FloorPricePerShare { get; set; }
+
+    // L1 freshness
+    public DateTime LastFreshL1Utc { get; set; }
+
+    // Time stop
+    public DateTime TimeStopDeadlineUtc { get; set; }
+
+    // Market history
+    public Queue<double> MarkHistory { get; } = new();
+
+    // Position refresh counter
+    public int TicksSincePositionRecheck { get; set; }
+
+    // ── V1.2 additions ──────────────────────────────────────────
+
+    // SAFETY overlay tracking
+    public DateTime LastConnectedUtc { get; set; } = DateTime.UtcNow;
+    public double SessionRealizedPnlUsd { get; set; }
+
+    // ENSURE_EXITS: broker-managed order tracking
+    public int? StopOrderId { get; set; }
+    public int? Tp1OrderId { get; set; }
+    public int? Tp2OrderId { get; set; }
+    public bool Tp1Done { get; set; }
+    public int ExitsVerifiedCount { get; set; }
+    public int ExitsRepairAttempts { get; set; }
+    public int TicksSinceExitRecheck { get; set; }
+    public double OriginalFilledQuantity { get; init; }
+
+    // 1m candle maintenance
+    public List<ConductCandleBar> CandleBars1M { get; } = [];
+    public ConductCandleBarBuilder? CurrentCandle { get; set; }
+    public double Atr1M { get; set; }
+
+    // Trade episode
+    public double RiskPerTradeUsd { get; set; }
+    public double RoundTripCommission { get; set; }
+}
+
+/// <summary>Completed 1-minute OHLCV candle bar.</summary>
+internal sealed record ConductCandleBar(
+    DateTime MinuteUtc,
+    double Open,
+    double High,
+    double Low,
+    double Close,
+    double Volume,
+    int TickCount
+);
+
+/// <summary>Builder for accumulating ticks into a 1-minute candle bar.</summary>
+internal sealed class ConductCandleBarBuilder
+{
+    public DateTime MinuteUtc { get; init; }
+    public double Open { get; init; }
+    public double High { get; set; }
+    public double Low { get; set; }
+    public double Close { get; set; }
+    public double Volume { get; set; }
+    public int TickCount { get; set; }
+
+    public ConductCandleBar Finalize() => new(
+        MinuteUtc, Open, High, Low, Close, Volume, TickCount);
+}
+
+/// <summary>Trade episode written to journal at position close (V1.2).</summary>
+internal sealed class ConductTradeEpisode
+{
+    public string TradeId { get; init; } = string.Empty;
+    public string Symbol { get; init; } = string.Empty;
+    public string Side { get; init; } = string.Empty;
+    public double EntryPrice { get; init; }
+    public double ExitPrice { get; init; }
+    public double Quantity { get; init; }
+    public DateTime EntryUtc { get; init; }
+    public DateTime ExitUtc { get; init; }
+    public double HoldDurationSec { get; init; }
+    public string ExitReason { get; init; } = string.Empty;
+    public double RealizedPnlUsd { get; init; }
+    public double RealizedPnlR { get; init; }
+    public double MfeUsd { get; init; }
+    public double MaeUsd { get; init; }
+    public double PeakUnrealPnlUsd { get; init; }
+    public double RiskPerTradeUsd { get; init; }
+    public double CommissionUsd { get; init; }
+    public double PeakPrice { get; init; }
+    public double TroughPrice { get; init; }
+    public bool TrailingActivated { get; init; }
+    public bool BreakEvenActivated { get; init; }
+    public bool ProfitLocked { get; init; }
+    public bool Tp1Done { get; init; }
+    public double FinalFloorPrice { get; init; }
+    public double Atr1MAtExit { get; init; }
+    public int CandleBarCount { get; init; }
+    public int LoopIterations { get; init; }
+    public string EngineVersion { get; init; } = "V1.2";
 }
 
 public sealed record ScannerPreviewSummaryRow(

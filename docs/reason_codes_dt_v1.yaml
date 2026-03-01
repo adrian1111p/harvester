@@ -1,0 +1,64 @@
+reason_codes:
+  # ── V1.0 reason codes (retained) ──────────────────────────────────
+  SAFETY:
+    when: "Global safety overlay hit (kill switch, daily loss, connectivity halt)"
+  L1_STALE:
+    when: "No valid L1 for longer than configured freshness window (3s default)"
+    exit_priority: E1
+  NO_PROTECTIVE_EXITS:
+    when: "Protective exits could not be maintained (reserved for future use)"
+  IMMEDIATE_REVERSAL:
+    when: "Adverse move within first 5s after entry (0.2% pct or dynamic USD threshold)"
+    exit_priority: E2
+  HARD_STOP:
+    when: "Price breaches absolute hard stop level (2× giveback cap distance from entry, min 3%)"
+    exit_priority: E3
+    v1_1: true
+  STOP_MISSING_FLATTEN:
+    when: "Hard stop should trigger but stop order missing/rejected (reserved for broker-managed stops)"
+  MICRO_STOP:
+    when: "Microstructure deterioration trigger (L2/L1 based, reserved for future L2 integration)"
+  TP1:
+    when: "First profit target filled (reserved for future TP/OCA implementation)"
+  TP2:
+    when: "Final profit target filled (reserved for future TP/OCA implementation)"
+
+  # ── V1.1 new reason codes ──────────────────────────────────────────
+  BREAKEVEN_FLOOR:
+    when: "Price drops below break-even floor after peak PnL reached 1R"
+    exit_priority: E4
+    v1_1: true
+    note: "Floor ratchets to entry price once peak unrealized >= 1× risk"
+  PROFIT_LOCK_FLOOR:
+    when: "Price drops below profit-lock floor after peak PnL reached 2R"
+    exit_priority: E4
+    v1_1: true
+    note: "Guarantees at least 0.5R profit once peak unrealized >= 2× risk"
+
+  # ── V1.0 reason codes (continued) ─────────────────────────────────
+  TRAIL_STOP:
+    when: "Adaptive trailing stop triggered (giveback cap + noise floor, EMA ATR with warmup)"
+    exit_priority: E5
+  MAX_DRAWDOWN:
+    when: "Price drawdown from peak exceeds max_drawdown_pct (pre-trailing fallback, replaces GIVEBACK_REVERSAL)"
+    exit_priority: E6
+    v1_1: true
+    replaces: "GIVEBACK_REVERSAL"
+  TIME_STOP:
+    when: "90s elapsed with MFE < 0.5R (insufficient progress)"
+    exit_priority: E7
+  EOD:
+    when: "End-of-day mandatory flatten (15:55 ET default)"
+    exit_priority: E8
+  EXTERNAL_CLOSE:
+    when: "Position qty refresh detected 0 qty (external manual or other system close)"
+    exit_priority: E0
+    v1_1: true
+  ORDER_REJECT:
+    when: "Broker rejected entry/exit/flatten order"
+
+  # ── Deprecated ─────────────────────────────────────────────────────
+  GIVEBACK_REVERSAL:
+    when: "DEPRECATED in V1.1 — replaced by MAX_DRAWDOWN"
+    deprecated: true
+    replaced_by: MAX_DRAWDOWN

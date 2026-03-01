@@ -16,7 +16,7 @@ public sealed class IbErrorPolicy
 {
     private static readonly HashSet<int> InformationalCodes =
     [
-        2100, 2104, 2106, 2158,
+        2100, 2103, 2104, 2106, 2108, 2158,
         10089, 10167, 10168, 10187,
         10285, 354, 322, 300, 310, 420
     ];
