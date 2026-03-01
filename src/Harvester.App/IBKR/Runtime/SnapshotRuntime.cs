@@ -935,10 +935,13 @@ public sealed class SnapshotRuntime
                     LiveOrderPlacementPlan replacementPlan;
                     try
                     {
-                        replacementPlan = ResolveLiveOrderPlacementPlan(
+                        replacementPlan = await ResolveLiveOrderPlacementPlanAsync(
+                            client,
+                            brokerAdapter,
                             actionOverride: "BUY",
                             excludedSymbols: excluded,
-                            quantityOverride: replacementQuantity);
+                            quantityOverride: replacementQuantity,
+                            token);
                     }
                     catch (Exception ex)
                     {
@@ -1188,7 +1191,7 @@ public sealed class SnapshotRuntime
     private async Task RunOrdersPlaceSimMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunOrdersPlaceSimMode));
-        var livePlan = ResolveLiveOrderPlacementPlan();
+        var livePlan = await ResolveLiveOrderPlacementPlanAsync(client, brokerAdapter, _options.LiveAction, excludedSymbols: null, quantityOverride: null, token);
         await ExecuteLiveOrderPlacementPlanAsync(client, brokerAdapter, livePlan, nameof(RunOrdersPlaceSimMode), token, quoteRequestSeed: 9917);
     }
 
@@ -2816,12 +2819,18 @@ public sealed class SnapshotRuntime
         return new LiveQuoteSnapshot(bid, ask, last, ticks);
     }
 
-    private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan()
+    private Task<LiveOrderPlacementPlan> ResolveLiveOrderPlacementPlanAsync(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
-        return ResolveLiveOrderPlacementPlan(_options.LiveAction, excludedSymbols: null, quantityOverride: null);
+        return ResolveLiveOrderPlacementPlanAsync(client, brokerAdapter, _options.LiveAction, excludedSymbols: null, quantityOverride: null, token);
     }
 
-    private LiveOrderPlacementPlan ResolveLiveOrderPlacementPlan(string actionOverride, IReadOnlySet<string>? excludedSymbols, double? quantityOverride)
+    private async Task<LiveOrderPlacementPlan> ResolveLiveOrderPlacementPlanAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        string actionOverride,
+        IReadOnlySet<string>? excludedSymbols,
+        double? quantityOverride,
+        CancellationToken token)
     {
         var symbol = _options.LiveSymbol;
         var action = actionOverride;
@@ -2904,12 +2913,24 @@ public sealed class SnapshotRuntime
                 .Where(x => !excluded.Contains(x.Symbol))
                 .ToList();
 
-            var emptyL1 = new Dictionary<string, Strategy.ScannerV2L1Snapshot>();
-            var emptyL2 = new Dictionary<string, Strategy.ScannerV2L2DepthSnapshot>();
-            var biasEntries = Array.Empty<Strategy.ScannerV2SymbolBias>();
+            var marketDataProbeCandidates = fileCandidates
+                .OrderByDescending(x => x.WeightedScore)
+                .ThenBy(x => x.AverageRank)
+                .Take(Math.Max(_options.LiveScannerTopN, _options.LiveScannerTopN * 3))
+                .ToList();
+
+            var (sessionOpenUtc, sessionCloseUtc) = ResolveUsEquitiesSessionWindowUtc(DateTime.UtcNow);
+            var snapshots = await CaptureScannerV2MarketSnapshotsAsync(client, brokerAdapter, marketDataProbeCandidates, token);
+            var biasEntries = LoadLiveScannerV2BiasEntries();
             var v2Snapshot = v2Engine.Evaluate(
-                fileCandidates, emptyL1, emptyL2, biasEntries,
-                DateTime.MinValue, DateTime.MinValue, DateTime.UtcNow, fullPath);
+                fileCandidates,
+                snapshots.L1BySymbol,
+                snapshots.L2BySymbol,
+                biasEntries,
+                sessionOpenUtc,
+                sessionCloseUtc,
+                DateTime.UtcNow,
+                fullPath);
 
             Console.WriteLine($"[INFO] Live Scanner V2.0: {v2Snapshot.SelectedCount} selected " +
                 $"from {v2Snapshot.TotalCandidates} candidates " +
@@ -3220,6 +3241,165 @@ public sealed class SnapshotRuntime
             "0" or "N" or "NO" or "FALSE" => false,
             _ => null
         };
+    }
+
+    private (DateTime SessionOpenUtc, DateTime SessionCloseUtc) ResolveUsEquitiesSessionWindowUtc(DateTime nowUtc)
+    {
+        var calendar = new UsEquitiesExchangeCalendarService();
+        if (!calendar.TryGetSessionWindowUtc("US-EQUITIES", nowUtc, out var session)
+            || !session.IsTradingDay)
+        {
+            return (DateTime.MinValue, DateTime.MinValue);
+        }
+
+        return (session.SessionOpenUtc, session.SessionCloseUtc);
+    }
+
+    private IReadOnlyList<Strategy.ScannerV2SymbolBias> LoadLiveScannerV2BiasEntries()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable("SCN_V2_BIAS_STORE_PATH") ?? string.Empty;
+        var outputPath = Path.Combine(EnsureOutputDir(), "strategy_replay_self_learning_v2_bias_store.json");
+        var fallbackPath = Path.Combine(Directory.GetCurrentDirectory(), "temp", "scanner_v2_bias_store.json");
+        var pathCandidates = new[] { configuredPath, outputPath, fallbackPath }
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var candidate in pathCandidates)
+        {
+            try
+            {
+                var fullPath = Path.GetFullPath(candidate);
+                if (!File.Exists(fullPath))
+                {
+                    continue;
+                }
+
+                var store = LoadSelfLearningV2BiasStore(fullPath);
+                if (store is null || store.Count == 0)
+                {
+                    continue;
+                }
+
+                return store.Values
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+                    .Select(x => new Strategy.ScannerV2SymbolBias(
+                        Symbol: x.Symbol.Trim().ToUpperInvariant(),
+                        Bias: x.Bias,
+                        Confidence: x.Confidence,
+                        ScannerScoreShift: x.Bias * x.Confidence * 10.0))
+                    .ToArray();
+            }
+            catch
+            {
+            }
+        }
+
+        return Array.Empty<Strategy.ScannerV2SymbolBias>();
+    }
+
+    private async Task<(Dictionary<string, Strategy.ScannerV2L1Snapshot> L1BySymbol, Dictionary<string, Strategy.ScannerV2L2DepthSnapshot> L2BySymbol)> CaptureScannerV2MarketSnapshotsAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        IReadOnlyList<Strategy.ScannerV2CandidateFileRow> candidates,
+        CancellationToken token)
+    {
+        var l1BySymbol = new Dictionary<string, Strategy.ScannerV2L1Snapshot>(StringComparer.OrdinalIgnoreCase);
+        var l2BySymbol = new Dictionary<string, Strategy.ScannerV2L2DepthSnapshot>(StringComparer.OrdinalIgnoreCase);
+        if (candidates.Count == 0)
+        {
+            return (l1BySymbol, l2BySymbol);
+        }
+
+        var reqBase = 45000 + (int)(DateTime.UtcNow.Ticks % 10000);
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            token.ThrowIfCancellationRequested();
+            var symbol = candidates[i].Symbol;
+            if (string.IsNullOrWhiteSpace(symbol))
+            {
+                continue;
+            }
+
+            var topReqId = reqBase + (i * 2);
+            var depthReqId = topReqId + 1;
+            var topContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                BrokerAssetType.Stock,
+                symbol,
+                "SMART",
+                "USD",
+                _options.PrimaryExchange));
+            var depthContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                BrokerAssetType.Stock,
+                symbol,
+                _options.DepthExchange,
+                "USD",
+                _options.PrimaryExchange));
+
+            brokerAdapter.RequestMarketData(client, topReqId, topContract);
+            brokerAdapter.RequestMarketDepth(client, depthReqId, depthContract, _options.DepthRows, isSmartDepth: false);
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(700), token);
+            }
+            finally
+            {
+                brokerAdapter.CancelMarketData(client, topReqId);
+                brokerAdapter.CancelMarketDepth(client, depthReqId, isSmartDepth: false);
+            }
+
+            var ticks = _wrapper.TopTicks
+                .Where(t => t.TickerId == topReqId)
+                .OrderBy(t => t.TimestampUtc)
+                .ToArray();
+            var bid = ticks.LastOrDefault(t => t.Kind == "tickPrice" && t.Field == 1)?.Price ?? 0;
+            var ask = ticks.LastOrDefault(t => t.Kind == "tickPrice" && t.Field == 2)?.Price ?? 0;
+            var last = ticks.LastOrDefault(t => t.Kind == "tickPrice" && t.Field == 4)?.Price ?? 0;
+            var volume = ticks
+                .Where(t => t.Kind == "tickSize" && t.Field == 8)
+                .Select(t => (double)Math.Max(0, t.Size))
+                .LastOrDefault();
+
+            l1BySymbol[symbol] = new Strategy.ScannerV2L1Snapshot(
+                Symbol: symbol,
+                Bid: bid,
+                Ask: ask,
+                Last: last,
+                Volume: volume,
+                TimestampUtc: DateTime.UtcNow);
+
+            var depthRows = _wrapper.DepthRows
+                .Where(d => d.TickerId == depthReqId)
+                .OrderByDescending(d => d.TimestampUtc)
+                .ToArray();
+            var latestByLevel = depthRows
+                .GroupBy(d => (d.Side, d.Position))
+                .Select(g => g.OrderByDescending(x => x.TimestampUtc).First())
+                .ToArray();
+            var bidLevels = latestByLevel
+                .Where(d => d.Side == 1 && d.Price > 0 && d.Size > 0)
+                .OrderBy(d => d.Position)
+                .Take(Math.Max(1, _options.DepthRows))
+                .Select(d => new Strategy.ScannerV2DepthLevel(d.Position, d.Price, d.Size))
+                .ToArray();
+            var askLevels = latestByLevel
+                .Where(d => d.Side == 0 && d.Price > 0 && d.Size > 0)
+                .OrderBy(d => d.Position)
+                .Take(Math.Max(1, _options.DepthRows))
+                .Select(d => new Strategy.ScannerV2DepthLevel(d.Position, d.Price, d.Size))
+                .ToArray();
+
+            l2BySymbol[symbol] = new Strategy.ScannerV2L2DepthSnapshot(
+                Symbol: symbol,
+                BidLevels: bidLevels,
+                AskLevels: askLevels,
+                TimestampUtc: DateTime.UtcNow);
+        }
+
+        return (l1BySymbol, l2BySymbol);
     }
 
     private static double ResolveTargetNotional(string mode, double budget, double selectedScore, IReadOnlyList<LiveScannerCandidateRow> selected)

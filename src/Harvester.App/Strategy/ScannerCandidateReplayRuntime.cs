@@ -94,7 +94,10 @@ public sealed class ScannerCandidateReplayRuntime :
             _mtfSignalEngine,
             BuildScannerRequireMtfAlignmentFromEnvironment(),
             BuildScannerRequireBuySetupConfirmationFromEnvironment(),
-            BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment());
+            BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment(),
+            BuildScannerRequireSellSetupConfirmationFromEnvironment(),
+            BuildScannerRequireBreakoutConfirmationFromEnvironment(),
+            BuildScannerRequireOneTwoThreeConfirmationFromEnvironment());
         var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
         var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
         var tradeManagementTrailing = new Tmg003TrailingProgressionStrategy(BuildTradeManagementTrailingConfigFromEnvironment());
@@ -365,6 +368,21 @@ public sealed class ScannerCandidateReplayRuntime :
     private static bool BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment()
     {
         return TryReadEnvironmentBool("SCN_001_REQUIRE_ENHANCED_BUY_SETUP_CONFIRMATION", false);
+    }
+
+    private static bool BuildScannerRequireSellSetupConfirmationFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_SELL_SETUP_CONFIRMATION", false);
+    }
+
+    private static bool BuildScannerRequireBreakoutConfirmationFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_BREAKOUT_CONFIRMATION", false);
+    }
+
+    private static bool BuildScannerRequireOneTwoThreeConfirmationFromEnvironment()
+    {
+        return TryReadEnvironmentBool("SCN_001_REQUIRE_123_CONFIRMATION", false);
     }
 
     private static Tmg002BreakEvenConfig BuildTradeManagementBreakEvenConfigFromEnvironment()

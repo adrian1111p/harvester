@@ -1711,6 +1711,9 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
     private readonly bool _requireMtfAlignment;
     private readonly bool _requireBuySetupConfirmation;
     private readonly bool _requireEnhancedBuySetupConfirmation;
+    private readonly bool _requireSellSetupConfirmation;
+    private readonly bool _requireBreakoutConfirmation;
+    private readonly bool _requireOneTwoThreeConfirmation;
 
     private sealed record BuySetupSignalState(
         bool BaseReady,
@@ -1724,7 +1727,17 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         bool MinorSupportRetestReady,
         bool TrendlineRetestReady,
         bool PracticePatternReady,
+        bool BreakoutReady,
+        bool OneTwoThreeReady,
         double RewardRiskRatio,
+        int EnhancedScore
+    );
+
+    private sealed record SellSetupSignalState(
+        bool BaseReady,
+        bool BreakdownReady,
+        bool PullupQualityReady,
+        bool RewardRiskReady,
         int EnhancedScore
     );
 
@@ -1737,7 +1750,10 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         IReplayMtfSignalSource? mtfSignalSource = null,
         bool requireMtfAlignment = false,
         bool requireBuySetupConfirmation = false,
-        bool requireEnhancedBuySetupConfirmation = false)
+        bool requireEnhancedBuySetupConfirmation = false,
+        bool requireSellSetupConfirmation = false,
+        bool requireBreakoutConfirmation = false,
+        bool requireOneTwoThreeConfirmation = false)
     {
         _submittedSymbols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _barsBySymbol = new Dictionary<string, List<SetupBar>>(StringComparer.OrdinalIgnoreCase);
@@ -1750,6 +1766,9 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         _requireMtfAlignment = requireMtfAlignment;
         _requireBuySetupConfirmation = requireBuySetupConfirmation;
         _requireEnhancedBuySetupConfirmation = requireEnhancedBuySetupConfirmation;
+        _requireSellSetupConfirmation = requireSellSetupConfirmation;
+        _requireBreakoutConfirmation = requireBreakoutConfirmation;
+        _requireOneTwoThreeConfirmation = requireOneTwoThreeConfirmation;
     }
 
     public IReadOnlyList<ReplayOrderIntent> Evaluate(ReplayDayTradingContext context, ReplayScannerSymbolSelectionSnapshotRow selection)
@@ -1782,9 +1801,15 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         var buySetupState = string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
             ? AnalyzeBuySetupSignals(symbol)
             : null;
+        var sellSetupState = string.Equals(side, "SELL", StringComparison.OrdinalIgnoreCase)
+            ? AnalyzeSellSetupSignals(symbol)
+            : null;
 
         var buySetupReady = buySetupState?.BaseReady ?? false;
         var buySetupEnhancedReady = (buySetupState?.EnhancedScore ?? 0) >= EnhancedSignalThreshold;
+        var sellSetupReady = sellSetupState?.BaseReady ?? false;
+        var breakoutReady = buySetupState?.BreakoutReady ?? false;
+        var oneTwoThreeReady = buySetupState?.OneTwoThreeReady ?? false;
 
         if (string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
             && _requireBuySetupConfirmation
@@ -1796,6 +1821,27 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         if (string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
             && _requireEnhancedBuySetupConfirmation
             && !buySetupEnhancedReady)
+        {
+            return [];
+        }
+
+        if (string.Equals(side, "SELL", StringComparison.OrdinalIgnoreCase)
+            && _requireSellSetupConfirmation
+            && !sellSetupReady)
+        {
+            return [];
+        }
+
+        if (string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+            && _requireBreakoutConfirmation
+            && !breakoutReady)
+        {
+            return [];
+        }
+
+        if (string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase)
+            && _requireOneTwoThreeConfirmation
+            && !oneTwoThreeReady)
         {
             return [];
         }
@@ -1856,18 +1902,32 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
                 null,
                 _timeInForce,
                 null,
-                BuildEntrySourceTag(side, buySetupState))
+                BuildEntrySourceTag(side, buySetupState, sellSetupState))
         ];
     }
 
-    private string BuildEntrySourceTag(string side, BuySetupSignalState? buySetupState)
+    private string BuildEntrySourceTag(string side, BuySetupSignalState? buySetupState, SellSetupSignalState? sellSetupState)
     {
         var source = _mtfSignalSource is null
             ? "entry:scanner-candidate"
             : "entry:scanner-candidate:mtf-aligned";
 
-        if (!string.Equals(side, "BUY", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(side, "SELL", StringComparison.OrdinalIgnoreCase))
         {
+            var sellReady = sellSetupState?.BaseReady ?? false;
+            source += sellReady ? ":sell-setup-confirmed" : ":sell-setup-signal";
+            if (_requireSellSetupConfirmation && !sellReady)
+            {
+                source += ":sell-setup-required";
+            }
+
+            if (sellSetupState is not null)
+            {
+                source += sellSetupState.BreakdownReady ? ":breakdown" : ":breakdown-miss";
+                source += sellSetupState.PullupQualityReady ? ":pullup-quality" : ":pullup-quality-miss";
+                source += sellSetupState.RewardRiskReady ? ":rr" : ":rr-miss";
+            }
+
             return source;
         }
 
@@ -1912,6 +1972,8 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
             source += buySetupState.MinorSupportRetestReady ? ":minor-support" : ":minor-support-miss";
             source += buySetupState.TrendlineRetestReady ? ":trendline" : ":trendline-miss";
             source += buySetupState.PracticePatternReady ? ":practice-pattern" : ":practice-pattern-miss";
+            source += buySetupState.BreakoutReady ? ":breakout" : ":breakout-miss";
+            source += buySetupState.OneTwoThreeReady ? ":123" : ":123-miss";
         }
 
         return source;
@@ -1963,21 +2025,21 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         if (!_barsBySymbol.TryGetValue(symbol, out var bars)
             || bars.Count < SetupMinBars)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var current = bars[^1];
         var prior = bars.Take(bars.Count - 1).ToList();
         if (prior.Count < SetupSmaLength + SetupPullbackBars)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var lookbackStart = Math.Max(0, prior.Count - SetupLookbackBars);
         var lookback = prior.Skip(lookbackStart).ToList();
         if (lookback.Count < SetupPullbackBars + 2)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var peakIndexInLookback = 0;
@@ -1993,14 +2055,14 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
 
         if (peakIndexInLookback <= 0 || peakIndexInLookback >= lookback.Count - SetupPullbackBars)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var rallySegment = lookback.Take(peakIndexInLookback + 1).ToList();
         var pullbackSegment = lookback.Skip(peakIndexInLookback + 1).ToList();
         if (rallySegment.Count < 2 || pullbackSegment.Count < SetupPullbackBars)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var latestPullback = pullbackSegment.Skip(Math.Max(0, pullbackSegment.Count - SetupPullbackBars)).ToList();
@@ -2016,7 +2078,7 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         var rallyRange = peakHigh - rallyLow;
         if (rallyRange <= 0)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var retracementPct = (peakHigh - pullbackLow) / rallyRange;
@@ -2025,7 +2087,7 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         var closes = bars.Select(bar => bar.Close).ToList();
         if (closes.Count < SetupSmaLength + 1)
         {
-            return new BuySetupSignalState(false, false, false, false, false, false, false, false, false, false, false, 0.0, 0);
+            return EmptyBuySetupSignalState();
         }
 
         var currentSma20 = closes.Skip(closes.Count - SetupSmaLength).Average();
@@ -2123,6 +2185,11 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
         var practicePatternReady = (multipleEntryBarsReady || entryBarReady)
             && (minorSupportRetestReady || trendlineRetestReady)
             && (volumeSpikeReady || rewardRiskReady);
+        var breakoutReady = current.Close > peakHigh && (avgPriorVolume <= 0 || current.Volume >= avgPriorVolume * 1.2);
+        var oneTwoThreeReady = hasPullbackStructure
+            && pullbackLow > rallyLow
+            && priorBar.High > 0
+            && current.Close > priorBar.High;
 
         var enhancedScore = 0;
         if (criteria4Ready)
@@ -2175,6 +2242,16 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
             enhancedScore++;
         }
 
+        if (breakoutReady)
+        {
+            enhancedScore++;
+        }
+
+        if (oneTwoThreeReady)
+        {
+            enhancedScore++;
+        }
+
         return new BuySetupSignalState(
             BaseReady: baseReady,
             Criteria4Ready: criteria4Ready,
@@ -2187,8 +2264,143 @@ public sealed class ReplayScannerSingleShotEntryStrategy : IReplayEntryStrategy
             MinorSupportRetestReady: minorSupportRetestReady,
             TrendlineRetestReady: trendlineRetestReady,
             PracticePatternReady: practicePatternReady,
+            BreakoutReady: breakoutReady,
+            OneTwoThreeReady: oneTwoThreeReady,
             RewardRiskRatio: rewardRiskRatio,
             EnhancedScore: enhancedScore);
+    }
+
+    private static BuySetupSignalState EmptyBuySetupSignalState()
+    {
+        return new BuySetupSignalState(
+            BaseReady: false,
+            Criteria4Ready: false,
+            EntryBarReady: false,
+            CopBarReady: false,
+            PullbackQualityReady: false,
+            RewardRiskReady: false,
+            MultipleEntryBarsReady: false,
+            VolumeSpikeReady: false,
+            MinorSupportRetestReady: false,
+            TrendlineRetestReady: false,
+            PracticePatternReady: false,
+            BreakoutReady: false,
+            OneTwoThreeReady: false,
+            RewardRiskRatio: 0.0,
+            EnhancedScore: 0);
+    }
+
+    private SellSetupSignalState AnalyzeSellSetupSignals(string symbol)
+    {
+        if (!_barsBySymbol.TryGetValue(symbol, out var bars)
+            || bars.Count < SetupMinBars)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var current = bars[^1];
+        var prior = bars.Take(bars.Count - 1).ToList();
+        if (prior.Count < SetupSmaLength + SetupPullbackBars)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var lookbackStart = Math.Max(0, prior.Count - SetupLookbackBars);
+        var lookback = prior.Skip(lookbackStart).ToList();
+        if (lookback.Count < SetupPullbackBars + 2)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var troughIndexInLookback = 0;
+        var troughLow = lookback[0].Low;
+        for (var i = 1; i < lookback.Count; i++)
+        {
+            if (lookback[i].Low <= troughLow)
+            {
+                troughLow = lookback[i].Low;
+                troughIndexInLookback = i;
+            }
+        }
+
+        if (troughIndexInLookback <= 0 || troughIndexInLookback >= lookback.Count - SetupPullbackBars)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var dropSegment = lookback.Take(troughIndexInLookback + 1).ToList();
+        var pullupSegment = lookback.Skip(troughIndexInLookback + 1).ToList();
+        if (dropSegment.Count < 2 || pullupSegment.Count < SetupPullbackBars)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var latestPullup = pullupSegment.Skip(Math.Max(0, pullupSegment.Count - SetupPullbackBars)).ToList();
+        var hasThreeGreenBars = latestPullup.All(bar => bar.Close > bar.Open);
+        var hasThreeHigherLows = latestPullup.Count >= 3
+            && latestPullup[0].Low < latestPullup[1].Low
+            && latestPullup[1].Low < latestPullup[2].Low;
+        var hasPullupStructure = hasThreeGreenBars || hasThreeHigherLows;
+
+        var dropHigh = dropSegment.Max(bar => bar.High);
+        var pullupHigh = pullupSegment.Max(bar => bar.High);
+        var dropRange = dropHigh - troughLow;
+        if (dropRange <= 0)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var retracementPct = (pullupHigh - troughLow) / dropRange;
+        var retracementInRange = retracementPct >= 0.40 && retracementPct <= 0.60;
+        var breakdownReady = current.Close < current.Open && current.Close < prior[^1].Low;
+
+        var closes = bars.Select(bar => bar.Close).ToList();
+        if (closes.Count < SetupSmaLength + 1)
+        {
+            return new SellSetupSignalState(false, false, false, false, 0);
+        }
+
+        var currentSma20 = closes.Skip(closes.Count - SetupSmaLength).Average();
+        var previousSma20 = closes.Skip(closes.Count - SetupSmaLength - 1).Take(SetupSmaLength).Average();
+        var smaFalling = currentSma20 < previousSma20;
+        var belowSma = current.Close <= currentSma20;
+
+        var stopPrice = pullupHigh * 1.0005;
+        var targetPrice = troughLow;
+        var entryPrice = Math.Min(current.Close, prior[^1].Low * 0.9995);
+        var risk = stopPrice - entryPrice;
+        var reward = entryPrice - targetPrice;
+        var rewardRiskRatio = (risk > 0 && reward > 0) ? (reward / risk) : 0.0;
+        var rewardRiskReady = rewardRiskRatio >= 1.5;
+
+        var pullupRanges = latestPullup.Select(bar => Math.Max(0.0, bar.High - bar.Low)).ToList();
+        var pullupQualityReady = pullupRanges.Count >= 3
+            && pullupRanges[0] >= pullupRanges[1]
+            && pullupRanges[1] >= pullupRanges[2];
+
+        var baseReady = hasPullupStructure
+            && retracementInRange
+            && smaFalling
+            && belowSma
+            && breakdownReady;
+
+        var enhancedScore = 0;
+        if (breakdownReady)
+        {
+            enhancedScore++;
+        }
+
+        if (pullupQualityReady)
+        {
+            enhancedScore++;
+        }
+
+        if (rewardRiskReady)
+        {
+            enhancedScore++;
+        }
+
+        return new SellSetupSignalState(baseReady, breakdownReady, pullupQualityReady, rewardRiskReady, enhancedScore);
     }
 
     private string ResolveOrderSide(double positionQuantity)
