@@ -2,8 +2,15 @@
 **/bin/
 **/obj/
 
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
 # Runtime outputs
 exports/
+*.log
 
 # Local-only workspace artifacts
 external/
@@ -11,3 +18,11 @@ data/
 docs/logs.txt
 docs/order_lifecycle_implementation.md
 docs/Lean_Zipline_Limit_Order_Cases_*.md
+
+# IDE
+.vs/
+
+# Temp/scratch
+temp/
+memory/
+backtest/*.txt
