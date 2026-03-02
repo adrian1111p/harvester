@@ -1,11 +1,17 @@
 """
-strategy.py — Conduct Strategy V1.3: Multi-Timeframe Trend-Following (Long + Short).
+strategy.py — Conduct Strategy V2.0: Multi-Timeframe Trend-Following (Long + Short).
+
+V2.0 changes vs V1.3:
+  - Added 20MA exhaustion filter: reject entries when price is too far from
+    the 20-period SMA (measured in ATR multiples).  This prevents chasing
+    extended moves that are likely to revert.
 
 Entry logic:
   1. Higher-TF bias  (1h / 1D EMA slope + ADX > 20)
   2. Mid-TF momentum (5m / 15m MACD histogram sign, RSI zone)
   3. Low-TF trigger   (1m / 30s Supertrend flip + volume spike + pullback to EMA)
-  4. Optional: L2 imbalance confirmation
+  4. 20MA exhaustion filter (reject if |price - SMA_20| > max_ma_dist_atr * ATR)
+  5. Optional: L2 imbalance confirmation
 
 Exit logic (mirrors Conduct V1.2):
   - Hard stop at -1 R
@@ -81,6 +87,9 @@ class StrategyConfig:
     tp2_r: float = 3.0                           # Take-profit 2 (close balance)
     max_hold_bars: int = 180                     # Max hold in 30s bars (= 90 min)
     eod_bar_minute: int = 955                    # 15:55 ET in minutes-from-midnight
+
+    # 20MA exhaustion filter
+    max_ma_dist_atr: float = 0.5                 # Max |price - SMA_20| / ATR to enter
 
     # Slippage & commission
     slippage_cents: float = 1.0                  # Per share
@@ -205,8 +214,9 @@ def compute_mtf_momentum(
 
 class ConductStrategyV13:
     """
-    Multi-timeframe trend-following strategy.
+    Conduct Strategy V2.0 — Multi-timeframe trend-following strategy.
     Works on the 1m trigger timeframe with context from 5m, 15m, 1h, 1D.
+    V2.0: Added 20MA exhaustion filter to reject extended entries.
     """
 
     def __init__(self, cfg: StrategyConfig | None = None):
@@ -272,6 +282,15 @@ class ConductStrategyV13:
                     rng = cfg.rsi_long_range if side == Side.LONG else cfg.rsi_short_range
                     if not (rng[0] <= rsi_val <= rng[1]):
                         continue
+
+                # ── 20MA exhaustion filter (V2.0) ──
+                sma_20 = row.get("SMA_20", np.nan)
+                if pd.notna(sma_20) and atr_val > 0:
+                    ma_dist = (row["Close"] - sma_20) / atr_val
+                    if side == Side.LONG and ma_dist > cfg.max_ma_dist_atr:
+                        continue   # Price too far above 20MA — chasing
+                    if side == Side.SHORT and ma_dist < -cfg.max_ma_dist_atr:
+                        continue   # Price too far below 20MA — chasing
 
                 # ── Mid-TF momentum ──
                 mtf_mom = compute_mtf_momentum(df_5m, df_15m, side, cfg, _enriched_cache=mtf_cache)
