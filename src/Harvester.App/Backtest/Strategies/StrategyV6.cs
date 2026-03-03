@@ -24,6 +24,9 @@ public sealed class V6Config
     public (int Start, int End)[] EntryWindows { get; set; } =
         [(585, 690), (840, 930)];
 
+    public bool RequireCrossFromInside { get; set; } = true;
+    public int MaxEntriesPerDirectionPerDay { get; set; } = 1;
+
     // Stop placement
     public bool StopAtOpposite { get; set; } = true;
     public bool StopAtMidpoint { get; set; } = false;
@@ -112,7 +115,7 @@ public sealed class StrategyV6 : IBacktestStrategy
             double rangeInAtr = orRange / atrAtOrEnd;
             if (rangeInAtr < _cfg.MinRangeAtr || rangeInAtr > _cfg.MaxRangeAtr) continue;
 
-            bool signaledLong = false, signaledShort = false;
+            int longEntries = 0, shortEntries = 0;
 
             for (int i = orEndIdx; i < day.EndIdx && i < triggerBars.Length; i++)
             {
@@ -136,7 +139,11 @@ public sealed class StrategyV6 : IBacktestStrategy
                 double price = row.Bar.Close;
 
                 // LONG: breakout above OR high
-                if (!signaledLong && price > orHigh && prev.Bar.Close <= orHigh && htfBias != "BEAR")
+                bool longBreak = _cfg.RequireCrossFromInside
+                    ? (price > orHigh && prev.Bar.Close <= orHigh)
+                    : (price > orHigh);
+
+                if (longEntries < _cfg.MaxEntriesPerDirectionPerDay && longBreak && htfBias != "BEAR")
                 {
                     if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price > row.Vwap))
                     {
@@ -151,13 +158,17 @@ public sealed class StrategyV6 : IBacktestStrategy
                             signals.Add(new BacktestSignal(i, row.Bar.Timestamp, TradeSide.Long,
                                 price, stopPrice, riskPerShare, posSize, atrVal,
                                 HtfBias.Neutral, "N/A", "ORB_BREAKOUT_HIGH"));
-                            signaledLong = true;
+                            longEntries++;
                         }
                     }
                 }
 
                 // SHORT: breakdown below OR low
-                if (!signaledShort && price < orLow && prev.Bar.Close >= orLow && htfBias != "BULL")
+                bool shortBreak = _cfg.RequireCrossFromInside
+                    ? (price < orLow && prev.Bar.Close >= orLow)
+                    : (price < orLow);
+
+                if (shortEntries < _cfg.MaxEntriesPerDirectionPerDay && shortBreak && htfBias != "BULL")
                 {
                     if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price < row.Vwap))
                     {
@@ -172,7 +183,7 @@ public sealed class StrategyV6 : IBacktestStrategy
                             signals.Add(new BacktestSignal(i, row.Bar.Timestamp, TradeSide.Short,
                                 price, stopPrice, riskPerShare, posSize, atrVal,
                                 HtfBias.Neutral, "N/A", "ORB_BREAKOUT_LOW"));
-                            signaledShort = true;
+                            shortEntries++;
                         }
                     }
                 }
@@ -214,8 +225,10 @@ public sealed class StrategyV6 : IBacktestStrategy
     private (double OrHigh, double OrLow, int OrEndIdx) ComputeOpeningRange(
         EnrichedBar[] bars, int dayStartIdx, EnrichedBar[] allBars)
     {
-        // Market open is typically 9:30 ET = minute 570
-        int marketOpenMinute = 570;
+        if (dayStartIdx < 0 || dayStartIdx >= allBars.Length)
+            return (double.NaN, double.NaN, -1);
+
+        int marketOpenMinute = GetMinuteOfDay(allBars[dayStartIdx].Bar.Timestamp);
         int orEndMinute = marketOpenMinute + _cfg.OrMinutes;
 
         double orHigh = double.MinValue;
@@ -224,8 +237,14 @@ public sealed class StrategyV6 : IBacktestStrategy
 
         for (int i = dayStartIdx; i < allBars.Length; i++)
         {
+            if (DateOnly.FromDateTime(allBars[i].Bar.Timestamp) !=
+                DateOnly.FromDateTime(allBars[dayStartIdx].Bar.Timestamp))
+            {
+                orEndIdx = i;
+                break;
+            }
+
             int minute = GetMinuteOfDay(allBars[i].Bar.Timestamp);
-            if (minute < marketOpenMinute) continue;
             if (minute >= orEndMinute)
             {
                 orEndIdx = i;
@@ -234,6 +253,12 @@ public sealed class StrategyV6 : IBacktestStrategy
             orHigh = Math.Max(orHigh, allBars[i].Bar.High);
             orLow = Math.Min(orLow, allBars[i].Bar.Low);
         }
+
+        if (orEndIdx < 0)
+            orEndIdx = allBars.Length - 1;
+
+        if (orHigh == double.MinValue || orLow == double.MaxValue)
+            return (double.NaN, double.NaN, -1);
 
         return (orHigh, orLow, orEndIdx);
     }

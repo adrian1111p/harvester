@@ -9714,7 +9714,8 @@ public sealed record AppOptions(
             "backtest-optimize" => RunMode.BacktestOptimize,
             "backtest-scan" => RunMode.BacktestScan,
             "backtest-live-sim" => RunMode.BacktestLiveSim,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay.")
+            "backtest-compare" => RunMode.BacktestCompare,
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay|backtest-run|backtest-sweep|backtest-optimize|backtest-scan|backtest-live-sim|backtest-compare.")
         };
     }
 }
@@ -9796,6 +9797,7 @@ public enum RunMode
     BacktestOptimize,
     BacktestScan,
     BacktestLiveSim,
+    BacktestCompare,
 }
 
 public sealed record ContractDetailsRow(

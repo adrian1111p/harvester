@@ -324,13 +324,40 @@ public sealed class ConductStrategyV2 : IBacktestStrategy
             }
 
             // ── Priority 6: Giveback from peak ──
-            if (peakR > 0)
+            if (_cfg.UseNotionalGivebackCap)
+            {
+                double positionNotional = entryPrice * posSize;
+                double givebackLimitUsd = Math.Min(
+                    _cfg.GivebackPctOfNotional * positionNotional,
+                    _cfg.GivebackUsdCap);
+
+                if (givebackLimitUsd > 0)
+                {
+                    double peakPnlUsd = side == TradeSide.Long
+                        ? (peakPrice - entryPrice) * posSize
+                        : (entryPrice - troughPrice) * posSize;
+                    double currentPnlUsd = side == TradeSide.Long
+                        ? (price - entryPrice) * posSize
+                        : (entryPrice - price) * posSize;
+                    double givebackUsd = peakPnlUsd - currentPnlUsd;
+
+                    if (currentPnlUsd > 0 && givebackUsd >= givebackLimitUsd)
+                    {
+                        exitPrice = price;
+                        exitReason = ExitReason.Giveback;
+                        exitBar = j;
+                        exited = true;
+                        break;
+                    }
+                }
+            }
+            else if (peakR > 0)
             {
                 double giveback = (peakR - unrealizedR) / peakR;
                 if (giveback >= _cfg.GivebackPct && unrealizedR > 0)
                 {
                     exitPrice = price;
-                    exitReason = ExitReason.Trailing;
+                    exitReason = ExitReason.Giveback;
                     exitBar = j;
                     exited = true;
                     break;

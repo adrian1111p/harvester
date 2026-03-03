@@ -23,6 +23,9 @@ public sealed class StrategyConfig
     public double BreakevenR { get; set; } = 1.0;
     public double TrailR { get; set; } = 0.5;
     public double GivebackPct { get; set; } = 0.50;
+    public bool UseNotionalGivebackCap { get; set; } = false;
+    public double GivebackPctOfNotional { get; set; } = 0.01;
+    public double GivebackUsdCap { get; set; } = 30.0;
     public double Tp1R { get; set; } = 1.5;
     public double Tp1ScalePct { get; set; } = 0.50;
     public double Tp2R { get; set; } = 3.0;
