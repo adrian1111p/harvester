@@ -82,6 +82,11 @@ if (options.Mode is RunMode.BacktestRun or RunMode.BacktestSweep
 // ── Standard IBKR modes ─────────────────────────────────────────────────────
 IStrategyRuntime? strategyRuntime = null;
 
+if (options.Mode == RunMode.StrategyLiveV3)
+{
+    strategyRuntime = new V3LiveRuntime();
+}
+
 if (options.Mode == RunMode.StrategyReplay
 	&& !string.IsNullOrWhiteSpace(options.ReplayScannerCandidatesInputPath))
 {

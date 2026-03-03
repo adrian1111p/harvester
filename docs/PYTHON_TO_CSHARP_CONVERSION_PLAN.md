@@ -61,20 +61,20 @@ src/Harvester.App/
 
 ## 2. File Mapping — Python Source → C# Target
 
-| Python Source | Lines | C# Target | Strategy |
-|---------------|-------|-----------|----------|
-| `indicators.py` | 328 | `Backtest/Indicators/TechnicalIndicators.cs` + `IndicatorModels.cs` | Replace pandas with double[] arrays |
-| `data_fetcher.py` | 136 | `Backtest/DataFetcher/BacktestDataFetcher.cs` + `CsvBarStorage.cs` | Use existing `IBrokerAdapter` + CSV I/O |
-| `engine.py` | 192 | `Backtest/Engine/BacktestEngine.cs` + `BacktestModels.cs` + `EquityCurveBuilder.cs` | |
-| `strategy.py` | 395 | `Backtest/Strategies/ConductStrategyV2.cs` | |
+| Python Source | Version | Lines | C# Target | Strategy |
+|---------------|---------|-------|-----------|----------|
+| `indicators.py` | V1.1 | 328 | `Backtest/Indicators/TechnicalIndicators.cs` + `IndicatorModels.cs` | Replace pandas with double[] arrays |
+| `data_fetcher.py` | - | 136 | `Backtest/DataFetcher/BacktestDataFetcher.cs` + `CsvBarStorage.cs` | Use existing `IBrokerAdapter` + CSV I/O |
+| `engine.py` | V1.1 | 192 | `Backtest/Engine/BacktestEngine.cs` + `BacktestModels.cs` + `EquityCurveBuilder.cs` | |
+| `strategy.py` | V1.3 | 395 | `Backtest/Strategies/ConductStrategyV2.cs` | |
 | `strategy_cycle.py` | 429 | `Backtest/Strategies/StrategyCycle.cs` | |
-| `strategy_v3.py` | 438 | `Backtest/Strategies/StrategyV3.cs` | |
+| `strategy_v3.py` | V3 | 438 | `Backtest/Strategies/StrategyV3.cs` | |
 | `strategy_v4.py` | 988 | `Backtest/Strategies/StrategyV4.cs` | |
 | `strategy_v5.py` | 452 | `Backtest/Strategies/StrategyV5.cs` | |
 | `strategy_v6.py` | 486 | `Backtest/Strategies/StrategyV6.cs` | |
 | `strategy_v7.py` | 468 | `Backtest/Strategies/StrategyV7.cs` | |
-| `live_paper.py` | 764 | `Backtest/Live/LivePaperBot.cs` + `LivePositionManager.cs` | Use existing `IBrokerAdapter` |
-| `quick_scanner.py` | 242 | `Backtest/Scanner/BacktestScanner.cs` | |
+| `live_paper.py` | V2 | 764 | `Backtest/Live/LivePaperBot.cs` + `LivePositionManager.cs` | Use existing `IBrokerAdapter` |
+| `quick_scanner.py` | V2 | 242 | `Backtest/Scanner/BacktestScanner.cs` | |
 | `run_backtest.py` | 164 | CLI mode in `Program.cs` / `SnapshotRuntime.cs` | New RunMode |
 | `v5_sweep.py` | 233 | `Backtest/Sweep/ParameterSweepRunner.cs` | Unified |
 | `v6v7_sweep.py` | 317 | `Backtest/Sweep/ParameterSweepRunner.cs` | Unified |

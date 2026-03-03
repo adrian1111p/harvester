@@ -270,6 +270,9 @@ public sealed class SnapshotRuntime
                 case RunMode.StrategyReplay:
                     await RunStrategyReplayMode(strategyContext, runtimeCts.Token);
                     break;
+                case RunMode.StrategyLiveV3:
+                    await RunStrategyLiveV3Mode(client, brokerAdapter, strategyContext, runtimeCts.Token);
+                    break;
             }
 
                     await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, runtimeCts.Token);
@@ -6220,6 +6223,95 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy replay self-learning V2 bias store export: {replaySelfLearningV2BiasStorePath} (symbols={selfLearningV2BiasStore.Count})");
     }
 
+    private async Task RunStrategyLiveV3Mode(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        StrategyRuntimeContext strategyContext,
+        CancellationToken token)
+    {
+        ValidateHistoricalBarRequestLimitations(_options.HistoricalDuration, _options.HistoricalBarSize);
+
+        if (BarSizeToSeconds(_options.HistoricalBarSize) < 5)
+        {
+            throw new InvalidOperationException("strategy-live-v3 requires --hist-bar-size >= 5 secs.");
+        }
+
+        var topContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            "SMART",
+            "USD",
+            _options.PrimaryExchange));
+        var depthContract = brokerAdapter.BuildContract(new BrokerContractSpec(
+            BrokerAssetType.Stock,
+            _options.Symbol,
+            _options.DepthExchange,
+            "USD",
+            _options.PrimaryExchange));
+
+        const int topReqId = 9751;
+        const int depthReqId = 9752;
+        const int historicalReqId = 9753;
+
+        brokerAdapter.RequestMarketDataType(client, _options.MarketDataType);
+        brokerAdapter.RequestMarketData(client, topReqId, topContract);
+        brokerAdapter.RequestMarketDepth(client, depthReqId, depthContract, _options.DepthRows, isSmartDepth: false);
+        brokerAdapter.RequestHistoricalData(
+            client,
+            historicalReqId,
+            topContract,
+            string.Empty,
+            _options.HistoricalDuration,
+            _options.HistoricalBarSize,
+            _options.HistoricalWhatToShow,
+            _options.HistoricalUseRth,
+            _options.HistoricalFormatDate,
+            keepUpToDate: true);
+
+        Console.WriteLine($"[INFO] strategy-live-v3 started symbol={_options.Symbol} captureSeconds={_options.CaptureSeconds} topReqId={topReqId} depthReqId={depthReqId} historicalReqId={historicalReqId}");
+
+        try
+        {
+            var startedAt = DateTime.UtcNow;
+            var cadence = TimeSpan.FromSeconds(1);
+            while ((DateTime.UtcNow - startedAt).TotalSeconds < Math.Max(1, _options.CaptureSeconds))
+            {
+                token.ThrowIfCancellationRequested();
+
+                await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, token);
+                await NotifyStrategyDataSliceAsync(BuildStrategyDataSlice("strategy-live-v3"), token);
+
+                await Task.Delay(cadence, token);
+            }
+        }
+        finally
+        {
+            brokerAdapter.CancelMarketData(client, topReqId);
+            brokerAdapter.CancelMarketDepth(client, depthReqId, isSmartDepth: false);
+            brokerAdapter.CancelHistoricalData(client, historicalReqId);
+        }
+
+        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+        var outputDir = EnsureOutputDir();
+        var topPath = Path.Combine(outputDir, $"strategy_live_v3_top_data_{_options.Symbol}_{timestamp}.json");
+        var depthPath = Path.Combine(outputDir, $"strategy_live_v3_depth_data_{_options.Symbol}_{timestamp}.json");
+        var barsPath = Path.Combine(outputDir, $"strategy_live_v3_historical_bars_{_options.Symbol}_{timestamp}.json");
+        var barUpdatesPath = Path.Combine(outputDir, $"strategy_live_v3_historical_bar_updates_{_options.Symbol}_{timestamp}.json");
+        var sanitizationPath = Path.Combine(outputDir, $"strategy_live_v3_market_data_sanitization_{_options.Symbol}_{timestamp}.json");
+
+        WriteJson(topPath, _wrapper.TopTicks.ToArray());
+        WriteJson(depthPath, _wrapper.DepthRows.ToArray());
+        WriteJson(barsPath, _wrapper.HistoricalBars.ToArray());
+        WriteJson(barUpdatesPath, _wrapper.HistoricalBarUpdates.ToArray());
+        WriteJson(sanitizationPath, _wrapper.MarketDataSanitizationRows.ToArray());
+
+        Console.WriteLine($"[OK] Strategy live V3 top data export: {topPath} (rows={_wrapper.TopTicks.Count})");
+        Console.WriteLine($"[OK] Strategy live V3 depth data export: {depthPath} (rows={_wrapper.DepthRows.Count})");
+        Console.WriteLine($"[OK] Strategy live V3 historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
+        Console.WriteLine($"[OK] Strategy live V3 historical bar updates export: {barUpdatesPath} (rows={_wrapper.HistoricalBarUpdates.Count})");
+        Console.WriteLine($"[OK] Strategy live V3 market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
+    }
+
     // ── V2 Self-Learning Bias Store persistence ──────────────────────
 
     private static Dictionary<string, SelfLearningV2SymbolBiasRow>? LoadSelfLearningV2BiasStore(string path)
@@ -9709,13 +9801,14 @@ public sealed record AppOptions(
             "display-groups-update" => RunMode.DisplayGroupsUpdate,
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
             "strategy-replay" => RunMode.StrategyReplay,
+            "strategy-live-v3" => RunMode.StrategyLiveV3,
             "backtest-run" => RunMode.BacktestRun,
             "backtest-sweep" => RunMode.BacktestSweep,
             "backtest-optimize" => RunMode.BacktestOptimize,
             "backtest-scan" => RunMode.BacktestScan,
             "backtest-live-sim" => RunMode.BacktestLiveSim,
             "backtest-compare" => RunMode.BacktestCompare,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay|backtest-run|backtest-sweep|backtest-optimize|backtest-scan|backtest-live-sim|backtest-compare.")
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay|strategy-live-v3|backtest-run|backtest-sweep|backtest-optimize|backtest-scan|backtest-live-sim|backtest-compare.")
         };
     }
 }
@@ -9792,6 +9885,7 @@ public enum RunMode
     DisplayGroupsUpdate,
     DisplayGroupsUnsubscribe,
     StrategyReplay,
+    StrategyLiveV3,
     BacktestRun,
     BacktestSweep,
     BacktestOptimize,
