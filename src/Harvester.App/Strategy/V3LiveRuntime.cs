@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Harvester.App.Backtest.Engine;
 using Harvester.App.IBKR.Runtime;
 
@@ -308,7 +309,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime
 
         var options = new JsonSerializerOptions
         {
-            WriteIndented = true
+            WriteIndented = true,
+            NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals
         };
 
         var summary = new V3LiveRuntimeSummary(
