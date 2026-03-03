@@ -6,6 +6,10 @@ public sealed record V3LiveConfig
     public bool RequireL2Depth { get; init; } = true;
     public int DepthLevels { get; init; } = 5;
     public bool EmitOrderIntents { get; init; } = true;
+    public bool UseScannerSelectionV2Gate { get; init; } = true;
+    public double ScannerMinCompositeScore { get; init; } = 55.0;
+    public bool RequireMtfConfirmation { get; init; } = true;
+    public bool AllowMtfUnready { get; init; } = true;
 
     public double RiskPerTradeDollars { get; init; } = 30.0;
     public double MaxDailyLossDollars { get; init; } = 300.0;
@@ -87,6 +91,10 @@ public sealed record V3LiveConfig
             RequireL2Depth = ReadBool("V3LIVE_REQUIRE_L2", true),
             DepthLevels = Math.Max(1, ReadInt("V3LIVE_DEPTH_LEVELS", 5)),
             EmitOrderIntents = ReadBool("V3LIVE_EMIT_ORDER_INTENTS", true),
+            UseScannerSelectionV2Gate = ReadBool("V3LIVE_USE_SCANNER_V2_GATE", true),
+            ScannerMinCompositeScore = Math.Clamp(ReadDouble("V3LIVE_SCANNER_MIN_SCORE", 55.0), 0.0, 100.0),
+            RequireMtfConfirmation = ReadBool("V3LIVE_REQUIRE_MTF_CONFIRMATION", true),
+            AllowMtfUnready = ReadBool("V3LIVE_ALLOW_MTF_UNREADY", true),
             RiskPerTradeDollars = Math.Max(1.0, ReadDouble("V3LIVE_RISK_PER_TRADE", 30.0)),
             MaxDailyLossDollars = Math.Max(1.0, ReadDouble("V3LIVE_MAX_DAILY_LOSS", 300.0)),
             MaxOpenRiskDollars = Math.Max(1.0, ReadDouble("V3LIVE_MAX_OPEN_RISK", 150.0)),

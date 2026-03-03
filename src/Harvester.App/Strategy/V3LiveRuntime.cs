@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Harvester.App.Backtest.Engine;
+using Harvester.App.IBKR.Runtime;
 
 namespace Harvester.App.Strategy;
 
@@ -8,6 +9,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime
     private readonly V3LiveConfig _config;
     private readonly V3LiveFeatureBuilder _featureBuilder = new();
     private readonly V3LiveSignalEngine _signalEngine = new();
+    private readonly ScannerSelectionEngineV2 _scannerV2Engine;
+    private readonly ReplayMtfCandleSignalEngine _mtfSignalEngine = new();
     private readonly V3LiveRiskGuard _riskGuard;
     private readonly V3LiveOrderBridge _orderBridge;
     private StrategyRuntimeContext? _context;
@@ -21,6 +24,15 @@ public sealed class V3LiveRuntime : IStrategyRuntime
     public V3LiveRuntime(V3LiveConfig? config = null)
     {
         _config = config ?? V3LiveConfig.FromEnvironment();
+        _scannerV2Engine = new ScannerSelectionEngineV2(new ScannerSelectionV2Config
+        {
+            TopN = 1,
+            MinFileScore = _config.ScannerMinCompositeScore,
+            MaxSpreadPct = _config.MaxSpreadPct,
+            MinBidDepthShares = _config.MinDepthPerSideShares,
+            MinAskDepthShares = _config.MinDepthPerSideShares,
+            DepthLevels = _config.DepthLevels
+        });
         _riskGuard = new V3LiveRiskGuard(_config);
         _orderBridge = new V3LiveOrderBridge(_config);
     }
@@ -85,6 +97,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime
 
         var now = dataSlice.TimestampUtc;
         var reasonCodes = new List<string>();
+
+        UpdateMtfSignalEngine(symbol, dataSlice, features);
 
         if (_closeOnly)
         {
@@ -153,9 +167,40 @@ public sealed class V3LiveRuntime : IStrategyRuntime
             }
         }
 
+        if (_config.UseScannerSelectionV2Gate)
+        {
+            var scannerGate = EvaluateScannerV2Gate(symbol, dataSlice, features, now);
+            if (!scannerGate.Passed)
+            {
+                reasonCodes.Add(scannerGate.ReasonCode);
+            }
+        }
+
         var passedPreTrade = reasonCodes.Count == 0;
 
         var decision = _signalEngine.Evaluate(features, _config);
+        if (_config.RequireMtfConfirmation && decision.HasSignal && decision.Side.HasValue)
+        {
+            if (!_mtfSignalEngine.TryGetSnapshot(symbol, out var snapshot) || !snapshot.HasAllTimeframes)
+            {
+                if (!_config.AllowMtfUnready)
+                {
+                    reasonCodes.Add("mtf-unready");
+                }
+            }
+            else
+            {
+                var mtfAligned = decision.Side == TradeSide.Long
+                    ? snapshot.BullishEntryReady
+                    : snapshot.BearishEntryReady;
+                if (!mtfAligned)
+                {
+                    reasonCodes.Add(decision.Side == TradeSide.Long ? "mtf-not-bullish" : "mtf-not-bearish");
+                }
+            }
+        }
+
+        passedPreTrade = reasonCodes.Count == 0;
         if (!decision.HasSignal && !string.IsNullOrWhiteSpace(decision.Reason))
         {
             reasonCodes.Add(decision.Reason);
@@ -318,6 +363,146 @@ public sealed class V3LiveRuntime : IStrategyRuntime
 
         var t = timestampUtc.TimeOfDay;
         return t >= start && t <= end;
+    }
+
+    private (bool Passed, string ReasonCode) EvaluateScannerV2Gate(
+        string symbol,
+        StrategyDataSlice dataSlice,
+        V3LiveFeatureSnapshot features,
+        DateTime nowUtc)
+    {
+        var candidate = new ScannerV2CandidateFileRow
+        {
+            Symbol = symbol,
+            WeightedScore = 100.0,
+            Eligible = true,
+            AverageRank = 1.0,
+            Bid = features.L1.Bid,
+            Ask = features.L1.Ask,
+            Mark = features.Price,
+            Exchange = "SMART"
+        };
+
+        var volume = dataSlice.HistoricalBars
+            .OrderByDescending(x => x.TimestampUtc)
+            .Select(x => (double)x.Volume)
+            .FirstOrDefault();
+        var l1Snapshot = new ScannerV2L1Snapshot(
+            Symbol: symbol,
+            Bid: features.L1.Bid,
+            Ask: features.L1.Ask,
+            Last: features.L1.Last > 0 ? features.L1.Last : features.Price,
+            Volume: Math.Max(0.0, volume),
+            TimestampUtc: nowUtc);
+
+        var l2Snapshot = BuildScannerL2Snapshot(symbol, dataSlice, nowUtc);
+        var l2Map = l2Snapshot is null
+            ? new Dictionary<string, ScannerV2L2DepthSnapshot>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, ScannerV2L2DepthSnapshot>(StringComparer.OrdinalIgnoreCase)
+            {
+                [symbol] = l2Snapshot
+            };
+
+        var sessionStart = ParseSessionBoundary(nowUtc, _config.SessionStartUtc, new TimeSpan(13, 35, 0));
+        var sessionEnd = ParseSessionBoundary(nowUtc, _config.SessionEndUtc, new TimeSpan(20, 0, 0));
+
+        var selection = _scannerV2Engine.Evaluate(
+            fileCandidates: [candidate],
+            l1Snapshots: new Dictionary<string, ScannerV2L1Snapshot>(StringComparer.OrdinalIgnoreCase) { [symbol] = l1Snapshot },
+            l2Snapshots: l2Map,
+            biasEntries: [],
+            sessionOpenUtc: sessionStart,
+            sessionCloseUtc: sessionEnd,
+            nowUtc: nowUtc,
+            sourcePath: "strategy-live-v3-inline");
+
+        var ranked = selection.RankedCandidates.FirstOrDefault();
+        if (ranked is null)
+        {
+            return (false, "scanner-v2-no-candidate");
+        }
+
+        if (!ranked.Eligible)
+        {
+            var reason = string.IsNullOrWhiteSpace(ranked.RejectReason)
+                ? "rejected"
+                : ranked.RejectReason.Replace(' ', '-').ToLowerInvariant();
+            return (false, $"scanner-v2-{reason}");
+        }
+
+        if (ranked.CompositeScore < _config.ScannerMinCompositeScore)
+        {
+            return (false, "scanner-v2-score-low");
+        }
+
+        return (true, string.Empty);
+    }
+
+    private ScannerV2L2DepthSnapshot? BuildScannerL2Snapshot(string symbol, StrategyDataSlice dataSlice, DateTime nowUtc)
+    {
+        var depthRows = dataSlice.DepthRows
+            .Where(x => x.Price > 0)
+            .ToArray();
+        if (depthRows.Length == 0)
+        {
+            return null;
+        }
+
+        var bids = depthRows
+            .Where(x => x.Side == 1)
+            .GroupBy(x => x.Position)
+            .Select(group => group.OrderByDescending(x => x.TimestampUtc).First())
+            .OrderBy(x => x.Position)
+            .Take(Math.Max(1, _config.DepthLevels))
+            .Select(x => new ScannerV2DepthLevel(x.Position, x.Price, Math.Max(0.0, x.Size)))
+            .ToArray();
+
+        var asks = depthRows
+            .Where(x => x.Side == 0)
+            .GroupBy(x => x.Position)
+            .Select(group => group.OrderByDescending(x => x.TimestampUtc).First())
+            .OrderBy(x => x.Position)
+            .Take(Math.Max(1, _config.DepthLevels))
+            .Select(x => new ScannerV2DepthLevel(x.Position, x.Price, Math.Max(0.0, x.Size)))
+            .ToArray();
+
+        if (bids.Length == 0 || asks.Length == 0)
+        {
+            return null;
+        }
+
+        return new ScannerV2L2DepthSnapshot(symbol, bids, asks, nowUtc);
+    }
+
+    private void UpdateMtfSignalEngine(string symbol, StrategyDataSlice dataSlice, V3LiveFeatureSnapshot features)
+    {
+        if (string.IsNullOrWhiteSpace(symbol))
+        {
+            return;
+        }
+
+        foreach (var bar in dataSlice.HistoricalBars)
+        {
+            _mtfSignalEngine.UpdateFromHistoricalBar(symbol, bar);
+        }
+
+        if (features.Price > 0)
+        {
+            _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, features.Price);
+        }
+    }
+
+    private static DateTime ParseSessionBoundary(DateTime nowUtc, string value, TimeSpan fallback)
+    {
+        var time = TimeSpan.TryParse(value, out var parsed) ? parsed : fallback;
+        return new DateTime(
+            nowUtc.Year,
+            nowUtc.Month,
+            nowUtc.Day,
+            time.Hours,
+            time.Minutes,
+            time.Seconds,
+            DateTimeKind.Utc);
     }
 
     private sealed class V3LiveSymbolState
