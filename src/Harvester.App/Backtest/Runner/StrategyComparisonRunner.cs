@@ -55,8 +55,9 @@ public static class StrategyComparisonRunner
             log($"{best.Strategy,-10} [{best.Variant}] -> {best.Trades} trades | WR {best.WinRate:P1} | PnL ${best.TotalPnl:F2} | PF {best.ProfitFactor:F2} | Sharpe {best.Sharpe:F2}");
         }
 
-        PrintTable(rows, minTrades, log);
-        return rows;
+        var rankedRows = RankRows(rows);
+        PrintTable(rankedRows, minTrades, log);
+        return rankedRows;
     }
 
     private static StrategyComparisonRow EvaluatePlan(
@@ -64,6 +65,7 @@ public static class StrategyComparisonRunner
         Dictionary<string, (EnrichedBar[] Trigger, EnrichedBar[]? Ctx5m, EnrichedBar[]? Ctx15m, EnrichedBar[]? Ctx1h, EnrichedBar[]? Ctx1d)> allData,
         int minTrades)
     {
+        int targetTrades = minTrades + 40;
         StrategyComparisonRow? bestEligible = null;
         StrategyComparisonRow? bestAny = null;
 
@@ -106,12 +108,23 @@ public static class StrategyComparisonRunner
 
             if (row.MeetsMinTrades)
             {
-                if (bestEligible == null || IsBetter(row, bestEligible, preferTradeFloor: true))
+                if (bestEligible == null || IsBetterEligible(row, bestEligible, targetTrades))
                     bestEligible = row;
             }
         }
 
         return bestEligible ?? bestAny!;
+    }
+
+    private static bool IsBetterEligible(StrategyComparisonRow left, StrategyComparisonRow right, int targetTrades)
+    {
+        int leftDistance = Math.Abs(left.Trades - targetTrades);
+        int rightDistance = Math.Abs(right.Trades - targetTrades);
+
+        if (leftDistance != rightDistance)
+            return leftDistance < rightDistance;
+
+        return IsBetter(left, right, preferTradeFloor: false);
     }
 
     private static bool IsBetter(StrategyComparisonRow left, StrategyComparisonRow right, bool preferTradeFloor)
@@ -134,18 +147,37 @@ public static class StrategyComparisonRunner
         return left.Trades > right.Trades;
     }
 
+    private static List<StrategyComparisonRow> RankRows(List<StrategyComparisonRow> rows)
+    {
+        var ranked = rows.ToList();
+        ranked.Sort(CompareRowsForTable);
+        return ranked;
+    }
+
+    private static int CompareRowsForTable(StrategyComparisonRow left, StrategyComparisonRow right)
+    {
+        if (IsBetter(left, right, preferTradeFloor: true)) return -1;
+        if (IsBetter(right, left, preferTradeFloor: true)) return 1;
+
+        int strategyCmp = string.Compare(left.Strategy, right.Strategy, StringComparison.OrdinalIgnoreCase);
+        if (strategyCmp != 0) return strategyCmp;
+
+        return string.Compare(left.Variant, right.Variant, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void PrintTable(List<StrategyComparisonRow> rows, int minTrades, Action<string> log)
     {
         log("\n=== STRATEGY COMPARISON TABLE ===");
         log($"Min trades target per strategy: {minTrades}");
-        log("| Strategy | Variant | Symbols | Trades | >=50 | WinRate | PF | Sharpe | TotalPnL$ | MaxDD$ |");
-        log("|---|---|---:|---:|:---:|---:|---:|---:|---:|---:|");
+        log("| Rank | Strategy | Variant | Symbols | Trades | >=50 | WinRate | PF | Sharpe | TotalPnL$ | MaxDD$ |");
+        log("|---:|---|---|---:|---:|:---:|---:|---:|---:|---:|---:|");
 
-        foreach (var r in rows)
+        for (int i = 0; i < rows.Count; i++)
         {
+            var r = rows[i];
             var meets = r.MeetsMinTrades ? "YES" : "NO";
             var pf = double.IsInfinity(r.ProfitFactor) ? "INF" : r.ProfitFactor.ToString("F2");
-            log($"| {r.Strategy} | {r.Variant} | {r.Symbols} | {r.Trades} | {meets} | {r.WinRate:P1} | {pf} | {r.Sharpe:F2} | {r.TotalPnl:F2} | {r.MaxDrawdown:F2} |");
+            log($"| {i + 1} | {r.Strategy} | {r.Variant} | {r.Symbols} | {r.Trades} | {meets} | {r.WinRate:P1} | {pf} | {r.Sharpe:F2} | {r.TotalPnl:F2} | {r.MaxDrawdown:F2} |");
         }
     }
 
@@ -163,12 +195,94 @@ public static class StrategyComparisonRunner
             new StrategyPlan(
                 "V1-First",
                 25_000.0,
-                [new StrategyVariant("default", () => new StrategyV1())]),
+                [
+                    new StrategyVariant("default", () => new StrategyV1()),
+                    new StrategyVariant("mid-trades", () => new StrategyV1(new StrategyConfig
+                    {
+                        TrailR = 1.3,
+                        GivebackPct = 0.60,
+                        Tp1R = 1.4,
+                        Tp2R = 2.6,
+                        HardStopR = 1.1,
+                        BreakevenR = 0.8,
+                        RvolMin = 0.85,
+                        AdxThreshold = 14.0,
+                        RsiLongRange = (30.0, 75.0),
+                        RsiShortRange = (25.0, 70.0),
+                        RequireSupertrend = true,
+                        MaxMaDistAtr = 0.7,
+                        RiskPerTradeDollars = 45.0,
+                        AccountSize = 25_000.0,
+                        UseNotionalGivebackCap = true,
+                        GivebackPctOfNotional = 0.01,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("balanced-trades", () => new StrategyV1(new StrategyConfig
+                    {
+                        TrailR = 1.2,
+                        GivebackPct = 0.55,
+                        Tp1R = 1.2,
+                        Tp2R = 2.2,
+                        HardStopR = 1.0,
+                        BreakevenR = 0.7,
+                        RvolMin = 0.5,
+                        AdxThreshold = 10.0,
+                        RsiLongRange = (25.0, 80.0),
+                        RsiShortRange = (20.0, 75.0),
+                        RequireSupertrend = false,
+                        MaxMaDistAtr = 1.0,
+                        RiskPerTradeDollars = 40.0,
+                        AccountSize = 25_000.0,
+                        UseNotionalGivebackCap = true,
+                        GivebackPctOfNotional = 0.01,
+                        GivebackUsdCap = 30.0,
+                    }))
+                ]),
 
             new StrategyPlan(
                 "V2-Conduct",
                 25_000.0,
-                [new StrategyVariant("optimized", () => new StrategyV2())]),
+                [
+                    new StrategyVariant("optimized", () => new StrategyV2()),
+                    new StrategyVariant("mid-trades", () => new StrategyV2(new StrategyConfig
+                    {
+                        TrailR = 1.3,
+                        GivebackPct = 0.60,
+                        Tp1R = 1.4,
+                        Tp2R = 2.6,
+                        HardStopR = 1.1,
+                        BreakevenR = 0.8,
+                        RvolMin = 0.85,
+                        AdxThreshold = 14.0,
+                        RsiLongRange = (30.0, 75.0),
+                        RsiShortRange = (25.0, 70.0),
+                        RequireSupertrend = true,
+                        MaxMaDistAtr = 0.7,
+                        RiskPerTradeDollars = 45.0,
+                        AccountSize = 25_000.0,
+                        UseNotionalGivebackCap = false,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("balanced-trades", () => new StrategyV2(new StrategyConfig
+                    {
+                        TrailR = 1.2,
+                        GivebackPct = 0.55,
+                        Tp1R = 1.2,
+                        Tp2R = 2.2,
+                        HardStopR = 1.0,
+                        BreakevenR = 0.7,
+                        RvolMin = 0.5,
+                        AdxThreshold = 10.0,
+                        RsiLongRange = (25.0, 80.0),
+                        RsiShortRange = (20.0, 75.0),
+                        RequireSupertrend = false,
+                        MaxMaDistAtr = 1.0,
+                        RiskPerTradeDollars = 40.0,
+                        AccountSize = 25_000.0,
+                        UseNotionalGivebackCap = false,
+                        GivebackUsdCap = 30.0,
+                    }))
+                ]),
 
             new StrategyPlan(
                 "V3",
@@ -177,6 +291,20 @@ public static class StrategyComparisonRunner
                     new StrategyVariant("default", () => new StrategyV3()),
                     new StrategyVariant("default-short-only", () => new StrategyV3(new V3Config
                     {
+                        AllowLong = false,
+                        AllowShort = true,
+                    })),
+                    new StrategyVariant("balanced-trades", () => new StrategyV3(new V3Config
+                    {
+                        MinPrice = 5,
+                        MaxPrice = 400,
+                        L2LiquidityMin = 20,
+                        SpreadZMax = 2.0,
+                        RvolMin = 0.4,
+                        RequireVolumeConfirm = true,
+                        VwapStretchAtr = 1.2,
+                        BbEntryPctbLow = 0.12,
+                        BbEntryPctbHigh = 0.88,
                         AllowLong = false,
                         AllowShort = true,
                     })),
@@ -300,6 +428,19 @@ public static class StrategyComparisonRunner
                         EntryWindows = [(570, 960)],
                         RequireCrossFromInside = false,
                         MaxEntriesPerDirectionPerDay = 5,
+                    })),
+                    new StrategyVariant("balanced-trades", () => new StrategyV6(new V6Config
+                    {
+                        OrMinutes = 1,
+                        MinRangeAtr = 0.0,
+                        MaxRangeAtr = 30.0,
+                        MaxMaDistAtr = 100.0,
+                        RequireVwapAlign = false,
+                        IgnoreHtfBias = true,
+                        RvolMin = 0,
+                        EntryWindows = [(570, 960)],
+                        RequireCrossFromInside = false,
+                        MaxEntriesPerDirectionPerDay = 20,
                     }))
                 ]),
 
@@ -312,6 +453,16 @@ public static class StrategyComparisonRunner
                     {
                         RsiMaxLong = 55.0,
                         RsiMinShort = 30.0,
+                    })),
+                    new StrategyVariant("balanced-trades", () => new StrategyV7(new V7Config
+                    {
+                        SkipFirstNMinutes = 10,
+                        PullbackAtrProximity = 0.25,
+                        EmaMinSlopeAtr = 0.01,
+                        RequireVolumeExpansion = true,
+                        MaxMaDistAtr = 0.8,
+                        RsiMaxLong = 68.0,
+                        RsiMinShort = 32.0,
                     })),
                     new StrategyVariant("relaxed", () => new StrategyV7(new V7Config
                     {

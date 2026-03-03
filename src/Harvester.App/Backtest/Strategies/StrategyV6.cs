@@ -18,6 +18,7 @@ public sealed class V6Config
 
     // VWAP alignment
     public bool RequireVwapAlign { get; set; } = true;
+    public bool IgnoreHtfBias { get; set; } = false;
 
     // Time windows (minutes from midnight ET): (start, end)
     // Default: 9:45-11:30 (585-690) and 14:00-15:30 (840-930)
@@ -145,7 +146,8 @@ public sealed class StrategyV6 : IBacktestStrategy
                     ? (price > orHigh && prev.Bar.Close <= orHigh)
                     : (price > orHigh);
 
-                if (longEntries < _cfg.MaxEntriesPerDirectionPerDay && longBreak && htfBias != "BEAR")
+                bool htfAllowsLong = _cfg.IgnoreHtfBias || htfBias != "BEAR";
+                if (longEntries < _cfg.MaxEntriesPerDirectionPerDay && longBreak && htfAllowsLong)
                 {
                     if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price > row.Vwap))
                     {
@@ -170,7 +172,8 @@ public sealed class StrategyV6 : IBacktestStrategy
                     ? (price < orLow && prev.Bar.Close >= orLow)
                     : (price < orLow);
 
-                if (shortEntries < _cfg.MaxEntriesPerDirectionPerDay && shortBreak && htfBias != "BULL")
+                bool htfAllowsShort = _cfg.IgnoreHtfBias || htfBias != "BULL";
+                if (shortEntries < _cfg.MaxEntriesPerDirectionPerDay && shortBreak && htfAllowsShort)
                 {
                     if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price < row.Vwap))
                     {
