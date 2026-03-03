@@ -351,6 +351,25 @@ public sealed class ConductStrategyV2 : IBacktestStrategy
                     }
                 }
             }
+            else if (_cfg.GivebackUsdCap > 0)
+            {
+                double peakPnlUsd = side == TradeSide.Long
+                    ? (peakPrice - entryPrice) * posSize
+                    : (entryPrice - troughPrice) * posSize;
+                double currentPnlUsd = side == TradeSide.Long
+                    ? (price - entryPrice) * posSize
+                    : (entryPrice - price) * posSize;
+                double givebackUsd = peakPnlUsd - currentPnlUsd;
+
+                if (currentPnlUsd > 0 && givebackUsd >= _cfg.GivebackUsdCap)
+                {
+                    exitPrice = price;
+                    exitReason = ExitReason.Giveback;
+                    exitBar = j;
+                    exited = true;
+                    break;
+                }
+            }
             else if (peakR > 0)
             {
                 double giveback = (peakR - unrealizedR) / peakR;

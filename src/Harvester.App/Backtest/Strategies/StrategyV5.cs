@@ -72,6 +72,8 @@ public sealed class StrategyV5 : IBacktestStrategy
             TrailR = _cfg.TrailR,
             GivebackPct = _cfg.GivebackPct,
             GivebackMinPeakR = 0.3,
+            UseFixedGivebackUsdCap = true,
+            GivebackUsdCap = 30.0,
             Tp1R = _cfg.Tp1R,
             Tp2R = _cfg.Tp2R,
             MaxHoldBars = _cfg.MaxHoldBars,

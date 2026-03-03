@@ -23,6 +23,8 @@ public static class ExitEngine
 
         // ── Giveback threshold (minimum peak_r before checking giveback) ──
         public double GivebackMinPeakR { get; init; } = 0.0;
+        public bool UseFixedGivebackUsdCap { get; init; } = false;
+        public double GivebackUsdCap { get; init; } = 30.0;
 
         // ── Slippage & Commission ──
         public double SlippageCents { get; init; } = 1.0;
@@ -246,8 +248,27 @@ public static class ExitEngine
                 }
             }
 
-            // ── Giveback from peak ──
-            if (peakR > cfg.GivebackMinPeakR)
+            // ── Giveback from peak (fixed USD cap mode) ──
+            if (cfg.UseFixedGivebackUsdCap && cfg.GivebackUsdCap > 0)
+            {
+                double peakPnlUsd = side == TradeSide.Long
+                    ? (peakPrice - entryPrice) * posSize
+                    : (entryPrice - troughPrice) * posSize;
+                double currentPnlUsd = side == TradeSide.Long
+                    ? (price - entryPrice) * posSize
+                    : (entryPrice - price) * posSize;
+                double givebackUsd = peakPnlUsd - currentPnlUsd;
+
+                if (currentPnlUsd > 0 && givebackUsd >= cfg.GivebackUsdCap)
+                {
+                    exitPrice = price;
+                    exitReason = ExitReason.Giveback;
+                    exitBar = j; exited = true; break;
+                }
+            }
+
+            // ── Giveback from peak (R-percent mode) ──
+            else if (peakR > cfg.GivebackMinPeakR)
             {
                 double giveback = peakR > 0 ? (peakR - unrealizedR) / peakR : 0;
                 if (giveback >= cfg.GivebackPct && unrealizedR > 0)
