@@ -24,7 +24,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _historicalTicksDoneTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _headTimestampTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _familyCodesTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource<bool> _accountDownloadEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource<bool> _accountDownloadEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _accountUpdateMultiEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _positionMultiEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _pnlFirstTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -93,6 +93,16 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> HeadTimestampTask => _headTimestampTcs.Task;
     public Task<bool> FamilyCodesTask => _familyCodesTcs.Task;
     public Task<bool> AccountDownloadEndTask => _accountDownloadEndTcs.Task;
+
+    /// <summary>
+    /// Replace the completed TCS with a fresh one so <see cref="AccountDownloadEndTask"/>
+    /// can be awaited again in the next polling cycle.
+    /// </summary>
+    public void ResetAccountDownloadEnd()
+    {
+        _accountDownloadEndTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
     public Task<bool> AccountUpdateMultiEndTask => _accountUpdateMultiEndTcs.Task;
     public Task<bool> PositionMultiEndTask => _positionMultiEndTcs.Task;
     public Task<bool> PnlFirstTask => _pnlFirstTcs.Task;

@@ -12,6 +12,7 @@ using Harvester.App.IBKR.Orders;
 using Harvester.App.IBKR.Risk;
 using Harvester.App.IBKR.Wrapper;
 using Harvester.App.Historical;
+using Harvester.App.Monitor;
 using Harvester.App.Strategy;
 using IBApi;
 using System.Collections.Concurrent;
@@ -99,6 +100,22 @@ public sealed class SnapshotRuntime
             await NotifyStrategyInitializeAsync(strategyContext, runtimeCts.Token);
             await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, runtimeCts.Token);
             await NotifyStrategyScheduledEventAsync("mode-start", strategyContext, runtimeCts.Token);
+
+            // Auto-start positions monitor UI alongside any mode when --monitor-ui is set
+            Task? monitorUiTask = null;
+            if (_options.MonitorUiEnabled && _options.Mode != RunMode.PositionsMonitorUi)
+            {
+                var monitorAccount = string.IsNullOrWhiteSpace(_options.UpdateAccount) ? _options.Account : _options.UpdateAccount;
+                var monitorPort = _options.MonitorUiPort > 0 ? _options.MonitorUiPort : 5100;
+                var store = new Monitor.PositionMonitorStore();
+                var poller = new Monitor.IbkrPositionPoller(_wrapper, brokerAdapter, client, monitorAccount, store);
+                var webServer = new Monitor.PositionsWebServer(store, monitorPort);
+                monitorUiTask = Task.WhenAll(
+                    Task.Run(() => poller.RunAsync(runtimeCts.Token), runtimeCts.Token),
+                    Task.Run(() => webServer.RunAsync(runtimeCts.Token), runtimeCts.Token)
+                );
+                Console.WriteLine($"[Monitor] Dashboard auto-started at http://localhost:{monitorPort}");
+            }
 
             switch (_options.Mode)
             {
@@ -272,6 +289,9 @@ public sealed class SnapshotRuntime
                     break;
                 case RunMode.StrategyLiveV3:
                     await RunStrategyLiveV3Mode(client, brokerAdapter, strategyContext, runtimeCts.Token);
+                    break;
+                case RunMode.PositionsMonitorUi:
+                    await RunPositionsMonitorUiMode(client, brokerAdapter, runtimeCts.Token);
                     break;
             }
 
@@ -3955,6 +3975,34 @@ public sealed class SnapshotRuntime
         Console.WriteLine($"[OK] Account update values export: {valuesPath} (rows={_wrapper.AccountValueUpdates.Count})");
         Console.WriteLine($"[OK] Account update portfolio export: {portfolioPath} (rows={_wrapper.PortfolioUpdates.Count})");
         Console.WriteLine($"[OK] Account update times export: {timesPath} (rows={_wrapper.AccountUpdateTimes.Count})");
+    }
+
+    private async Task RunPositionsMonitorUiMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        var account = string.IsNullOrWhiteSpace(_options.UpdateAccount) ? _options.Account : _options.UpdateAccount;
+        var port = _options.MonitorUiPort > 0 ? _options.MonitorUiPort : 5100;
+
+        Console.WriteLine($"[Monitor] Starting positions monitor UI – account={account} port={port}");
+
+        var store = new PositionMonitorStore();
+        var poller = new IbkrPositionPoller(_wrapper, brokerAdapter, client, account, store);
+        var webServer = new PositionsWebServer(store, port);
+
+        // Run poller and web server concurrently until cancelled
+        var pollerTask = Task.Run(() => poller.RunAsync(token), token);
+        var webTask = Task.Run(() => webServer.RunAsync(token), token);
+
+        Console.WriteLine($"[Monitor] Dashboard ready at http://localhost:{port}");
+
+        await Task.WhenAny(pollerTask, webTask);
+
+        // If one task finished (error), cancel everything and let the other finish
+        if (!token.IsCancellationRequested)
+        {
+            Console.WriteLine("[Monitor] One of poller/web server exited unexpectedly.");
+        }
+
+        await Task.WhenAll(pollerTask, webTask).ConfigureAwait(false);
     }
 
     private async Task RunAccountUpdatesMultiMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
@@ -8696,7 +8744,9 @@ public sealed record AppOptions(
     ReconciliationGateAction ReconciliationGateAction,
     double ReconciliationMinCommissionCoverage,
     double ReconciliationMinOrderCoverage,
-    int ConductL1StaleSec
+    int ConductL1StaleSec,
+    int MonitorUiPort,
+    bool MonitorUiEnabled
 )
 {
     public static AppOptions Parse(string[] args)
@@ -8720,6 +8770,8 @@ public sealed record AppOptions(
         var liveMomentumGuardEnabled = true;
         var liveMomentumMaxAdverseBps = 20.0;
         var conductL1StaleSec = -1; // -1 = use ConductExitConfig default (3s)
+        var monitorUiPort = 5100;
+        var monitorUiEnabled = false;
         var cancelOrderId = 0;
         var cancelOrderIdempotent = false;
         var maxNotional = 100.00;
@@ -8943,6 +8995,13 @@ public sealed record AppOptions(
                 case "--conduct-l1-stale-sec" when i + 1 < args.Length && int.TryParse(args[i + 1], out var cls):
                     conductL1StaleSec = cls;
                     i++;
+                    break;
+                case "--monitor-ui-port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var muip):
+                    monitorUiPort = muip;
+                    i++;
+                    break;
+                case "--monitor-ui":
+                    monitorUiEnabled = true;
                     break;
                 case "--live-momentum-max-adverse-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lmmab):
                     liveMomentumMaxAdverseBps = Math.Max(0, lmmab);
@@ -9687,7 +9746,9 @@ public sealed record AppOptions(
             reconciliationGateAction,
             reconciliationMinCommissionCoverage,
             reconciliationMinOrderCoverage,
-            conductL1StaleSec
+            conductL1StaleSec,
+            monitorUiPort,
+            monitorUiEnabled
         );
     }
 
@@ -9811,13 +9872,14 @@ public sealed record AppOptions(
             "display-groups-unsubscribe" => RunMode.DisplayGroupsUnsubscribe,
             "strategy-replay" => RunMode.StrategyReplay,
             "strategy-live-v3" => RunMode.StrategyLiveV3,
+            "positions-monitor-ui" => RunMode.PositionsMonitorUi,
             "backtest-run" => RunMode.BacktestRun,
             "backtest-sweep" => RunMode.BacktestSweep,
             "backtest-optimize" => RunMode.BacktestOptimize,
             "backtest-scan" => RunMode.BacktestScan,
             "backtest-live-sim" => RunMode.BacktestLiveSim,
             "backtest-compare" => RunMode.BacktestCompare,
-            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay|strategy-live-v3|backtest-run|backtest-sweep|backtest-optimize|backtest-scan|backtest-live-sim|backtest-compare.")
+            _ => throw new ArgumentException($"Unknown mode '{value}'. Use connect|orders|orders-all-open|positions|positions-monitor-1pct|positions-monitor-1pct-loop|positions-auto-replace-scan-loop|snapshot-all|contracts-validate|orders-dryrun|orders-place-sim|orders-cancel-sim|orders-whatif|top-data|market-depth|realtime-bars|market-data-all|historical-bars|historical-bars-live|histogram|historical-ticks|head-timestamp|managed-accounts|family-codes|account-updates|account-updates-multi|account-summary|positions-multi|pnl-account|pnl-single|option-chains|option-exercise|option-greeks|crypto-permissions|crypto-contract|crypto-streaming|crypto-historical|crypto-order|fa-allocation-groups|fa-groups-profiles|fa-unification|fa-model-portfolios|fa-order|fundamental-data|wsh-filters|error-codes|scanner-examples|scanner-complex|scanner-parameters|scanner-workbench|scanner-preview|display-groups-query|display-groups-subscribe|display-groups-update|display-groups-unsubscribe|strategy-replay|strategy-live-v3|positions-monitor-ui|backtest-run|backtest-sweep|backtest-optimize|backtest-scan|backtest-live-sim|backtest-compare.")
         };
     }
 }
@@ -9895,6 +9957,7 @@ public enum RunMode
     DisplayGroupsUnsubscribe,
     StrategyReplay,
     StrategyLiveV3,
+    PositionsMonitorUi,
     BacktestRun,
     BacktestSweep,
     BacktestOptimize,

@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Harvester – Positions Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Segoe UI', -apple-system, sans-serif;
+    font-size: 14px;
+    padding: 20px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--blue);
+  }
+  .status-bar {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 4px;
+  }
+  .status-dot.connected { background: var(--green); }
+  .status-dot.disconnected { background: var(--red); }
+  .status-dot.connecting { background: var(--yellow); animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0.3; } }
+
+  .summary-cards {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    min-width: 180px;
+    flex: 1;
+  }
+  .card .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .card .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th {
+    background: #1c2128;
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    padding: 10px 12px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+  }
+  th:first-child, td:first-child { text-align: left; }
+  td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1c2128; }
+  tr.totals-row td {
+    font-weight: 700;
+    border-top: 2px solid var(--border);
+    background: #1c2128;
+  }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .zero { color: var(--text-dim); }
+  .side-long { color: var(--green); font-weight: 600; }
+  .side-short { color: var(--red); font-weight: 600; }
+
+  .last-update {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-dim);
+    text-align: right;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-dim);
+  }
+  .empty-state p { margin-top: 8px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Positions Monitor</h1>
+  <div class="status-bar">
+    <span><span class="status-dot disconnected" id="wsDot"></span><span id="wsStatus">Disconnected</span></span>
+    <span id="versionLabel">v0</span>
+  </div>
+</header>
+
+<div class="summary-cards" id="summaryCards">
+  <div class="card"><div class="label">Positions</div><div class="value" id="cardCount">0</div></div>
+  <div class="card"><div class="label">Total Unrealized P&L</div><div class="value" id="cardUnreal">$0.00</div></div>
+  <div class="card"><div class="label">Total Realized P&L</div><div class="value" id="cardReal">$0.00</div></div>
+  <div class="card"><div class="label">Total Market Value</div><div class="value" id="cardMktVal">$0.00</div></div>
+</div>
+
+<div id="tableContainer">
+  <div class="empty-state" id="emptyState">
+    <h2>Waiting for data…</h2>
+    <p>Connect to IBKR with <code>--mode positions-monitor-ui</code></p>
+  </div>
+</div>
+
+<div class="last-update" id="lastUpdate"></div>
+
+<script>
+(function() {
+  const WS_URL = `ws://${location.host}/ws/positions`;
+  const RECONNECT_MS = 2000;
+
+  const dot = document.getElementById('wsDot');
+  const wsStatusEl = document.getElementById('wsStatus');
+  const versionLabel = document.getElementById('versionLabel');
+  const cardCount = document.getElementById('cardCount');
+  const cardUnreal = document.getElementById('cardUnreal');
+  const cardReal = document.getElementById('cardReal');
+  const cardMktVal = document.getElementById('cardMktVal');
+  const tableContainer = document.getElementById('tableContainer');
+  const emptyState = document.getElementById('emptyState');
+  const lastUpdate = document.getElementById('lastUpdate');
+
+  let ws = null;
+  let reconnectTimer = null;
+
+  function setStatus(state) {
+    dot.className = 'status-dot ' + state;
+    wsStatusEl.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+  }
+
+  function fmtMoney(v) {
+    if (v == null || isNaN(v)) return '$0.00';
+    const sign = v < 0 ? '-' : '';
+    return sign + '$' + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function fmtPrice(v) {
+    if (v == null || isNaN(v)) return '0.00';
+    return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  }
+
+  function pnlClass(v) {
+    if (v > 0.005) return 'positive';
+    if (v < -0.005) return 'negative';
+    return 'zero';
+  }
+
+  function pnlPct(unrealized, marketValue) {
+    if (!marketValue || marketValue === 0) return '0.00%';
+    const pct = (unrealized / Math.abs(marketValue)) * 100;
+    return pct.toFixed(2) + '%';
+  }
+
+  function render(data) {
+    if (!data) return;
+
+    const positions = data.positions || [];
+    const version = data.version || 0;
+    versionLabel.textContent = 'v' + version;
+
+    // Filter to non-zero positions for cards (but show all in table)
+    const active = positions.filter(p => p.position !== 0);
+
+    let totUnreal = 0, totReal = 0, totMktVal = 0;
+    positions.forEach(p => {
+      totUnreal += p.unrealizedPnl || 0;
+      totReal += p.realizedPnl || 0;
+      totMktVal += p.marketValue || 0;
+    });
+
+    cardCount.textContent = active.length;
+    cardUnreal.textContent = fmtMoney(totUnreal);
+    cardUnreal.className = 'value ' + pnlClass(totUnreal);
+    cardReal.textContent = fmtMoney(totReal);
+    cardReal.className = 'value ' + pnlClass(totReal);
+    cardMktVal.textContent = fmtMoney(totMktVal);
+
+    if (positions.length === 0) {
+      emptyState.style.display = '';
+      return;
+    }
+    emptyState.style.display = 'none';
+
+    let html = `<table>
+      <thead><tr>
+        <th>Symbol</th>
+        <th>Side</th>
+        <th>Qty</th>
+        <th>Avg Cost</th>
+        <th>Mkt Price</th>
+        <th>Mkt Value</th>
+        <th>Unreal P&L</th>
+        <th>P&L %</th>
+        <th>Real P&L</th>
+        <th>Exchange</th>
+      </tr></thead><tbody>`;
+
+    positions.forEach(p => {
+      const side = p.position > 0 ? 'LONG' : p.position < 0 ? 'SHORT' : 'FLAT';
+      const sideClass = p.position > 0 ? 'side-long' : p.position < 0 ? 'side-short' : 'zero';
+      const qty = Math.abs(p.position);
+      html += `<tr>
+        <td style="font-weight:600">${p.symbol}</td>
+        <td class="${sideClass}">${side}</td>
+        <td>${qty}</td>
+        <td>${fmtPrice(p.averageCost)}</td>
+        <td>${fmtPrice(p.marketPrice)}</td>
+        <td>${fmtMoney(p.marketValue)}</td>
+        <td class="${pnlClass(p.unrealizedPnl)}">${fmtMoney(p.unrealizedPnl)}</td>
+        <td class="${pnlClass(p.unrealizedPnl)}">${pnlPct(p.unrealizedPnl, p.marketValue)}</td>
+        <td class="${pnlClass(p.realizedPnl)}">${fmtMoney(p.realizedPnl)}</td>
+        <td style="color:var(--text-dim)">${p.exchange || ''}</td>
+      </tr>`;
+    });
+
+    // Totals row
+    html += `<tr class="totals-row">
+      <td>TOTAL</td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td></td>
+      <td>${fmtMoney(totMktVal)}</td>
+      <td class="${pnlClass(totUnreal)}">${fmtMoney(totUnreal)}</td>
+      <td></td>
+      <td class="${pnlClass(totReal)}">${fmtMoney(totReal)}</td>
+      <td></td>
+    </tr>`;
+
+    html += '</tbody></table>';
+    tableContainer.innerHTML = html;
+
+    const now = new Date();
+    lastUpdate.textContent = 'Last update: ' + now.toLocaleTimeString() + '.' + String(now.getMilliseconds()).padStart(3, '0');
+  }
+
+  function connect() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    setStatus('connecting');
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      setStatus('connected');
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        render(data);
+      } catch (err) {
+        console.error('Parse error:', err);
+      }
+    };
+
+    ws.onclose = () => {
+      setStatus('disconnected');
+      scheduleReconnect();
+    };
+
+    ws.onerror = () => {
+      setStatus('disconnected');
+      ws.close();
+    };
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, RECONNECT_MS);
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>
