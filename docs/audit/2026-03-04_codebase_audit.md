@@ -1,12 +1,12 @@
 # Harvester.App — Comprehensive Code Audit Report
 
 **Date:** 2026-03-04 (updated)  
-**Commit:** `54c3fc9` (main)  
+**Commit:** `112bb32` (main)  
 **Auditor:** Engineering Team  
 **Target:** .NET 9 console application — `src/Harvester.App/`  
 **Total LOC:** 40,513 across 95 `.cs` files  
 **Build Status:** ✅ 0 errors, 0 warnings  
-**Test Coverage:** 0% — no test projects exist
+**Test Coverage:** improving — `Harvester.App.Tests` present (17 passing tests)
 
 ---
 
@@ -87,9 +87,9 @@ src/Harvester.App/
 | 3 | `ReplayExecutionSimulator.cs` | **2,142** | Fill simulation, margin, settlement, fee computation | HIGH |
 | 4 | `SnapshotEWrapper.cs` | **1,134** | 36 ConcurrentQueues + 30 TCS fields + 35 record types | HIGH |
 
-### 2.2 AppOptions Monolith
+### 2.2 AppOptions Monolith (Historical Baseline)
 
-The `AppOptions` record has **~145 positional parameters** — the largest record in the codebase. It is defined inline within `SnapshotRuntime.cs`. Its `Parse(string[] args)` method is ~800 lines of manual `switch`/`case` CLI parsing.
+The `AppOptions` record has **~145 positional parameters** — the largest record in the codebase. It was previously inline in `SnapshotRuntime.cs`, and has now been extracted into dedicated runtime option files.
 
 **Problems:**
 - Adding a new CLI flag requires editing 4 locations in the same file (record field, default variable, switch case, constructor call)
@@ -97,9 +97,9 @@ The `AppOptions` record has **~145 positional parameters** — the largest recor
 - Unknown flags are silently ignored
 - Hardcoded defaults include a real IBKR account number (`U22462030`)
 
-### 2.3 Zero Test Coverage
+### 2.3 Test Coverage Gap (Improved, Still Incomplete)
 
-No test projects, test files, or test framework references exist anywhere in the repository. The following modules are pure logic and highly testable but have no tests:
+`Harvester.App.Tests` now exists and includes passing tests for policy/risk/reconciliation/indicators/factory/config/runtime-wrapper flows. Coverage is still incomplete for broader mode orchestration and long-path runtime behavior.
 
 | Module | Testability |
 |--------|-------------|
@@ -156,11 +156,11 @@ There are **335+ raw `Console.WriteLine` calls** in `SnapshotRuntime.cs` alone. 
 | Area | Problem | Impact |
 |------|---------|--------|
 | **SnapshotRuntime** | Does everything — CLI, routing, heartbeat, reconnect, modes, export, risk | Untestable, unmaintainable |
-| **AppOptions** | 145 params in one record, inline in SnapshotRuntime | Change amplification |
+| **AppOptions** | Large options surface (~145 params) with high change fanout | Change amplification |
 | **Record types** | 71 records in SnapshotRuntime + 35 in SnapshotEWrapper | Poor discoverability |
 | **ReplayStrategySystemLayout** | 9,431-line replay orchestrator | Same as SnapshotRuntime |
 | **Logging** | Raw Console.WriteLine everywhere | No filtering, no persistence |
-| **Configuration** | 145 CLI flags, no appsettings.json support | Poor DX |
+| **Configuration** | Large CLI surface (145 flags) now layered with appsettings/env | Complexity risk |
 
 ### 3.3 Dependency Graph
 
@@ -268,6 +268,6 @@ Phase 4 (Backlog):   ✅ R12 → ✅ R13 → ✅ R14 → ✅ R15
 
 ## 7. Summary
 
-The codebase has a solid foundation in its broker abstraction, connection management, risk evaluation, and monitoring layers. However, two critical god classes (`SnapshotRuntime.cs` at 9,773 lines and `ReplayStrategySystemLayout.cs` at 9,431 lines) represent **47% of total LOC** and create severe maintainability, testability, and onboarding risk. The complete absence of unit tests compounds this risk.
+The codebase has a solid foundation in its broker abstraction, connection management, risk evaluation, and monitoring layers. However, two critical god classes (`SnapshotRuntime.cs` at 9,773 lines and `ReplayStrategySystemLayout.cs` at 9,431 lines) represent **47% of total LOC** and create severe maintainability, testability, and onboarding risk. Test coverage has improved materially, but remains incomplete for full runtime behavior.
 
 The recommended refactoring plan prioritizes decomposing these god classes, establishing test coverage, and introducing structured logging — all without changing external behavior.
