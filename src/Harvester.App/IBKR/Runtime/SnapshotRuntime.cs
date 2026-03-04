@@ -1491,7 +1491,9 @@ public sealed class SnapshotRuntime
     private async Task TryApplyPeakDrawdownExitAsync(EClientSocket client, IBrokerAdapter brokerAdapter, LiveOrderPlacementPlan livePlan, double filledQuantity, CancellationToken token, int requestIdSeed = 9960, int? entryOrderId = null)
     {
         // ── V1.2 Config ──────────────────────────────────────────────────
-        var cfg = new ConductExitConfig();
+        var cfg = _options.ConductL1StaleSec >= 0
+            ? new ConductExitConfig() with { L1StaleSec = _options.ConductL1StaleSec }
+            : new ConductExitConfig();
         const int monitorSafetyBufferSeconds = 5;
         var monitorSeconds = Math.Max(0, _options.TimeoutSeconds - monitorSafetyBufferSeconds);
         if (monitorSeconds <= 0 || filledQuantity <= 0)
@@ -8693,7 +8695,8 @@ public sealed record AppOptions(
     double ClockSkewFailSeconds,
     ReconciliationGateAction ReconciliationGateAction,
     double ReconciliationMinCommissionCoverage,
-    double ReconciliationMinOrderCoverage
+    double ReconciliationMinOrderCoverage,
+    int ConductL1StaleSec
 )
 {
     public static AppOptions Parse(string[] args)
@@ -8716,6 +8719,7 @@ public sealed record AppOptions(
         var livePriceSanityRequireQuote = true;
         var liveMomentumGuardEnabled = true;
         var liveMomentumMaxAdverseBps = 20.0;
+        var conductL1StaleSec = -1; // -1 = use ConductExitConfig default (3s)
         var cancelOrderId = 0;
         var cancelOrderIdempotent = false;
         var maxNotional = 100.00;
@@ -8935,6 +8939,10 @@ public sealed record AppOptions(
                     break;
                 case "--live-momentum-guard" when i + 1 < args.Length:
                     liveMomentumGuardEnabled = bool.TryParse(args[++i], out var lmg) && lmg;
+                    break;
+                case "--conduct-l1-stale-sec" when i + 1 < args.Length && int.TryParse(args[i + 1], out var cls):
+                    conductL1StaleSec = cls;
+                    i++;
                     break;
                 case "--live-momentum-max-adverse-bps" when i + 1 < args.Length && double.TryParse(args[i + 1], out var lmmab):
                     liveMomentumMaxAdverseBps = Math.Max(0, lmmab);
@@ -9678,7 +9686,8 @@ public sealed record AppOptions(
             clockSkewFailSeconds,
             reconciliationGateAction,
             reconciliationMinCommissionCoverage,
-            reconciliationMinOrderCoverage
+            reconciliationMinOrderCoverage,
+            conductL1StaleSec
         );
     }
 

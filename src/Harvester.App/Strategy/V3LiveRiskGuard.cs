@@ -9,6 +9,10 @@ public sealed class V3LiveRiskGuard
         _config = config;
     }
 
+    /// <summary>
+    /// Evaluate pre-trade risk checks for a proposed order.
+    /// Uses live position tracker data for accurate daily PnL and open risk.
+    /// </summary>
     public V3LiveRiskCheckResult Evaluate(
         string symbol,
         DateTime timestampUtc,
@@ -18,14 +22,22 @@ public sealed class V3LiveRiskGuard
     {
         var reasons = new List<string>();
 
+        // C-02 FIX: Daily loss limit now uses live-tracked realized PnL
         if (state.RealizedPnlToday <= -Math.Abs(_config.MaxDailyLossDollars))
         {
             reasons.Add("daily-loss-limit");
         }
 
+        // C-03 FIX: Open risk now uses live-tracked aggregate (decremented on close)
         if (state.OpenRiskDollars + order.EstimatedRiskDollars > _config.MaxOpenRiskDollars)
         {
             reasons.Add("max-open-risk");
+        }
+
+        // Duplicate position check: don't enter if already holding this symbol
+        if (state.HasOpenPosition)
+        {
+            reasons.Add("duplicate-position");
         }
 
         var mid = features.L1.HasQuote ? (features.L1.Bid + features.L1.Ask) / 2.0 : features.Price;
@@ -61,10 +73,20 @@ public sealed class V3LiveRiskGuard
     }
 }
 
+/// <summary>
+/// Risk state snapshot for the risk guard. Now populated from <see cref="V3LivePositionTracker"/>
+/// which provides accurate live values that update on both entries and exits.
+/// </summary>
 public sealed class V3LiveSymbolRiskState
 {
+    /// <summary>Account-wide aggregate open risk (sum of all non-flat positions). Decremented on close.</summary>
     public double OpenRiskDollars { get; set; }
+
+    /// <summary>Account-wide realized PnL today. Updated from position close events.</summary>
     public double RealizedPnlToday { get; set; }
+
+    /// <summary>Whether this specific symbol already has an open position.</summary>
+    public bool HasOpenPosition { get; set; }
 }
 
 public sealed record V3LiveRiskCheckResult(
