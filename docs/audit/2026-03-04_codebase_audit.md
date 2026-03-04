@@ -1,10 +1,11 @@
 # Harvester.App — Comprehensive Code Audit Report
 
-**Date:** 2026-03-04  
-**Commit:** `423cadf` (main)  
+**Date:** 2026-03-04 (updated)  
+**Commit:** `54c3fc9` (main)  
 **Auditor:** Engineering Team  
 **Target:** .NET 9 console application — `src/Harvester.App/`  
-**Total LOC:** ~40,450 across 89 `.cs` files  
+**Total LOC:** 40,513 across 95 `.cs` files  
+**Build Status:** ✅ 0 errors, 0 warnings  
 **Test Coverage:** 0% — no test projects exist
 
 ---
@@ -14,7 +15,7 @@
 ```
 src/Harvester.App/
 ├── Program.cs                         (107 lines)  — Entry point
-├── Harvester.App.csproj               (25 lines)   — net9.0 + IBApi + ClosedXML + ASP.NET Core
+├── Harvester.App.csproj               (18 lines)   — net9.0 + IBApi + ClosedXML + ASP.NET Core
 ├── IBKR/
 │   ├── Broker/                        (5 files, ~1,190 lines)
 │   │   ├── IBrokerAdapter.cs          (172)  — Interface for all broker operations
@@ -33,9 +34,9 @@ src/Harvester.App/
 │   │   ├── PreTradeControlDsl.cs     (151)  — DSL evaluator for pre-trade guards
 │   │   ├── PreTradeCostRiskEstimator.cs (95) — Commission+slippage estimator
 │   │   └── FaRoutingValidator.cs     (68)   — FA routing validation
-│   ├── Runtime/                       (9 files, ~13,215 lines)
-│   │   ├── SnapshotRuntime.cs        (10,931) — ⚠️ GOD CLASS
-│   │   ├── SnapshotEWrapper.cs       (1,262)  — EWrapper + 35 record types
+│   ├── Runtime/                       (9 files, ~12,058 lines)
+│   │   ├── SnapshotRuntime.cs        (9,773)  — ⚠️ GOD CLASS
+│   │   ├── SnapshotEWrapper.cs       (1,134)  — EWrapper + 35 record types
 │   │   ├── OrderLifecycleModel.cs    (297)    — Order state machine
 │   │   ├── OrderReconciliation.cs    (253)    — Order reconciliation
 │   │   ├── L2CandlestickBuilder.cs   (227)    — L2 OHLC builder
@@ -47,21 +48,21 @@ src/Harvester.App/
 │       └── HarvesterEWrapper.cs      (95)   — Base EWrapper class
 ├── Historical/                        (1 file, 88 lines)
 │   └── HistoricalIngestionContracts.cs — Generic ETL pipeline interfaces
-├── Monitor/                           (4 files, ~359 lines)
-│   ├── PositionsWebServer.cs         (174)  — Kestrel + WebSocket server
-│   ├── IbkrPositionPoller.cs         (98)   — IBKR account update poller
-│   ├── PositionMonitorStore.cs       (87)   — Thread-safe position store
+├── Monitor/                           (3 .cs files + 1 html, ~315 lines)
+│   ├── PositionsWebServer.cs         (155)  — Kestrel + WebSocket server
+│   ├── IbkrPositionPoller.cs         (84)   — IBKR account update poller
+│   ├── PositionMonitorStore.cs       (76)   — Thread-safe position store
 │   └── wwwroot/index.html            —        SPA dashboard
-├── Strategy/                          (34 files, ~8,700 lines)
+├── Strategy/                          (34 files, ~18,380 lines)
 │   ├── ReplayStrategySystemLayout.cs (9,431) — ⚠️ GOD CLASS
 │   ├── ReplayExecutionSimulator.cs   (2,142) — Order fill simulator
 │   ├── ScannerCandidateReplayRuntime.cs (1,139) — Scanner replay
-│   ├── V3LiveRuntime.cs              (862)   — V3 live strategy
+│   ├── V3LiveRuntime.cs              (749)   — V3 live strategy
 │   ├── ReplaySelfLearningEngine.cs   (722)   — Walk-forward learning
 │   ├── ScannerSelectionEngineV2.cs   (613)   — Candidate ranking
 │   ├── ReplayRamSessionState.cs      (575)   — Session state tracking
 │   └── ... (27 additional files)     (~2,900) — Interfaces, configs, models
-└── Backtest/                          (18 files, ~5,300 lines)
+└── Backtest/                          (26 files, ~7,414 lines)
     ├── Runner/
     │   ├── StrategyComparisonRunner.cs (1,036) — Multi-strategy comparison
     │   └── LivePaperBot.cs           (517)   — Paper trading simulator
@@ -69,7 +70,7 @@ src/Harvester.App/
     │   └── TechnicalIndicators.cs    (655)   — SMA/EMA/RSI/VWAP/ATR/etc.
     ├── Strategies/
     │   ├── StrategyV4.cs             (608)   — Strategy V4
-    │   └── ... (V1–V10)             (~1,500) — Strategy versions
+    │   └── ... (V1–V10)             (~3,600) — Strategy versions + exit engine
     └── ... (engine, models, fetchers) (~1,000)
 ```
 
@@ -81,10 +82,10 @@ src/Harvester.App/
 
 | # | File | Lines | Responsibility Count | Severity |
 |---|------|-------|---------------------|----------|
-| 1 | `SnapshotRuntime.cs` | **10,931** | CLI parsing + 63 mode dispatch + heartbeat + reconnect + data export + risk eval + 71 record types + 3 enums | **CRITICAL** |
+| 1 | `SnapshotRuntime.cs` | **9,773** | CLI parsing + 63 mode dispatch + heartbeat + reconnect + data export + risk eval + 71 record types + 3 enums | **CRITICAL** |
 | 2 | `ReplayStrategySystemLayout.cs` | **9,431** | Full replay orchestration, data loading, phase management, reporting | **CRITICAL** |
 | 3 | `ReplayExecutionSimulator.cs` | **2,142** | Fill simulation, margin, settlement, fee computation | HIGH |
-| 4 | `SnapshotEWrapper.cs` | **1,262** | 36 ConcurrentQueues + 30 TCS fields + 35 record types | HIGH |
+| 4 | `SnapshotEWrapper.cs` | **1,134** | 36 ConcurrentQueues + 30 TCS fields + 35 record types | HIGH |
 
 ### 2.2 AppOptions Monolith
 
@@ -188,7 +189,7 @@ Program.cs
 
 | # | Task | Files Affected | Estimated Effort |
 |---|------|---------------|-----------------|
-| **R1** | **Split SnapshotRuntime.cs** — Extract each RunMode group into its own class (e.g., `ConnectMode.cs`, `OrdersMode.cs`, `HistoricalMode.cs`, `ScannerMode.cs`, `CryptoMode.cs`, `FaMode.cs`, `OptionsMode.cs`). Keep thin `RuntimeOrchestrator` with dispatch. | 10,931 → ~500 per file + orchestrator | 3–5 days |
+| **R1** | **Split SnapshotRuntime.cs** — Extract each RunMode group into its own class (e.g., `ConnectMode.cs`, `OrdersMode.cs`, `HistoricalMode.cs`, `ScannerMode.cs`, `CryptoMode.cs`, `FaMode.cs`, `OptionsMode.cs`). Keep thin `RuntimeOrchestrator` with dispatch. | 9,773 → ~500 per file + orchestrator | 3–5 days |
 | **R2** | **Extract AppOptions** into `Options/AppOptions.cs` + `Options/AppOptionsParser.cs`. Decompose into sub-records: `ConnectionOptions`, `LiveTradingOptions`, `HistoricalOptions`, `ScannerOptions`, `ReplayOptions`, `CryptoOptions`, `FaOptions`, `MonitorOptions` | 1 → 10 files | 2–3 days |
 | **R3** | **Extract record types** — Move 71 records from SnapshotRuntime and 35 from SnapshotEWrapper into domain-specific model files under `Models/` | 2 → 8–10 files | 1–2 days |
 | **R4** | **Add test project** — Create `Harvester.App.Tests` with unit tests for the 10 pure-logic modules listed in §2.3 | New project | 3–4 days |
@@ -249,6 +250,6 @@ Phase 4 (Backlog):   R12 → R13 → R14 → R15
 
 ## 7. Summary
 
-The codebase has a solid foundation in its broker abstraction, connection management, risk evaluation, and monitoring layers. However, two critical god classes (`SnapshotRuntime.cs` at 10,931 lines and `ReplayStrategySystemLayout.cs` at 9,431 lines) represent **50% of total LOC** and create severe maintainability, testability, and onboarding risk. The complete absence of unit tests compounds this risk.
+The codebase has a solid foundation in its broker abstraction, connection management, risk evaluation, and monitoring layers. However, two critical god classes (`SnapshotRuntime.cs` at 9,773 lines and `ReplayStrategySystemLayout.cs` at 9,431 lines) represent **47% of total LOC** and create severe maintainability, testability, and onboarding risk. The complete absence of unit tests compounds this risk.
 
 The recommended refactoring plan prioritizes decomposing these god classes, establishing test coverage, and introducing structured logging — all without changing external behavior.
