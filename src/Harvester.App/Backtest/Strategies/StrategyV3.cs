@@ -55,7 +55,7 @@ public sealed class V3Config
 /// V3 "VWAP Reversion + BB Bounce + Keltner Squeeze + L2 Proxy".
 /// Three sub-strategies targeting $10–$50 stocks.
 /// </summary>
-public sealed class StrategyV3 : IBacktestStrategy
+public sealed class StrategyV3 : BacktestStrategyBase
 {
     private readonly V3Config _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -82,7 +82,7 @@ public sealed class StrategyV3 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -226,7 +226,7 @@ public sealed class StrategyV3 : IBacktestStrategy
             SubStrategy: subStrategy);
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     private static string HtfGuard(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
@@ -252,3 +252,6 @@ public sealed class StrategyV3 : IBacktestStrategy
         return "NEUTRAL";
     }
 }
+
+
+

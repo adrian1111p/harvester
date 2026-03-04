@@ -2,7 +2,7 @@ param(
     [string]$GatewayHost = "127.0.0.1",
     [int]$Port = 7496,
     [int]$ClientId = 9970,
-    [string]$Account = "U22462030",
+    [string]$Account = "",
     [string]$Symbol = "SIRI",
     [string]$PrimaryExchange = "NSDQ",
     [string]$ExportDir = "exports",
@@ -34,6 +34,18 @@ if ($args -contains '-?' -or $args -contains '/?') {
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($Account)) {
+    $Account = $env:HARVESTER_IB_ACCOUNT
+}
+
+if ([string]::IsNullOrWhiteSpace($Account)) {
+    $Account = $env:IBKR_ACCOUNT
+}
+
+if ([string]::IsNullOrWhiteSpace($Account)) {
+    throw "Account is required. Pass -Account or set HARVESTER_IB_ACCOUNT/IBKR_ACCOUNT."
+}
 
 function Get-LatestFile {
     param(

@@ -2,6 +2,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Harvester.App.Backtest.Engine;
 using Harvester.App.IBKR.Runtime;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Harvester.App.Strategy;
 
@@ -39,6 +41,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly V3LiveCandleAggregator _candleAggregator = new();
     private readonly V3LivePositionTracker _positionTracker = new();
     private readonly V3LivePositionMonitor _positionMonitor;
+    private readonly ILogger<V3LiveRuntime> _logger;
 
     // ── Per-symbol state ───────────────────────────────────────────────────
     private readonly Dictionary<string, V3LiveSymbolState> _stateBySymbol = new(StringComparer.OrdinalIgnoreCase);
@@ -52,8 +55,9 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly List<V3LiveSignalRow> _signals = [];
     private readonly List<V3LiveExitEventRow> _exitEvents = [];
     private readonly List<V3LiveRiskEventRow> _riskEvents = [];
+    private readonly object _eventsLock = new();
 
-    public V3LiveRuntime(V3LiveConfig? config = null)
+    public V3LiveRuntime(V3LiveConfig? config = null, ILogger<V3LiveRuntime>? logger = null)
     {
         _config = config ?? V3LiveConfig.FromEnvironment();
         _scannerV2Engine = new ScannerSelectionEngineV2(new ScannerSelectionV2Config
@@ -68,6 +72,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         _riskGuard = new V3LiveRiskGuard(_config);
         _orderBridge = new V3LiveOrderBridge(_config);
         _positionMonitor = new V3LivePositionMonitor(_config);
+        _logger = logger ?? NullLogger<V3LiveRuntime>.Instance;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -78,10 +83,13 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     {
         _context = context;
         _closeOnly = false;
-        _evaluations.Clear();
-        _signals.Clear();
-        _exitEvents.Clear();
-        _riskEvents.Clear();
+        lock (_eventsLock)
+        {
+            _evaluations.Clear();
+            _signals.Clear();
+            _exitEvents.Clear();
+            _riskEvents.Clear();
+        }
         _stateBySymbol.Clear();
 
         lock (_intentLock) _pendingIntents.Clear();
@@ -91,7 +99,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _stateBySymbol[symbol] = new V3LiveSymbolState();
         }
 
-        Console.WriteLine($"[V3Live] Initialized — symbols={string.Join(",", _config.Symbols)} account={context.Account}");
+        _logger.LogInformation("V3Live initialized symbols={Symbols} account={Account}", string.Join(",", _config.Symbols), context.Account);
         return Task.CompletedTask;
     }
 
@@ -101,7 +109,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             || string.Equals(eventName, "pre-close", StringComparison.OrdinalIgnoreCase))
         {
             _closeOnly = true;
-            Console.WriteLine("[V3Live] Close-only mode activated");
+            _logger.LogInformation("V3Live close-only mode activated");
         }
 
         if (string.Equals(eventName, "mode-start", StringComparison.OrdinalIgnoreCase)
@@ -115,7 +123,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 state.EntriesToday = 0;
                 state.LastSignalUtc = null;
             }
-            Console.WriteLine("[V3Live] Session reset — daily counters cleared");
+            _logger.LogInformation("V3Live session reset; daily counters cleared");
         }
 
         return Task.CompletedTask;
@@ -166,30 +174,33 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         else
         {
             // Record evaluation row for monitoring ticks (no entry attempt)
-            _evaluations.Add(new V3LiveEvaluationRow(
-                TimestampUtc: now,
-                Symbol: symbol,
-                PassedPreTradeGates: false,
-                EmittedSignal: false,
-                SignalSide: string.Empty,
-                SignalSetup: string.Empty,
-                OrderIntentAccepted: false,
-                OrderIntentId: string.Empty,
-                OrderIntentRejectReason: "position-open-monitoring",
-                ReasonCodes: ["position-open"],
-                Bid: l1.Bid,
-                Ask: l1.Ask,
-                Last: l1.Last,
-                SpreadPct: l1.SpreadPct,
-                BidDepthN: l2.BidDepthN,
-                AskDepthN: l2.AskDepthN,
-                ImbalanceRatio: l2.ImbalanceRatio,
-                OfiSignal: features.OfiSignal,
-                DistFromVwapAtr: features.DistFromVwapAtr,
-                Rsi14: features.Rsi14,
-                BbPctB: features.BbPctB,
-                EntriesToday: symbolState.EntriesToday,
-                CloseOnlyMode: _closeOnly));
+            lock (_eventsLock)
+            {
+                _evaluations.Add(new V3LiveEvaluationRow(
+                    TimestampUtc: now,
+                    Symbol: symbol,
+                    PassedPreTradeGates: false,
+                    EmittedSignal: false,
+                    SignalSide: string.Empty,
+                    SignalSetup: string.Empty,
+                    OrderIntentAccepted: false,
+                    OrderIntentId: string.Empty,
+                    OrderIntentRejectReason: "position-open-monitoring",
+                    ReasonCodes: ["position-open"],
+                    Bid: l1.Bid,
+                    Ask: l1.Ask,
+                    Last: l1.Last,
+                    SpreadPct: l1.SpreadPct,
+                    BidDepthN: l2.BidDepthN,
+                    AskDepthN: l2.AskDepthN,
+                    ImbalanceRatio: l2.ImbalanceRatio,
+                    OfiSignal: features.OfiSignal,
+                    DistFromVwapAtr: features.DistFromVwapAtr,
+                    Rsi14: features.Rsi14,
+                    BbPctB: features.BbPctB,
+                    EntriesToday: symbolState.EntriesToday,
+                    CloseOnlyMode: _closeOnly));
+            }
         }
 
         return Task.CompletedTask;
@@ -225,14 +236,35 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             p.IsFlat
         }).ToArray();
 
+        V3LiveEvaluationRow[] evaluationsSnapshot;
+        V3LiveSignalRow[] signalsSnapshot;
+        V3LiveExitEventRow[] exitEventsSnapshot;
+        V3LiveRiskEventRow[] riskEventsSnapshot;
+        int evaluationCount;
+        int passedCount;
+        int failedCount;
+        int exitEventCount;
+
+        lock (_eventsLock)
+        {
+            evaluationsSnapshot = _evaluations.ToArray();
+            signalsSnapshot = _signals.ToArray();
+            exitEventsSnapshot = _exitEvents.ToArray();
+            riskEventsSnapshot = _riskEvents.ToArray();
+            evaluationCount = evaluationsSnapshot.Length;
+            passedCount = evaluationsSnapshot.Count(x => x.PassedPreTradeGates);
+            failedCount = evaluationCount - passedCount;
+            exitEventCount = exitEventsSnapshot.Length;
+        }
+
         var summary = new V3LiveRuntimeSummary(
             TimestampUtc: DateTime.UtcNow,
             ExitCode: exitCode,
             Symbols: _config.Symbols,
-            Evaluations: _evaluations.Count,
-            Passed: _evaluations.Count(x => x.PassedPreTradeGates),
-            Failed: _evaluations.Count(x => !x.PassedPreTradeGates),
-            ExitEvents: _exitEvents.Count,
+            Evaluations: evaluationCount,
+            Passed: passedCount,
+            Failed: failedCount,
+            ExitEvents: exitEventCount,
             RealizedPnlToday: _positionTracker.TotalRealizedPnlToday,
             FilledOrdersToday: _positionTracker.TotalFilledOrdersToday,
             Config: _config);
@@ -244,22 +276,22 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
         await File.WriteAllTextAsync(
             Path.Combine(outputDir, $"v3live_evaluations_{stamp}.json"),
-            JsonSerializer.Serialize(_evaluations, options),
+            JsonSerializer.Serialize(evaluationsSnapshot, options),
             cancellationToken);
 
         await File.WriteAllTextAsync(
             Path.Combine(outputDir, $"v3live_signals_{stamp}.json"),
-            JsonSerializer.Serialize(_signals, options),
+            JsonSerializer.Serialize(signalsSnapshot, options),
             cancellationToken);
 
         await File.WriteAllTextAsync(
             Path.Combine(outputDir, $"v3live_exit_events_{stamp}.json"),
-            JsonSerializer.Serialize(_exitEvents, options),
+            JsonSerializer.Serialize(exitEventsSnapshot, options),
             cancellationToken);
 
         await File.WriteAllTextAsync(
             Path.Combine(outputDir, $"v3live_risk_events_{stamp}.json"),
-            JsonSerializer.Serialize(_riskEvents, options),
+            JsonSerializer.Serialize(riskEventsSnapshot, options),
             cancellationToken);
 
         await File.WriteAllTextAsync(
@@ -267,7 +299,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             JsonSerializer.Serialize(positionSummaries, options),
             cancellationToken);
 
-        Console.WriteLine($"[V3Live] Shutdown — {_evaluations.Count} evals, {_signals.Count} signals, {_exitEvents.Count} exits, PnL=${_positionTracker.TotalRealizedPnlToday:F2}");
+        _logger.LogInformation("V3Live shutdown evaluations={Evaluations} signals={Signals} exits={Exits} pnl={Pnl}", evaluationCount, signalsSnapshot.Length, exitEventCount, _positionTracker.TotalRealizedPnlToday);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -289,7 +321,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     public void AcknowledgeOrderTransmitted(string intentId, string symbol, double filledQuantity, double fillPrice)
     {
-        Console.WriteLine($"[V3Live] Order transmitted: {intentId} {symbol} qty={filledQuantity} fill={fillPrice:F4}");
+        _logger.LogInformation("V3Live order transmitted intentId={IntentId} symbol={Symbol} quantity={Quantity} fillPrice={FillPrice}", intentId, symbol, filledQuantity, fillPrice);
 
         // Find the matching proposed order to get risk/side info
         var side = "LONG"; // default
@@ -313,7 +345,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     public void AcknowledgePositionClosed(string symbol, double closedQuantity, double realizedPnl)
     {
-        Console.WriteLine($"[V3Live] Position closed: {symbol} qty={closedQuantity} PnL=${realizedPnl:F2}");
+        _logger.LogInformation("V3Live position closed symbol={Symbol} quantity={Quantity} realizedPnl={RealizedPnl}", symbol, closedQuantity, realizedPnl);
         _positionTracker.RecordClose(symbol, closedQuantity, realizedPnl);
     }
 
@@ -342,7 +374,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
         if (exitDecision.ShouldExit)
         {
-            Console.WriteLine($"[V3Live] EXIT signal: {symbol} reason={exitDecision.Reason} — {exitDecision.Detail}");
+            _logger.LogInformation("V3Live exit signal symbol={Symbol} reason={Reason} detail={Detail}", symbol, exitDecision.Reason, exitDecision.Detail);
 
             // Build exit order intent
             var exitSide = position.Side == "LONG" ? "SELL" : "BUY";
@@ -368,23 +400,26 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
             EnqueueIntent(exitIntent);
 
-            _exitEvents.Add(new V3LiveExitEventRow(
-                TimestampUtc: now,
-                Symbol: symbol,
-                Side: exitSide,
-                Quantity: (int)exitQty,
-                ExitPrice: exitPrice,
-                Reason: exitDecision.Reason,
-                Detail: exitDecision.Detail,
-                UnrealizedPnl: position.UnrealizedPnl,
-                UnrealizedPnlPeak: position.UnrealizedPnlPeak,
-                HoldSeconds: (now - position.EntryUtc).TotalSeconds,
-                EntryPrice: position.EntryPrice));
+            lock (_eventsLock)
+            {
+                _exitEvents.Add(new V3LiveExitEventRow(
+                    TimestampUtc: now,
+                    Symbol: symbol,
+                    Side: exitSide,
+                    Quantity: (int)exitQty,
+                    ExitPrice: exitPrice,
+                    Reason: exitDecision.Reason,
+                    Detail: exitDecision.Detail,
+                    UnrealizedPnl: position.UnrealizedPnl,
+                    UnrealizedPnlPeak: position.UnrealizedPnlPeak,
+                    HoldSeconds: (now - position.EntryUtc).TotalSeconds,
+                    EntryPrice: position.EntryPrice));
+            }
         }
         else if (exitDecision.IsAdvisory)
         {
             // Log advisory but don't exit
-            Console.WriteLine($"[V3Live] Advisory: {symbol} {exitDecision.Reason} — {exitDecision.Detail}");
+            _logger.LogInformation("V3Live advisory symbol={Symbol} reason={Reason} detail={Detail}", symbol, exitDecision.Reason, exitDecision.Detail);
         }
     }
 
@@ -485,19 +520,22 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             symbolState.LastSignalUtc = now;
             symbolState.EntriesToday++;
 
-            _signals.Add(new V3LiveSignalRow(
-                TimestampUtc: now,
-                Symbol: symbol,
-                Side: signalSide.ToString(),
-                Setup: decision.Setup,
-                Price: features.Price,
-                Atr14: features.Atr14,
-                Rsi14: features.Rsi14,
-                DistFromVwapAtr: features.DistFromVwapAtr,
-                BbPctB: features.BbPctB,
-                ImbalanceRatio: features.L2.ImbalanceRatio,
-                OfiSignal: features.OfiSignal,
-                SpreadPct: features.L1.SpreadPct));
+            lock (_eventsLock)
+            {
+                _signals.Add(new V3LiveSignalRow(
+                    TimestampUtc: now,
+                    Symbol: symbol,
+                    Side: signalSide.ToString(),
+                    Setup: decision.Setup,
+                    Price: features.Price,
+                    Atr14: features.Atr14,
+                    Rsi14: features.Rsi14,
+                    DistFromVwapAtr: features.DistFromVwapAtr,
+                    BbPctB: features.BbPctB,
+                    ImbalanceRatio: features.L2.ImbalanceRatio,
+                    OfiSignal: features.OfiSignal,
+                    SpreadPct: features.L1.SpreadPct));
+            }
 
             if (_config.EmitOrderIntents)
             {
@@ -505,7 +543,10 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 if (proposed is null)
                 {
                     orderIntentRejectReason = "order-bridge-null";
-                    _riskEvents.Add(new V3LiveRiskEventRow(now, symbol, "order-bridge-null", "bridge-failed", 0.0, 0.0));
+                    lock (_eventsLock)
+                    {
+                        _riskEvents.Add(new V3LiveRiskEventRow(now, symbol, "order-bridge-null", "bridge-failed", 0.0, 0.0));
+                    }
                 }
                 else
                 {
@@ -538,43 +579,49 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                             Source: proposed.Source);
 
                         EnqueueIntent(liveIntent);
-                        Console.WriteLine($"[V3Live] ENTRY intent: {symbol} {proposed.Side} qty={proposed.Quantity} @ {proposed.EntryPrice:F4} stop={proposed.StopPrice:F4} setup={proposed.Setup}");
+                        _logger.LogInformation("V3Live entry intent symbol={Symbol} side={Side} quantity={Quantity} entryPrice={EntryPrice} stopPrice={StopPrice} setup={Setup}", symbol, proposed.Side, proposed.Quantity, proposed.EntryPrice, proposed.StopPrice, proposed.Setup);
                     }
                     else
                     {
                         orderIntentRejectReason = string.Join(";", check.Reasons);
-                        _riskEvents.Add(new V3LiveRiskEventRow(
-                            now, symbol, "order-rejected", orderIntentRejectReason,
-                            check.CurrentOpenRiskDollars, check.ProposedRiskDollars));
+                        lock (_eventsLock)
+                        {
+                            _riskEvents.Add(new V3LiveRiskEventRow(
+                                now, symbol, "order-rejected", orderIntentRejectReason,
+                                check.CurrentOpenRiskDollars, check.ProposedRiskDollars));
+                        }
                     }
                 }
             }
         }
 
-        _evaluations.Add(new V3LiveEvaluationRow(
-            TimestampUtc: now,
-            Symbol: symbol,
-            PassedPreTradeGates: passedPreTrade,
-            EmittedSignal: emittedSignal,
-            SignalSide: decision.Side?.ToString() ?? string.Empty,
-            SignalSetup: decision.Setup,
-            OrderIntentAccepted: orderIntentAccepted,
-            OrderIntentId: orderIntentId,
-            OrderIntentRejectReason: orderIntentRejectReason,
-            ReasonCodes: reasonCodes,
-            Bid: l1.Bid,
-            Ask: l1.Ask,
-            Last: l1.Last,
-            SpreadPct: l1.SpreadPct,
-            BidDepthN: l2.BidDepthN,
-            AskDepthN: l2.AskDepthN,
-            ImbalanceRatio: l2.ImbalanceRatio,
-            OfiSignal: features.OfiSignal,
-            DistFromVwapAtr: features.DistFromVwapAtr,
-            Rsi14: features.Rsi14,
-            BbPctB: features.BbPctB,
-            EntriesToday: symbolState.EntriesToday,
-            CloseOnlyMode: _closeOnly));
+        lock (_eventsLock)
+        {
+            _evaluations.Add(new V3LiveEvaluationRow(
+                TimestampUtc: now,
+                Symbol: symbol,
+                PassedPreTradeGates: passedPreTrade,
+                EmittedSignal: emittedSignal,
+                SignalSide: decision.Side?.ToString() ?? string.Empty,
+                SignalSetup: decision.Setup,
+                OrderIntentAccepted: orderIntentAccepted,
+                OrderIntentId: orderIntentId,
+                OrderIntentRejectReason: orderIntentRejectReason,
+                ReasonCodes: reasonCodes,
+                Bid: l1.Bid,
+                Ask: l1.Ask,
+                Last: l1.Last,
+                SpreadPct: l1.SpreadPct,
+                BidDepthN: l2.BidDepthN,
+                AskDepthN: l2.AskDepthN,
+                ImbalanceRatio: l2.ImbalanceRatio,
+                OfiSignal: features.OfiSignal,
+                DistFromVwapAtr: features.DistFromVwapAtr,
+                Rsi14: features.Rsi14,
+                BbPctB: features.BbPctB,
+                EntriesToday: symbolState.EntriesToday,
+                CloseOnlyMode: _closeOnly));
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

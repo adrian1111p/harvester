@@ -38,7 +38,7 @@ public sealed class V8Config
     public double CommissionPerShare { get; set; } = 0.005;
 }
 
-public sealed class StrategyV8 : IBacktestStrategy
+public sealed class StrategyV8 : BacktestStrategyBase
 {
     private readonly V8Config _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -69,7 +69,7 @@ public sealed class StrategyV8 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -148,7 +148,7 @@ public sealed class StrategyV8 : IBacktestStrategy
         return signals;
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     private static string ComputeHtfBias(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
@@ -227,3 +227,6 @@ public sealed class StrategyV8 : IBacktestStrategy
         return best;
     }
 }
+
+
+

@@ -57,7 +57,7 @@ public sealed class V5Config
 /// V5 "Smart Mean-Reversion" — 20MA filter + micro-trail.
 /// Three sub-strategies: Pullback to 20MA, VWAP Tag, Exhaustion Fade.
 /// </summary>
-public sealed class StrategyV5 : IBacktestStrategy
+public sealed class StrategyV5 : BacktestStrategyBase
 {
     private readonly V5Config _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -88,7 +88,7 @@ public sealed class StrategyV5 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -200,7 +200,7 @@ public sealed class StrategyV5 : IBacktestStrategy
             HtfBias.Neutral, "N/A", subStrategy);
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     private static string HtfBiasHelper(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
@@ -222,3 +222,6 @@ public sealed class StrategyV5 : IBacktestStrategy
         return "NEUTRAL";
     }
 }
+
+
+

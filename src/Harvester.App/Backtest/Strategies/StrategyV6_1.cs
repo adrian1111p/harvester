@@ -87,7 +87,7 @@ public sealed class V6Config_1
 /// V6 "Opening Range Breakout" — classic ORB strategy with 20MA filter,
 /// VWAP confirmation, time windows, and one-entry-per-direction limits.
 /// </summary>
-public sealed class StrategyV6_1 : IBacktestStrategy
+public sealed class StrategyV6_1 : BacktestStrategyBase
 {
     private readonly V6Config_1 _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -118,7 +118,7 @@ public sealed class StrategyV6_1 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -274,7 +274,7 @@ public sealed class StrategyV6_1 : IBacktestStrategy
         return Math.Max(1, qty);
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     // ── Day Grouping & Opening Range (exchange/ET aware) ─────────────────
@@ -402,3 +402,6 @@ public sealed class StrategyV6_1 : IBacktestStrategy
         public static DateOnly GetDateEt(DateTime ts) => DateOnly.FromDateTime(ToEt(ts));
     }
 }
+
+
+

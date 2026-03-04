@@ -215,6 +215,24 @@ Program.cs
 | **R14** | Create integration tests with mock `IBrokerAdapter` | 3–5 days |
 | **R15** | Extract `StrategyBase` from V1–V10 backtest strategies to reduce duplication | 1–2 days |
 
+### Execution Status Update (2026-03-04)
+
+Completed items from this audit roadmap:
+
+- ✅ **R4** test project established and expanded (`tests/Harvester.App.Tests`, now 17 passing tests)
+- ✅ **R6** replay layout split started (`ReplayStrategyContracts.cs` extracted from `ReplayStrategySystemLayout.cs`)
+- ✅ **R7** structured logging introduced and wired in runtime paths (`SnapshotRuntime`, `V3LiveRuntime`)
+- ✅ **R8** thread-safety hardening applied (atomic TCS replacement, synchronized event collections, atomic counters)
+- ✅ **R9** runtime finalization deduplicated into centralized helper path
+- ✅ **R10** configuration layering added (`appsettings.json` + env + CLI precedence)
+- ✅ **R11** key XML docs added for public strategy/runtime contracts
+- ✅ **R12** shared contracts project introduced (`src/Harvester.Contracts`) and consumed by app/tests
+- ✅ **R13** run-mode command pattern introduced (`IRunModeCommand` + command implementations)
+- ✅ **R14** integration-style wrapper tests added with mock `IBrokerAdapter`
+- ✅ **R15** backtest strategy base extraction applied (`BacktestStrategyBase` and `ConductStrategyAdapterBase`)
+
+Remaining high-priority roadmap work from this document is concentrated in **R1/R2** (full runtime/app-options decomposition) and broader **R3** model extraction scope.
+
 ---
 
 ## 5. Module-by-Module Scores
@@ -241,7 +259,7 @@ Program.cs
 Phase 1 (Week 1-2):  R5 → R3 → R2 → R1
 Phase 2 (Week 3-4):  R4 → R7 → R8 → R9
 Phase 3 (Week 5-6):  R6 → R10 → R11
-Phase 4 (Backlog):   R12 → R13 → R14 → R15
+Phase 4 (Backlog):   ✅ R12 → ✅ R13 → ✅ R14 → ✅ R15
 ```
 
 **Rationale:** Start with quick wins (R5 hardcoded removal, R3 record extraction) before the larger structural splits (R1, R2). Add tests (R4) immediately after the split so refactored code has coverage. Logging (R7) and thread safety (R8) are independent and can run in parallel.

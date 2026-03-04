@@ -58,7 +58,7 @@ public sealed class V10Config
     public bool AllowShort { get; set; } = true;
 }
 
-public sealed class StrategyV10 : IBacktestStrategy
+public sealed class StrategyV10 : BacktestStrategyBase
 {
     private readonly V10Config _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -89,7 +89,7 @@ public sealed class StrategyV10 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -334,7 +334,7 @@ public sealed class StrategyV10 : IBacktestStrategy
         return Math.Max(1, qty);
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     private sealed record DayGroup(DateOnly DateEt, int StartIdx, int EndIdx);
@@ -457,3 +457,6 @@ public sealed class StrategyV10 : IBacktestStrategy
         public static DateOnly GetDateEt(DateTime ts) => DateOnly.FromDateTime(ToEt(ts));
     }
 }
+
+
+

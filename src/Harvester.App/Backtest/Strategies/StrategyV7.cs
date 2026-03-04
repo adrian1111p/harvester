@@ -58,7 +58,7 @@ public sealed class V7Config
 /// V7 "9 EMA Momentum Scalp" — ride the 9 EMA with micro-pullback entries.
 /// Uses 9/20 EMA alignment, volume contraction→expansion, and 9 EMA trailing stop.
 /// </summary>
-public sealed class StrategyV7 : IBacktestStrategy
+public sealed class StrategyV7 : BacktestStrategyBase
 {
     private readonly V7Config _cfg;
     private readonly ExitEngine.ExitConfig _exitCfg;
@@ -91,7 +91,7 @@ public sealed class StrategyV7 : IBacktestStrategy
         };
     }
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
+    public override IReadOnlyList<BacktestSignal> GenerateSignals(
         EnrichedBar[] triggerBars,
         EnrichedBar[]? bars5m = null,
         EnrichedBar[]? bars15m = null,
@@ -208,7 +208,7 @@ public sealed class StrategyV7 : IBacktestStrategy
         return signals;
     }
 
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
     private static string HtfBiasHelper(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
@@ -228,3 +228,6 @@ public sealed class StrategyV7 : IBacktestStrategy
         return "NEUTRAL";
     }
 }
+
+
+

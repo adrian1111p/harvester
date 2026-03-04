@@ -7,7 +7,7 @@ namespace Harvester.App.IBKR.Runtime;
 
 public sealed class SnapshotEWrapper : HarvesterEWrapper
 {
-    private readonly IBrokerAdapter _brokerAdapter = new IbBrokerAdapter();
+    private readonly IBrokerAdapter _brokerAdapter;
     private readonly TaskCompletionSource<bool> _currentTimeTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _accountSummaryEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _openOrderEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -38,6 +38,11 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     private readonly TaskCompletionSource<bool> _scannerDataEndTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _scannerParametersTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ConcurrentDictionary<string, DateTime> _latestTopPriceByTickerField = new();
+
+    public SnapshotEWrapper(IBrokerAdapter? brokerAdapter = null)
+    {
+        _brokerAdapter = brokerAdapter ?? new IbBrokerAdapter();
+    }
 
     public ConcurrentQueue<AccountSummaryRow> AccountSummaryRows { get; } = new();
     public ConcurrentQueue<OpenOrderRow> OpenOrders { get; } = new();
@@ -92,7 +97,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     public Task<bool> HistoricalTicksDoneTask => _historicalTicksDoneTcs.Task;
     public Task<bool> HeadTimestampTask => _headTimestampTcs.Task;
     public Task<bool> FamilyCodesTask => _familyCodesTcs.Task;
-    public Task<bool> AccountDownloadEndTask => _accountDownloadEndTcs.Task;
+    public Task<bool> AccountDownloadEndTask => Volatile.Read(ref _accountDownloadEndTcs).Task;
 
     /// <summary>
     /// Replace the completed TCS with a fresh one so <see cref="AccountDownloadEndTask"/>
@@ -100,7 +105,9 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     /// </summary>
     public void ResetAccountDownloadEnd()
     {
-        _accountDownloadEndTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(
+            ref _accountDownloadEndTcs,
+            new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously));
     }
 
     public Task<bool> AccountUpdateMultiEndTask => _accountUpdateMultiEndTcs.Task;
@@ -593,7 +600,7 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
 
     public override void accountDownloadEnd(string account)
     {
-        _accountDownloadEndTcs.TrySetResult(true);
+        Volatile.Read(ref _accountDownloadEndTcs).TrySetResult(true);
     }
 
     public override void accountUpdateMulti(int reqId, string account, string modelCode, string key, string value, string currency)
@@ -901,8 +908,6 @@ public sealed class SnapshotEWrapper : HarvesterEWrapper
     }
 }
 
-public sealed record AccountSummaryRow(string Account, string Tag, string Value, string Currency);
-
 public sealed record OpenOrderRow(
     int OrderId,
     string Symbol,
@@ -927,16 +932,6 @@ public sealed record CompletedOrderRow(
     string Status,
     string Account,
     int PermId
-);
-
-public sealed record PositionRow(
-    string Account,
-    string Symbol,
-    string SecurityType,
-    string Currency,
-    string Exchange,
-    double Quantity,
-    double AverageCost
 );
 
 public sealed record ExecutionRow(
@@ -987,32 +982,10 @@ public sealed record WhatIfOrderStateRow(
     string CommissionCurrency
 );
 
-public sealed record TopTickRow(
-    DateTime TimestampUtc,
-    int TickerId,
-    string Kind,
-    int Field,
-    double Price,
-    int Size,
-    string Value
-);
-
 public sealed record MarketDataTypeRow(
     DateTime TimestampUtc,
     int RequestId,
     int MarketDataType
-);
-
-public sealed record DepthRow(
-    DateTime TimestampUtc,
-    int TickerId,
-    int Position,
-    int Operation,
-    int Side,
-    double Price,
-    int Size,
-    string MarketMaker,
-    bool IsSmartDepth
 );
 
 public sealed record RealtimeBarRow(
@@ -1024,19 +997,6 @@ public sealed record RealtimeBarRow(
     double Low,
     double Close,
     long Volume,
-    double Wap,
-    int Count
-);
-
-public sealed record HistoricalBarRow(
-    DateTime TimestampUtc,
-    int RequestId,
-    string Time,
-    double Open,
-    double High,
-    double Low,
-    double Close,
-    decimal Volume,
     double Wap,
     int Count
 );

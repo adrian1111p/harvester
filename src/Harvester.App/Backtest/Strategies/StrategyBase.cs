@@ -17,6 +17,52 @@ public interface IBacktestStrategy
     BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars);
 }
 
+/// <summary>
+/// Base type for concrete strategy versions to enforce a common contract and enable shared evolution.
+/// </summary>
+public abstract class BacktestStrategyBase : IBacktestStrategy
+{
+    public abstract IReadOnlyList<BacktestSignal> GenerateSignals(
+        EnrichedBar[] triggerBars,
+        EnrichedBar[]? bars5m = null,
+        EnrichedBar[]? bars15m = null,
+        EnrichedBar[]? bars1h = null,
+        EnrichedBar[]? bars1d = null);
+
+    public abstract BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars);
+}
+
+/// <summary>
+/// Shared adapter base for strategy versions that delegate to <see cref="ConductStrategyV2"/>.
+/// </summary>
+public abstract class ConductStrategyAdapterBase : IBacktestStrategy
+{
+    private readonly ConductStrategyV2 _inner;
+
+    public StrategyConfig Config { get; }
+
+    protected ConductStrategyAdapterBase(StrategyConfig? cfg, Func<StrategyConfig> defaultConfigFactory)
+    {
+        Config = cfg ?? defaultConfigFactory();
+        _inner = new ConductStrategyV2(Config);
+    }
+
+    public IReadOnlyList<BacktestSignal> GenerateSignals(
+        EnrichedBar[] triggerBars,
+        EnrichedBar[]? bars5m = null,
+        EnrichedBar[]? bars15m = null,
+        EnrichedBar[]? bars1h = null,
+        EnrichedBar[]? bars1d = null)
+    {
+        return _inner.GenerateSignals(triggerBars, bars5m, bars15m, bars1h, bars1d);
+    }
+
+    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
+    {
+        return _inner.SimulateTrade(signal, triggerBars);
+    }
+}
+
 // ── Enriched Bar ─────────────────────────────────────────────────────────────
 
 /// <summary>

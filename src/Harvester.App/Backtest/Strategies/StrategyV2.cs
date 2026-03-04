@@ -2,16 +2,11 @@ using Harvester.App.Backtest.Engine;
 
 namespace Harvester.App.Backtest.Strategies;
 
-public sealed class StrategyV2 : IBacktestStrategy
+public sealed class StrategyV2 : ConductStrategyAdapterBase
 {
-    private readonly ConductStrategyV2 _inner;
-
-    public StrategyConfig Config { get; }
-
     public StrategyV2(StrategyConfig? cfg = null)
+        : base(cfg, BuildDefaultConfig)
     {
-        Config = cfg ?? BuildDefaultConfig();
-        _inner = new ConductStrategyV2(Config);
     }
 
     public static StrategyConfig BuildDefaultConfig() => new()
@@ -29,14 +24,6 @@ public sealed class StrategyV2 : IBacktestStrategy
         UseNotionalGivebackCap = false,
     };
 
-    public IReadOnlyList<BacktestSignal> GenerateSignals(
-        EnrichedBar[] triggerBars,
-        EnrichedBar[]? bars5m = null,
-        EnrichedBar[]? bars15m = null,
-        EnrichedBar[]? bars1h = null,
-        EnrichedBar[]? bars1d = null)
-        => _inner.GenerateSignals(triggerBars, bars5m, bars15m, bars1h, bars1d);
-
-    public BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
-        => _inner.SimulateTrade(signal, triggerBars);
 }
+
+
