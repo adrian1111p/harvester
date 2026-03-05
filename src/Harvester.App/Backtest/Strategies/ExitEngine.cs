@@ -131,7 +131,9 @@ public static class ExitEngine
                 if ((side == TradeSide.Long && low <= tightGivebackStop) ||
                     (side == TradeSide.Short && high >= tightGivebackStop))
                 {
-                    exitPrice = tightGivebackStop;
+                    exitPrice = side == TradeSide.Long
+                        ? Math.Min(bar.Open, tightGivebackStop)
+                        : Math.Max(bar.Open, tightGivebackStop);
                     exitReason = ExitReason.Giveback;
                     exitBar = j; exited = true; break;
                 }
@@ -146,6 +148,11 @@ public static class ExitEngine
             double bestUnrealizedR = side == TradeSide.Long
                 ? (high - entryPrice) / riskPerShare
                 : (entryPrice - low) / riskPerShare;
+
+            // Worst intra-bar unrealised R (uses L/H for giveback detection)
+            double worstUnrealizedR = side == TradeSide.Long
+                ? (low - entryPrice) / riskPerShare
+                : (entryPrice - high) / riskPerShare;
 
             double peakR = side == TradeSide.Long
                 ? (peakPrice - entryPrice) / riskPerShare
@@ -207,7 +214,7 @@ public static class ExitEngine
                     stopPrice = Math.Min(stopPrice, entryPrice);
             }
 
-            // ── Micro-trail (V5/V6/V7 feature) ──
+            // ── Micro-trail update (V5/V6/V7 feature) ──
             if (cfg.MicroTrail)
             {
                 double profitCents = side == TradeSide.Long
@@ -228,21 +235,10 @@ public static class ExitEngine
                     else
                         microTrailStop = Math.Min(microTrailStop, newMicroStop);
                 }
-
-                if (microTrailActive && !double.IsNaN(microTrailStop))
-                {
-                    if ((side == TradeSide.Long && low <= microTrailStop) ||
-                        (side == TradeSide.Short && high >= microTrailStop))
-                    {
-                        exitPrice = microTrailStop;
-                        exitReason = ExitReason.MicroTrail;
-                        exitBar = j; exited = true; break;
-                    }
-                }
             }
 
-            // ── 9 EMA Trail (V7 feature) ──
-            if (cfg.EmaTrail && beActivated && !microTrailActive)
+            // ── 9 EMA Trail update (V7 feature) — always update when BE active ──
+            if (cfg.EmaTrail && beActivated)
             {
                 double ema9 = triggerBars[j].Ema9;
                 double atr = triggerBars[j].Atr14;
@@ -256,42 +252,53 @@ public static class ExitEngine
                         trailingStop = Math.Max(trailingStop, emaStop);
                     else
                         trailingStop = Math.Min(trailingStop, emaStop);
-
-                    if ((side == TradeSide.Long && low <= trailingStop) ||
-                        (side == TradeSide.Short && high >= trailingStop))
-                    {
-                        exitPrice = trailingStop;
-                        exitReason = ExitReason.EmaTrail;
-                        exitBar = j; exited = true; break;
-                    }
                 }
             }
 
-            // ── Standard trailing stop ──
-            if (beActivated && !microTrailActive)
+            // ── Standard trailing stop update — always update when BE active ──
+            if (beActivated)
             {
                 double trailDist = cfg.TrailR * riskPerShare;
                 if (side == TradeSide.Long)
+                    trailingStop = Math.Max(trailingStop, peakPrice - trailDist);
+                else
+                    trailingStop = Math.Min(trailingStop, troughPrice + trailDist);
+            }
+
+            // ── Combined trail exit: use the stop that locks in the most profit ──
+            {
+                double bestStop = double.NaN;
+                ExitReason bestReason = ExitReason.Trailing;
+
+                // Standard / EMA trail stop
+                if (beActivated)
                 {
-                    double newTrail = peakPrice - trailDist;
-                    trailingStop = Math.Max(trailingStop, newTrail);
-                    if (low <= trailingStop)
+                    bestStop = trailingStop;
+                    bestReason = cfg.EmaTrail ? ExitReason.EmaTrail : ExitReason.Trailing;
+                }
+
+                // Micro-trail: use whichever stop protects more profit
+                if (microTrailActive && !double.IsNaN(microTrailStop))
+                {
+                    if (double.IsNaN(bestStop))
                     {
-                        exitPrice = trailingStop;
-                        exitReason = ExitReason.Trailing;
-                        exitBar = j; exited = true; break;
+                        bestStop = microTrailStop;
+                        bestReason = ExitReason.MicroTrail;
+                    }
+                    else if (side == TradeSide.Long ? microTrailStop > bestStop : microTrailStop < bestStop)
+                    {
+                        bestStop = microTrailStop;
+                        bestReason = ExitReason.MicroTrail;
                     }
                 }
-                else
+
+                if (!double.IsNaN(bestStop) &&
+                    ((side == TradeSide.Long && low <= bestStop) ||
+                     (side == TradeSide.Short && high >= bestStop)))
                 {
-                    double newTrail = troughPrice + trailDist;
-                    trailingStop = Math.Min(trailingStop, newTrail);
-                    if (high >= trailingStop)
-                    {
-                        exitPrice = trailingStop;
-                        exitReason = ExitReason.Trailing;
-                        exitBar = j; exited = true; break;
-                    }
+                    exitPrice = bestStop;
+                    exitReason = bestReason;
+                    exitBar = j; exited = true; break;
                 }
             }
 
@@ -314,45 +321,57 @@ public static class ExitEngine
                         : cfg.GivebackUsdCap;
                 }
 
-                if (effectiveGivebackUsdCap <= 0)
-                    continue;
-
-                double peakPnlUsd = side == TradeSide.Long
-                    ? (peakPrice - entryPrice) * posSize
-                    : (entryPrice - troughPrice) * posSize;
-                double currentPnlUsd = side == TradeSide.Long
-                    ? (price - entryPrice) * posSize
-                    : (entryPrice - price) * posSize;
-                double givebackUsd = peakPnlUsd - currentPnlUsd;
-
-                if (currentPnlUsd > 0 && givebackUsd >= effectiveGivebackUsdCap)
+                if (effectiveGivebackUsdCap > 0)
                 {
-                    if (!cfg.UseTightTrailOnFixedGiveback)
+                    // Compute the giveback stop level: the price at which dollar giveback = cap
+                    double givebackStopLevel = side == TradeSide.Long
+                        ? peakPrice - effectiveGivebackUsdCap / posSize
+                        : troughPrice + effectiveGivebackUsdCap / posSize;
+
+                    // Only trigger if the stop would still be in profit territory
+                    bool stopInProfit = side == TradeSide.Long
+                        ? givebackStopLevel > entryPrice
+                        : givebackStopLevel < entryPrice;
+
+                    if (stopInProfit)
                     {
-                        exitPrice = price;
-                        exitReason = ExitReason.Giveback;
-                        exitBar = j; exited = true; break;
-                    }
+                        // Use H/L for intra-bar detection (like a stop order at the giveback level)
+                        bool hit = side == TradeSide.Long
+                            ? low <= givebackStopLevel
+                            : high >= givebackStopLevel;
 
-                    tightGivebackTrailActive = true;
-                    double trailPerShare = ComputeTightGivebackTrailPerShare(price, cfg);
-                    double candidateStop = side == TradeSide.Long
-                        ? peakPrice - trailPerShare
-                        : troughPrice + trailPerShare;
+                        if (hit)
+                        {
+                            if (!cfg.UseTightTrailOnFixedGiveback)
+                            {
+                                exitPrice = side == TradeSide.Long
+                                    ? Math.Min(bar.Open, givebackStopLevel)
+                                    : Math.Max(bar.Open, givebackStopLevel);
+                                exitReason = ExitReason.Giveback;
+                                exitBar = j; exited = true; break;
+                            }
 
-                    if (double.IsNaN(tightGivebackStop))
-                        tightGivebackStop = candidateStop;
-                    else if (side == TradeSide.Long)
-                        tightGivebackStop = Math.Max(tightGivebackStop, candidateStop);
-                    else
-                        tightGivebackStop = Math.Min(tightGivebackStop, candidateStop);
+                            tightGivebackTrailActive = true;
+                            double trailPerShare = ComputeTightGivebackTrailPerShare(price, cfg);
+                            double candidateStop = side == TradeSide.Long
+                                ? peakPrice - trailPerShare
+                                : troughPrice + trailPerShare;
 
-                    if ((side == TradeSide.Long && low <= tightGivebackStop) ||
-                        (side == TradeSide.Short && high >= tightGivebackStop))
-                    {
-                        exitPrice = tightGivebackStop;
-                        exitReason = ExitReason.Giveback;
-                        exitBar = j; exited = true; break;
+                            if (double.IsNaN(tightGivebackStop))
+                                tightGivebackStop = candidateStop;
+                            else if (side == TradeSide.Long)
+                                tightGivebackStop = Math.Max(tightGivebackStop, candidateStop);
+                            else
+                                tightGivebackStop = Math.Min(tightGivebackStop, candidateStop);
+
+                            if ((side == TradeSide.Long && low <= tightGivebackStop) ||
+                                (side == TradeSide.Short && high >= tightGivebackStop))
+                            {
+                                exitPrice = tightGivebackStop;
+                                exitReason = ExitReason.Giveback;
+                                exitBar = j; exited = true; break;
+                            }
+                        }
                     }
                 }
             }
@@ -360,10 +379,17 @@ public static class ExitEngine
             // ── Giveback from peak (R-percent mode) ──
             else if (peakR > cfg.GivebackMinPeakR)
             {
-                double giveback = peakR > 0 ? (peakR - unrealizedR) / peakR : 0;
-                if (giveback >= cfg.GivebackPct && unrealizedR > 0)
+                // Use worst intra-bar unrealised R to detect giveback via H/L
+                double worstGiveback = peakR > 0 ? (peakR - worstUnrealizedR) / peakR : 0;
+                if (worstGiveback >= cfg.GivebackPct && worstUnrealizedR > 0)
                 {
-                    exitPrice = price;
+                    // Compute exact trigger price where giveback% was hit
+                    double givebackTriggerPrice = side == TradeSide.Long
+                        ? entryPrice + riskPerShare * peakR * (1.0 - cfg.GivebackPct)
+                        : entryPrice - riskPerShare * peakR * (1.0 - cfg.GivebackPct);
+                    exitPrice = side == TradeSide.Long
+                        ? Math.Min(bar.Open, givebackTriggerPrice)
+                        : Math.Max(bar.Open, givebackTriggerPrice);
                     exitReason = ExitReason.Giveback;
                     exitBar = j; exited = true; break;
                 }
