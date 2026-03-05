@@ -27,6 +27,8 @@ public static class StrategyComparisonRunner
         "V7",
         "V8",
         "V9",
+        "V3",
+        "V9_1",
     ];
 
     public static List<StrategyComparisonRow> RunAll(
@@ -78,7 +80,6 @@ public static class StrategyComparisonRunner
         Dictionary<string, (EnrichedBar[] Trigger, EnrichedBar[]? Ctx5m, EnrichedBar[]? Ctx15m, EnrichedBar[]? Ctx1h, EnrichedBar[]? Ctx1d)> allData,
         int minTrades)
     {
-        int targetTrades = minTrades + 40;
         StrategyComparisonRow? bestEligible = null;
         StrategyComparisonRow? bestAny = null;
 
@@ -121,23 +122,12 @@ public static class StrategyComparisonRunner
 
             if (row.MeetsMinTrades)
             {
-                if (bestEligible == null || IsBetterEligible(row, bestEligible, targetTrades))
+                if (bestEligible == null || IsBetter(row, bestEligible, preferTradeFloor: false))
                     bestEligible = row;
             }
         }
 
         return bestEligible ?? bestAny!;
-    }
-
-    private static bool IsBetterEligible(StrategyComparisonRow left, StrategyComparisonRow right, int targetTrades)
-    {
-        int leftDistance = Math.Abs(left.Trades - targetTrades);
-        int rightDistance = Math.Abs(right.Trades - targetTrades);
-
-        if (leftDistance != rightDistance)
-            return leftDistance < rightDistance;
-
-        return IsBetter(left, right, preferTradeFloor: false);
     }
 
     private static bool IsBetter(StrategyComparisonRow left, StrategyComparisonRow right, bool preferTradeFloor)
@@ -565,6 +555,31 @@ public static class StrategyComparisonRunner
                 25_000.0,
                 [
                     new StrategyVariant("default", () => new StrategyV6()),
+                    new StrategyVariant("profit-focused", () => new StrategyV6(new V6Config
+                    {
+                        OrMinutes = 5,
+                        MinRangeAtr = 0.20,
+                        MaxRangeAtr = 4.0,
+                        MaxMaDistAtr = 0.8,
+                        RequireVwapAlign = true,
+                        IgnoreHtfBias = false,
+                        RvolMin = 0.6,
+                        EntryWindows = [(585, 690), (840, 930)],
+                        RequireCrossFromInside = true,
+                        MaxEntriesPerDirectionPerDay = 1,
+                        StopAtOpposite = false,
+                        StopAtMidpoint = true,
+                        HardStopR = 0.8,
+                        BreakevenR = 0.4,
+                        TrailR = 0.35,
+                        GivebackPct = 0.30,
+                        Tp1R = 0.9,
+                        Tp2R = 1.8,
+                        MaxHoldBars = 45,
+                        MicroTrailCents = 2.0,
+                        MicroTrailActivateCents = 4.0,
+                        ReversalFlatten = true,
+                    })),
                     new StrategyVariant("relaxed", () => new StrategyV6(new V6Config
                     {
                         OrMinutes = 5,
@@ -609,6 +624,35 @@ public static class StrategyComparisonRunner
                 25_000.0,
                 [
                     new StrategyVariant("default", () => new StrategyV6_1()),
+                    new StrategyVariant("profit-focused", () => new StrategyV6_1(new V6Config_1
+                    {
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.20,
+                        MaxShares = 6000,
+                        UseNextBarOpenEntry = true,
+                        OrMinutes = 5,
+                        MinRangeAtr = 0.20,
+                        MaxRangeAtr = 4.0,
+                        MaxMaDistAtr = 0.8,
+                        RequireVwapAlign = true,
+                        IgnoreHtfBias = false,
+                        RvolMin = 0.6,
+                        EntryWindows = [(585, 690), (840, 930)],
+                        RequireCrossFromInside = true,
+                        MaxEntriesPerDirectionPerDay = 1,
+                        StopAtOpposite = false,
+                        StopAtMidpoint = true,
+                        HardStopR = 0.8,
+                        BreakevenR = 0.4,
+                        TrailR = 0.35,
+                        GivebackPct = 0.30,
+                        Tp1R = 0.9,
+                        Tp2R = 1.8,
+                        MaxHoldBars = 45,
+                        MicroTrailCents = 2.0,
+                        MicroTrailActivateCents = 4.0,
+                        ReversalFlatten = true,
+                    })),
                     new StrategyVariant("balanced-trades", () => new StrategyV6_1(new V6Config_1
                     {
                         OrMinutes = 1,
