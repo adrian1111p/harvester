@@ -8,24 +8,6 @@ public sealed class V6Config
     public double RiskPerTradeDollars { get; set; } = 50.0;
     public double AccountSize { get; set; } = 25_000.0;
 
-    /// <summary>Cap position notional as % of AccountSize (0..1).</summary>
-    public double MaxPositionNotionalPctOfAccount { get; set; } = 0.25;
-
-    /// <summary>Absolute hard cap on shares.</summary>
-    public int MaxShares { get; set; } = 10_000;
-
-    /// <summary>Minimum risk per share to avoid unrealistic huge sizing when stop is too tight.</summary>
-    public double MinRiskPerShare { get; set; } = 0.01;
-
-    /// <summary>
-    /// If true: signal computed on bar i close, but entry assumed at bar i+1 open (more realistic).
-    /// If false: entry at bar i close (legacy behavior).
-    /// </summary>
-    public bool UseNextBarOpenEntry { get; set; } = true;
-
-    /// <summary>Market open minute-of-day in exchange time (ET). Default 09:30 => 570.</summary>
-    public int MarketOpenMinute { get; set; } = 570;
-
     // Opening Range
     public int OrMinutes { get; set; } = 15;
     public double MinRangeAtr { get; set; } = 0.3;
@@ -94,15 +76,14 @@ public sealed class StrategyV6 : BacktestStrategyBase
             GivebackPct = _cfg.GivebackPct,
             GivebackMinPeakR = 0.0,
             UseFixedGivebackUsdCap = true,
-            UseVariableGivebackUsdCap = true,
             GivebackUsdCap = 30.0,
             Tp1R = _cfg.Tp1R,
             Tp2R = _cfg.Tp2R,
             MaxHoldBars = _cfg.MaxHoldBars,
             SlippageCents = _cfg.SlippageCents,
             CommissionPerShare = _cfg.CommissionPerShare,
-            DeductCommission = true,
-            Tp1TightenToBe = true,
+            DeductCommission = false,  // V6 doesn't deduct commission
+            Tp1TightenToBe = false,
             ReversalFlatten = _cfg.ReversalFlatten,
             MicroTrail = true,
             MicroTrailCents = _cfg.MicroTrailCents,
@@ -119,12 +100,12 @@ public sealed class StrategyV6 : BacktestStrategyBase
     {
         var signals = new List<BacktestSignal>();
 
-        // Group bars by exchange trading day (ET) and compute opening ranges
-        var dayGroups = GroupByTradingDayEt(triggerBars);
+        // Group bars by trading day and compute opening ranges
+        var dayGroups = GroupByTradingDay(triggerBars);
 
         foreach (var day in dayGroups)
         {
-            var (orHigh, orLow, orEndIdx) = ComputeOpeningRangeEt(day.StartIdx, day.EndIdx, triggerBars);
+            var (orHigh, orLow, orEndIdx) = ComputeOpeningRange(day.Bars, day.StartIdx, triggerBars);
             if (orEndIdx < 0) continue;
 
             double orRange = orHigh - orLow;
@@ -145,8 +126,8 @@ public sealed class StrategyV6 : BacktestStrategyBase
                 double atrVal = row.Atr14;
                 if (double.IsNaN(atrVal) || atrVal <= 0) continue;
 
-                // Time window check (ET)
-                int minuteOfDay = TradingTime.GetMinuteOfDayEt(row.Bar.Timestamp);
+                // Time window check
+                int minuteOfDay = GetMinuteOfDay(row.Bar.Timestamp);
                 if (!InEntryWindow(minuteOfDay)) continue;
 
                 // Compute HTF bias per-bar (no lookahead)
@@ -157,45 +138,58 @@ public sealed class StrategyV6 : BacktestStrategyBase
                 double maDist = Math.Abs((row.Bar.Close - row.Sma20) / atrVal);
                 if (maDist > _cfg.MaxMaDistAtr) continue;
 
-                // Volume (conservative: NaN fails when volume filter is in use)
-                if (double.IsNaN(row.Rvol) || row.Rvol < _cfg.RvolMin) continue;
+                // Volume
+                if (!double.IsNaN(row.Rvol) && row.Rvol < _cfg.RvolMin) continue;
 
-                double evalPrice = row.Bar.Close;
+                double price = row.Bar.Close;
 
                 // LONG: breakout above OR high
                 bool longBreak = _cfg.RequireCrossFromInside
-                    ? (evalPrice > orHigh && prev.Bar.Close <= orHigh)
-                    : (evalPrice > orHigh);
+                    ? (price > orHigh && prev.Bar.Close <= orHigh)
+                    : (price > orHigh);
 
                 bool htfAllowsLong = _cfg.IgnoreHtfBias || htfBias != "BEAR";
                 if (longEntries < _cfg.MaxEntriesPerDirectionPerDay && longBreak && htfAllowsLong)
                 {
-                    if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && evalPrice > row.Vwap))
+                    if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price > row.Vwap))
                     {
-                        var sig = BuildSignal(i, triggerBars, TradeSide.Long, evalPrice, orHigh, orLow, atrVal, "ORB_BREAKOUT_HIGH", day.EndIdx);
-                        if (sig != null)
+                        double stopPrice = _cfg.StopAtOpposite ? orLow
+                            : _cfg.StopAtMidpoint ? (orHigh + orLow) / 2.0
+                            : price - _cfg.HardStopR * atrVal;
+
+                        double riskPerShare = Math.Abs(price - stopPrice);
+                        if (riskPerShare > 0)
                         {
-                            signals.Add(sig);
+                            int posSize = Math.Max(1, (int)(_cfg.RiskPerTradeDollars / riskPerShare));
+                            signals.Add(new BacktestSignal(i, row.Bar.Timestamp, TradeSide.Long,
+                                price, stopPrice, riskPerShare, posSize, atrVal,
+                                HtfBias.Neutral, "N/A", "ORB_BREAKOUT_HIGH"));
                             longEntries++;
-                            continue;
                         }
                     }
                 }
 
                 // SHORT: breakdown below OR low
                 bool shortBreak = _cfg.RequireCrossFromInside
-                    ? (evalPrice < orLow && prev.Bar.Close >= orLow)
-                    : (evalPrice < orLow);
+                    ? (price < orLow && prev.Bar.Close >= orLow)
+                    : (price < orLow);
 
                 bool htfAllowsShort = _cfg.IgnoreHtfBias || htfBias != "BULL";
                 if (shortEntries < _cfg.MaxEntriesPerDirectionPerDay && shortBreak && htfAllowsShort)
                 {
-                    if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && evalPrice < row.Vwap))
+                    if (!_cfg.RequireVwapAlign || (!double.IsNaN(row.Vwap) && price < row.Vwap))
                     {
-                        var sig = BuildSignal(i, triggerBars, TradeSide.Short, evalPrice, orHigh, orLow, atrVal, "ORB_BREAKOUT_LOW", day.EndIdx);
-                        if (sig != null)
+                        double stopPrice = _cfg.StopAtOpposite ? orHigh
+                            : _cfg.StopAtMidpoint ? (orHigh + orLow) / 2.0
+                            : price + _cfg.HardStopR * atrVal;
+
+                        double riskPerShare = Math.Abs(stopPrice - price);
+                        if (riskPerShare > 0)
                         {
-                            signals.Add(sig);
+                            int posSize = Math.Max(1, (int)(_cfg.RiskPerTradeDollars / riskPerShare));
+                            signals.Add(new BacktestSignal(i, row.Bar.Timestamp, TradeSide.Short,
+                                price, stopPrice, riskPerShare, posSize, atrVal,
+                                HtfBias.Neutral, "N/A", "ORB_BREAKOUT_LOW"));
                             shortEntries++;
                         }
                     }
@@ -206,124 +200,69 @@ public sealed class StrategyV6 : BacktestStrategyBase
         return signals;
     }
 
-    private BacktestSignal? BuildSignal(
-        int i,
-        EnrichedBar[] bars,
-        TradeSide side,
-        double evalPrice,
-        double orHigh,
-        double orLow,
-        double atrVal,
-        string subStrategy,
-        int dayEndIdxExclusive)
-    {
-        // Entry model: next-bar open (preferred) vs same-bar close (legacy)
-        int entryIndex = i;
-        double entryPrice = evalPrice;
-        DateTime entryTs = bars[i].Bar.Timestamp;
-
-        if (_cfg.UseNextBarOpenEntry)
-        {
-            if (i + 1 >= bars.Length) return null;
-            if (i + 1 >= dayEndIdxExclusive) return null; // do not enter beyond day slice
-            entryIndex = i + 1;
-            entryPrice = bars[entryIndex].Bar.Open;
-            entryTs = bars[entryIndex].Bar.Timestamp;
-        }
-
-        double stopPrice = side == TradeSide.Long
-            ? (_cfg.StopAtOpposite ? orLow : _cfg.StopAtMidpoint ? (orHigh + orLow) / 2.0 : entryPrice - _cfg.HardStopR * atrVal)
-            : (_cfg.StopAtOpposite ? orHigh : _cfg.StopAtMidpoint ? (orHigh + orLow) / 2.0 : entryPrice + _cfg.HardStopR * atrVal);
-
-        double riskPerShare = Math.Abs(entryPrice - stopPrice);
-        if (riskPerShare <= 0 || riskPerShare < _cfg.MinRiskPerShare) return null;
-
-        int posSize = ComputePositionSize(entryPrice, riskPerShare);
-        if (posSize <= 0) return null;
-
-        return new BacktestSignal(
-            BarIndex: entryIndex,
-            Timestamp: entryTs,
-            Side: side,
-            EntryPrice: entryPrice,
-            StopPrice: stopPrice,
-            RiskPerShare: riskPerShare,
-            PositionSize: posSize,
-            AtrValue: atrVal,
-            HtfTrend: HtfBias.Neutral,
-            MtfMomentum: "N/A",
-            SubStrategy: subStrategy);
-    }
-
-    private int ComputePositionSize(double entryPrice, double riskPerShare)
-    {
-        int qtyByRisk = Math.Max(1, (int)(_cfg.RiskPerTradeDollars / riskPerShare));
-
-        double maxNotional = Math.Max(0.0, _cfg.AccountSize * _cfg.MaxPositionNotionalPctOfAccount);
-        int qtyByNotional = maxNotional > 0 && entryPrice > 0 ? Math.Max(1, (int)(maxNotional / entryPrice)) : _cfg.MaxShares;
-
-        int qty = Math.Min(qtyByRisk, qtyByNotional);
-        qty = Math.Min(qty, _cfg.MaxShares);
-        return Math.Max(1, qty);
-    }
-
     public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
-// ── Day Grouping & Opening Range (exchange/ET aware) ─────────────────
+    // ── Day Grouping & Opening Range ─────────────────────────────────────
 
-    private sealed record DayGroup(DateOnly DateEt, int StartIdx, int EndIdx);
+    private sealed record DayGroup(DateOnly Date, int StartIdx, int EndIdx, EnrichedBar[] Bars);
 
-    private static List<DayGroup> GroupByTradingDayEt(EnrichedBar[] bars)
+    private static List<DayGroup> GroupByTradingDay(EnrichedBar[] bars)
     {
         var groups = new List<DayGroup>();
         if (bars.Length == 0) return groups;
 
         int start = 0;
-        DateOnly currentDay = TradingTime.GetDateEt(bars[0].Bar.Timestamp);
+        DateOnly currentDay = DateOnly.FromDateTime(bars[0].Bar.Timestamp);
 
         for (int i = 1; i < bars.Length; i++)
         {
-            var day = TradingTime.GetDateEt(bars[i].Bar.Timestamp);
+            var day = DateOnly.FromDateTime(bars[i].Bar.Timestamp);
             if (day != currentDay)
             {
-                groups.Add(new DayGroup(currentDay, start, i));
+                groups.Add(new DayGroup(currentDay, start, i, bars));
                 start = i;
                 currentDay = day;
             }
         }
-        groups.Add(new DayGroup(currentDay, start, bars.Length));
+        groups.Add(new DayGroup(currentDay, start, bars.Length, bars));
         return groups;
     }
 
-    private (double OrHigh, double OrLow, int OrEndIdx) ComputeOpeningRangeEt(int dayStartIdx, int dayEndIdx, EnrichedBar[] allBars)
+    private (double OrHigh, double OrLow, int OrEndIdx) ComputeOpeningRange(
+        EnrichedBar[] bars, int dayStartIdx, EnrichedBar[] allBars)
     {
-        int orStartMinute = _cfg.MarketOpenMinute;
-        int orEndMinute = orStartMinute + _cfg.OrMinutes;
+        if (dayStartIdx < 0 || dayStartIdx >= allBars.Length)
+            return (double.NaN, double.NaN, -1);
+
+        int marketOpenMinute = GetMinuteOfDay(allBars[dayStartIdx].Bar.Timestamp);
+        int orEndMinute = marketOpenMinute + _cfg.OrMinutes;
 
         double orHigh = double.MinValue;
         double orLow = double.MaxValue;
         int orEndIdx = -1;
 
-        // Ignore premarket bars; start collecting at market open ET.
-        for (int i = dayStartIdx; i < dayEndIdx && i < allBars.Length; i++)
+        for (int i = dayStartIdx; i < allBars.Length; i++)
         {
-            int minute = TradingTime.GetMinuteOfDayEt(allBars[i].Bar.Timestamp);
-
-            if (minute < orStartMinute) continue;
-
-            if (minute >= orEndMinute)
+            if (DateOnly.FromDateTime(allBars[i].Bar.Timestamp) !=
+                DateOnly.FromDateTime(allBars[dayStartIdx].Bar.Timestamp))
             {
                 orEndIdx = i;
                 break;
             }
 
+            int minute = GetMinuteOfDay(allBars[i].Bar.Timestamp);
+            if (minute >= orEndMinute)
+            {
+                orEndIdx = i;
+                break;
+            }
             orHigh = Math.Max(orHigh, allBars[i].Bar.High);
             orLow = Math.Min(orLow, allBars[i].Bar.Low);
         }
 
         if (orEndIdx < 0)
-            return (double.NaN, double.NaN, -1);
+            orEndIdx = allBars.Length - 1;
 
         if (orHigh == double.MinValue || orLow == double.MaxValue)
             return (double.NaN, double.NaN, -1);
@@ -331,11 +270,17 @@ public sealed class StrategyV6 : BacktestStrategyBase
         return (orHigh, orLow, orEndIdx);
     }
 
-    private bool InEntryWindow(int minuteEt)
+    private static int GetMinuteOfDay(DateTime dt)
+    {
+        // Assume timestamps are already in ET or that we calculate approximate minute
+        return dt.Hour * 60 + dt.Minute;
+    }
+
+    private bool InEntryWindow(int minute)
     {
         foreach (var (start, end) in _cfg.EntryWindows)
         {
-            if (minuteEt >= start && minuteEt <= end) return true;
+            if (minute >= start && minute <= end) return true;
         }
         return false;
     }
@@ -369,38 +314,6 @@ public sealed class StrategyV6 : BacktestStrategyBase
             else hi = mid - 1;
         }
         return best;
-    }
-
-    private static class TradingTime
-    {
-        private static readonly TimeZoneInfo _et = ResolveEasternTimeZone();
-
-        private static TimeZoneInfo ResolveEasternTimeZone()
-        {
-            try { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
-            catch { /* ignore */ }
-            try { return TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
-            catch { /* ignore */ }
-            return TimeZoneInfo.Utc;
-        }
-
-        public static DateTime ToEt(DateTime ts)
-        {
-            return ts.Kind switch
-            {
-                DateTimeKind.Utc => TimeZoneInfo.ConvertTimeFromUtc(ts, _et),
-                DateTimeKind.Local => TimeZoneInfo.ConvertTime(ts, _et),
-                _ => ts
-            };
-        }
-
-        public static int GetMinuteOfDayEt(DateTime ts)
-        {
-            var et = ToEt(ts);
-            return et.Hour * 60 + et.Minute;
-        }
-
-        public static DateOnly GetDateEt(DateTime ts) => DateOnly.FromDateTime(ToEt(ts));
     }
 }
 

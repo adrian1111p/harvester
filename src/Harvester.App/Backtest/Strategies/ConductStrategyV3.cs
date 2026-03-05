@@ -28,7 +28,6 @@ public sealed class ConductStrategyV3 : BacktestStrategyBase
             GivebackPct = _cfg.GivebackPct,
             GivebackMinPeakR = 0.0,
             UseFixedGivebackUsdCap = !_cfg.UseNotionalGivebackCap && _cfg.GivebackUsdCap > 0,
-            UseVariableGivebackUsdCap = !_cfg.UseNotionalGivebackCap,
             UseNotionalGivebackCap = _cfg.UseNotionalGivebackCap,
             GivebackPctOfNotional = _cfg.GivebackPctOfNotional,
             GivebackUsdCap = _cfg.GivebackUsdCap,
