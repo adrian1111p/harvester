@@ -302,6 +302,23 @@ public static class StrategyComparisonRunner
                 25_000.0,
                 [
                     new StrategyVariant("default", () => new ConductStrategyV3()),
+                    new StrategyVariant("pullback", () => new ConductStrategyV3(new StrategyConfig
+                    {
+                        RiskPerTradeDollars = 40.0,
+                        CooldownBars = 2,
+                        RequireSupertrend = false,        // EMA pullback entries (much more frequent)
+                        RequireMtfAlignment = false,
+                        StrictMissingDataChecks = false,
+                        RvolMin = 0.8,
+                        MaxMaDistAtr = 1.0,
+                        HardStopR = 1.0,
+                        BreakevenR = 0.8,
+                        TrailR = 0.4,
+                        GivebackPct = 0.35,
+                        Tp1R = 1.2,
+                        Tp2R = 2.5,
+                        MaxHoldBars = 120,
+                    })),
                     new StrategyVariant("balanced", () => new ConductStrategyV3(new StrategyConfig
                     {
                         RiskPerTradeDollars = 32.0,
@@ -317,7 +334,7 @@ public static class StrategyComparisonRunner
                         RsiShortRange = (32.0, 65.0),
                         RvolMin = 1.0,
                         PullbackEmaPeriod = 9,
-                        RequireSupertrend = true,
+                        RequireSupertrend = false,        // Allow EMA pullback
                         RequireMtfAlignment = true,
                         HardStopR = 0.9,
                         BreakevenR = 0.6,
@@ -342,13 +359,13 @@ public static class StrategyComparisonRunner
                         MinRiskPerShare = 0.01,
                         CooldownBars = 2,
                         UseNextBarOpenEntry = true,
-                        StrictMissingDataChecks = true,
+                        StrictMissingDataChecks = false,
                         AdxThreshold = 14.0,
                         RsiLongRange = (34.0, 70.0),
                         RsiShortRange = (30.0, 66.0),
-                        RvolMin = 0.9,
+                        RvolMin = 0.7,
                         PullbackEmaPeriod = 9,
-                        RequireSupertrend = true,
+                        RequireSupertrend = false,        // Allow EMA pullback
                         RequireMtfAlignment = false,
                         HardStopR = 0.95,
                         BreakevenR = 0.65,
@@ -363,6 +380,28 @@ public static class StrategyComparisonRunner
                         MaxMaDistAtr = 0.7,
                         SlippageCents = 1.0,
                         CommissionPerShare = 0.005,
+                    })),
+                    new StrategyVariant("vwap-bb", () => new ConductStrategyV3(new StrategyConfig
+                    {
+                        RiskPerTradeDollars = 35.0,
+                        CooldownBars = 2,
+                        RequireSupertrend = false,
+                        RequireMtfAlignment = false,
+                        StrictMissingDataChecks = false,
+                        RvolMin = 0.8,
+                        MaxMaDistAtr = 1.2,
+                        VwapReversionEnabled = true,
+                        VwapStretchAtr = 1.0,
+                        BbBounceEnabled = true,
+                        BbEntryPctbLow = 0.05,
+                        BbEntryPctbHigh = 0.95,
+                        HardStopR = 1.0,
+                        BreakevenR = 0.8,
+                        TrailR = 0.4,
+                        GivebackPct = 0.35,
+                        Tp1R = 1.0,
+                        Tp2R = 2.0,
+                        MaxHoldBars = 100,
                     }))
                 ]),
 

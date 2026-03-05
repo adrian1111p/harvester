@@ -9,6 +9,8 @@ namespace Harvester.App.Backtest.Strategies;
 /// - Uses shared ExitEngine (single source of truth for exits)
 /// - Supports next-bar-open entry and capped position sizing
 /// - Adds optional strict missing-data policy and MTF alignment gating
+/// - Entry time windows and price filter for realistic market-hours-only trading
+/// - Optional VWAP reversion and BB bounce alternate entries
 /// </summary>
 public sealed class ConductStrategyV3 : BacktestStrategyBase
 {
@@ -57,13 +59,21 @@ public sealed class ConductStrategyV3 : BacktestStrategyBase
             if (i - lastSignalBar < Math.Max(0, _cfg.CooldownBars))
                 continue;
 
-            int entryIndex = _cfg.UseNextBarOpenEntry ? i + 1 : i;
-            if (entryIndex >= triggerBars.Length)
-                break;
-
             var row = triggerBars[i];
             var prev = triggerBars[i - 1];
             var ts = row.Bar.Timestamp;
+
+            // ── Time & price filters ──
+            int minuteEt = TradingTime.GetMinuteOfDayEt(ts);
+            if (minuteEt < _cfg.MarketOpenMinute + _cfg.SkipFirstNMinutes) continue;
+            if (!InEntryWindow(minuteEt)) continue;
+
+            double price = row.Bar.Close;
+            if (price < _cfg.MinPrice || price > _cfg.MaxPrice) continue;
+
+            int entryIndex = _cfg.UseNextBarOpenEntry ? i + 1 : i;
+            if (entryIndex >= triggerBars.Length)
+                break;
 
             double atrVal = row.Atr14;
             if (double.IsNaN(atrVal) || atrVal <= 0)
@@ -71,6 +81,30 @@ public sealed class ConductStrategyV3 : BacktestStrategyBase
 
             var htfBias = ComputeHtfBiasAt(ts, bars1h, bars1d);
             var candidates = GetCandidateSides(row, prev, htfBias);
+
+            // ── Alternate entries: VWAP reversion ──
+            if (_cfg.VwapReversionEnabled && candidates.Count == 0)
+            {
+                double vwapVal = row.Vwap;
+                if (!double.IsNaN(vwapVal) && vwapVal > 0)
+                {
+                    double distFromVwap = (price - vwapVal) / atrVal;
+                    if (distFromVwap < -_cfg.VwapStretchAtr && htfBias is HtfBias.Bull or HtfBias.Neutral)
+                        candidates.Add(TradeSide.Long);
+                    else if (distFromVwap > _cfg.VwapStretchAtr && htfBias is HtfBias.Bear or HtfBias.Neutral)
+                        candidates.Add(TradeSide.Short);
+                }
+            }
+
+            // ── Alternate entries: BB bounce ──
+            if (_cfg.BbBounceEnabled && candidates.Count == 0)
+            {
+                double bbPctb = double.IsNaN(row.BbPctB) ? 0.5 : row.BbPctB;
+                if (bbPctb < _cfg.BbEntryPctbLow && htfBias is HtfBias.Bull or HtfBias.Neutral)
+                    candidates.Add(TradeSide.Long);
+                else if (bbPctb > _cfg.BbEntryPctbHigh && htfBias is HtfBias.Bear or HtfBias.Neutral)
+                    candidates.Add(TradeSide.Short);
+            }
 
             foreach (var side in candidates)
             {
@@ -198,6 +232,45 @@ public sealed class ConductStrategyV3 : BacktestStrategyBase
 
     private double ResolvePullbackEma(EnrichedBar row)
         => _cfg.PullbackEmaPeriod <= 9 ? row.Ema9 : row.Ema21;
+
+    private bool InEntryWindow(int minuteEt)
+    {
+        foreach (var (start, end) in _cfg.EntryWindows)
+        {
+            if (minuteEt >= start && minuteEt <= end) return true;
+        }
+        return false;
+    }
+
+    private static class TradingTime
+    {
+        private static readonly TimeZoneInfo _et = ResolveEasternTimeZone();
+
+        private static TimeZoneInfo ResolveEasternTimeZone()
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch { /* ignore */ }
+            try { return TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
+            catch { /* ignore */ }
+            return TimeZoneInfo.Utc;
+        }
+
+        public static DateTime ToEt(DateTime ts)
+        {
+            return ts.Kind switch
+            {
+                DateTimeKind.Utc => TimeZoneInfo.ConvertTimeFromUtc(ts, _et),
+                DateTimeKind.Local => TimeZoneInfo.ConvertTime(ts, _et),
+                _ => ts
+            };
+        }
+
+        public static int GetMinuteOfDayEt(DateTime ts)
+        {
+            var et = ToEt(ts);
+            return et.Hour * 60 + et.Minute;
+        }
+    }
 
     private HtfBias ComputeHtfBiasAt(DateTime ts, EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
     {

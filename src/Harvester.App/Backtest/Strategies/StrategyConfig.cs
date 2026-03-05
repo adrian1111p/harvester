@@ -25,6 +25,20 @@ public sealed class StrategyConfig
     public bool RequireSupertrend { get; set; } = true;
     public bool RequireMtfAlignment { get; set; } = false;
 
+    // ── Price & Time Filters ──
+    public double MinPrice { get; set; } = 10.0;
+    public double MaxPrice { get; set; } = 500.0;
+    public List<(int Start, int End)> EntryWindows { get; set; } = [(570, 780)]; // 9:30-13:00 ET
+    public int SkipFirstNMinutes { get; set; } = 5;
+    public int MarketOpenMinute { get; set; } = 570; // 9:30 ET
+
+    // ── Alternate Entry Modes ──
+    public bool VwapReversionEnabled { get; set; } = false;
+    public double VwapStretchAtr { get; set; } = 1.0;
+    public bool BbBounceEnabled { get; set; } = false;
+    public double BbEntryPctbLow { get; set; } = 0.05;
+    public double BbEntryPctbHigh { get; set; } = 0.95;
+
     // ── Exit Rules ──
     public double HardStopR { get; set; } = 1.0;
     public double BreakevenR { get; set; } = 1.0;
