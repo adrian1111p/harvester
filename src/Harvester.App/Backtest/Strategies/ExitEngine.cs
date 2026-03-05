@@ -25,6 +25,18 @@ public static class ExitEngine
         public double GivebackMinPeakR { get; init; } = 0.0;
         public bool UseFixedGivebackUsdCap { get; init; } = false;
         public double GivebackUsdCap { get; init; } = 30.0;
+        public bool UseVariableGivebackUsdCap { get; init; } = true;
+        public double GivebackCapAnchorLowPrice { get; init; } = 1.0;
+        public double GivebackCapAnchorHighPrice { get; init; } = 300.0;
+        public double GivebackCapAtLowPrice { get; init; } = 8.0;
+        public double GivebackCapAtHighPrice { get; init; } = 30.0;
+        public double GivebackCapMinUsd { get; init; } = 5.0;
+        public double GivebackCapMaxUsd { get; init; } = 60.0;
+        public bool UseTightTrailOnFixedGiveback { get; init; } = true;
+        public double TightTrailAnchorLowPrice { get; init; } = 1.0;
+        public double TightTrailAnchorHighPrice { get; init; } = 300.0;
+        public double TightTrailAtLowPrice { get; init; } = 0.30;
+        public double TightTrailAtHighPrice { get; init; } = 1.00;
 
         // ── Slippage & Commission ──
         public double SlippageCents { get; init; } = 1.0;
@@ -68,6 +80,8 @@ public static class ExitEngine
         // Micro-trail state
         bool microTrailActive = false;
         double microTrailStop = double.NaN;
+        bool tightGivebackTrailActive = false;
+        double tightGivebackStop = double.NaN;
 
         int lastBar = Math.Min(signal.BarIndex + cfg.MaxHoldBars + 1, triggerBars.Length);
 
@@ -96,6 +110,29 @@ public static class ExitEngine
                 exitPrice = stopPrice;
                 exitReason = ExitReason.HardStop;
                 exitBar = j; exited = true; break;
+            }
+
+            if (tightGivebackTrailActive)
+            {
+                double trailPerShare = ComputeTightGivebackTrailPerShare(price, cfg);
+                double candidateStop = side == TradeSide.Long
+                    ? peakPrice - trailPerShare
+                    : troughPrice + trailPerShare;
+
+                if (double.IsNaN(tightGivebackStop))
+                    tightGivebackStop = candidateStop;
+                else if (side == TradeSide.Long)
+                    tightGivebackStop = Math.Max(tightGivebackStop, candidateStop);
+                else
+                    tightGivebackStop = Math.Min(tightGivebackStop, candidateStop);
+
+                if ((side == TradeSide.Long && low <= tightGivebackStop) ||
+                    (side == TradeSide.Short && high >= tightGivebackStop))
+                {
+                    exitPrice = tightGivebackStop;
+                    exitReason = ExitReason.Giveback;
+                    exitBar = j; exited = true; break;
+                }
             }
 
             // ── Unrealised R ──
@@ -258,12 +295,39 @@ public static class ExitEngine
                     ? (price - entryPrice) * posSize
                     : (entryPrice - price) * posSize;
                 double givebackUsd = peakPnlUsd - currentPnlUsd;
+                double effectiveGivebackUsdCap = cfg.UseVariableGivebackUsdCap
+                    ? ComputeVariableGivebackUsdCap(price, cfg)
+                    : cfg.GivebackUsdCap;
 
-                if (currentPnlUsd > 0 && givebackUsd >= cfg.GivebackUsdCap)
+                if (currentPnlUsd > 0 && givebackUsd >= effectiveGivebackUsdCap)
                 {
-                    exitPrice = price;
-                    exitReason = ExitReason.Giveback;
-                    exitBar = j; exited = true; break;
+                    if (!cfg.UseTightTrailOnFixedGiveback)
+                    {
+                        exitPrice = price;
+                        exitReason = ExitReason.Giveback;
+                        exitBar = j; exited = true; break;
+                    }
+
+                    tightGivebackTrailActive = true;
+                    double trailPerShare = ComputeTightGivebackTrailPerShare(price, cfg);
+                    double candidateStop = side == TradeSide.Long
+                        ? peakPrice - trailPerShare
+                        : troughPrice + trailPerShare;
+
+                    if (double.IsNaN(tightGivebackStop))
+                        tightGivebackStop = candidateStop;
+                    else if (side == TradeSide.Long)
+                        tightGivebackStop = Math.Max(tightGivebackStop, candidateStop);
+                    else
+                        tightGivebackStop = Math.Min(tightGivebackStop, candidateStop);
+
+                    if ((side == TradeSide.Long && low <= tightGivebackStop) ||
+                        (side == TradeSide.Short && high >= tightGivebackStop))
+                    {
+                        exitPrice = tightGivebackStop;
+                        exitReason = ExitReason.Giveback;
+                        exitBar = j; exited = true; break;
+                    }
                 }
             }
 
@@ -328,5 +392,44 @@ public static class ExitEngine
             ExitReason: exitReason,
             PeakR: finalPeakR,
             BarsHeld: exitBar - signal.BarIndex);
+    }
+
+    private static double ComputeTightGivebackTrailPerShare(double price, ExitConfig cfg)
+    {
+        double lowPrice = Math.Max(0.01, cfg.TightTrailAnchorLowPrice);
+        double highPrice = Math.Max(lowPrice + 0.01, cfg.TightTrailAnchorHighPrice);
+        double lowTrail = Math.Max(0.01, cfg.TightTrailAtLowPrice);
+        double highTrail = Math.Max(0.01, cfg.TightTrailAtHighPrice);
+
+        double clampedPrice = Math.Clamp(price, lowPrice, highPrice);
+
+        double logLo = Math.Log(lowPrice);
+        double logHi = Math.Log(highPrice);
+        double logPx = Math.Log(clampedPrice);
+
+        double t = (logPx - logLo) / Math.Max(1e-9, logHi - logLo);
+        double trail = lowTrail + (highTrail - lowTrail) * t;
+
+        return Math.Max(0.01, trail);
+    }
+
+    private static double ComputeVariableGivebackUsdCap(double price, ExitConfig cfg)
+    {
+        double lowPrice = Math.Max(0.01, cfg.GivebackCapAnchorLowPrice);
+        double highPrice = Math.Max(lowPrice + 0.01, cfg.GivebackCapAnchorHighPrice);
+        double lowCap = Math.Max(0.01, cfg.GivebackCapAtLowPrice);
+        double highCap = Math.Max(0.01, cfg.GivebackCapAtHighPrice);
+        double capMin = Math.Max(0.01, Math.Min(cfg.GivebackCapMinUsd, cfg.GivebackCapMaxUsd));
+        double capMax = Math.Max(capMin, Math.Max(cfg.GivebackCapMinUsd, cfg.GivebackCapMaxUsd));
+
+        double clampedPrice = Math.Clamp(price, lowPrice, highPrice);
+
+        double logLo = Math.Log(lowPrice);
+        double logHi = Math.Log(highPrice);
+        double logPx = Math.Log(clampedPrice);
+        double t = (logPx - logLo) / Math.Max(1e-9, logHi - logLo);
+
+        double cap = lowCap + (highCap - lowCap) * t;
+        return Math.Clamp(cap, capMin, capMax);
     }
 }

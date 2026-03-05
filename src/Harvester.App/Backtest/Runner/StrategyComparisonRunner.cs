@@ -18,6 +18,17 @@ public sealed record StrategyComparisonRow(
 
 public static class StrategyComparisonRunner
 {
+    private static readonly HashSet<string> ArchivedStrategyPlans =
+    [
+        "V1-First",
+        "V2-Conduct",
+        "V4",
+        "V5",
+        "V7",
+        "V8",
+        "V9",
+    ];
+
     public static List<StrategyComparisonRow> RunAll(
         string[]? symbols = null,
         int minTrades = 50,
@@ -47,7 +58,9 @@ public static class StrategyComparisonRunner
 
         var rows = new List<StrategyComparisonRow>();
 
-        var plans = BuildPlans();
+        var plans = BuildPlans()
+            .Where(p => !ArchivedStrategyPlans.Contains(p.Name))
+            .ToList();
         foreach (var plan in plans)
         {
             var best = EvaluatePlan(plan, allData, minTrades);
@@ -1077,6 +1090,159 @@ public static class StrategyComparisonRunner
                         MaxHoldBars = 35,
                         EntryWindows = [(585, 690), (810, 930)],
                         AccountSize = 25_000.0,
+                    }))
+                ]),
+
+            new StrategyPlan(
+                "V11",
+                25_000.0,
+                [
+                    new StrategyVariant("default", () => new StrategyV11(new V11Config
+                    {
+                        RiskPerTradeDollars = 28.0,
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.20,
+                        MaxShares = 7000,
+                        CooldownBars = 2,
+                        RvolMin = 0.78,
+                        L2LiquidityMin = 18.0,
+                        SpreadZMax = 2.2,
+                        VolAccelMin = -0.30,
+                        BbLongThreshold = 0.14,
+                        BbShortThreshold = 0.86,
+                        VwapDeviationAtr = 0.50,
+                        RsiLongMax = 40.0,
+                        RsiShortMin = 60.0,
+                        AdxMin = 10.0,
+                        AdxMax = 38.0,
+                        MinScore = 4,
+                        HardStopR = 0.85,
+                        BreakevenR = 0.38,
+                        TrailR = 0.24,
+                        GivebackPct = 0.20,
+                        Tp1R = 0.50,
+                        Tp2R = 0.95,
+                        MaxHoldBars = 22,
+                        UseFixedGivebackUsdCap = true,
+                        UseVariableGivebackUsdCap = true,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("active-quality", () => new StrategyV11(new V11Config
+                    {
+                        RiskPerTradeDollars = 30.0,
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.20,
+                        MaxShares = 7000,
+                        CooldownBars = 1,
+                        RvolMin = 0.72,
+                        L2LiquidityMin = 16.0,
+                        SpreadZMax = 2.4,
+                        VolAccelMin = -0.35,
+                        BbLongThreshold = 0.15,
+                        BbShortThreshold = 0.85,
+                        VwapDeviationAtr = 0.46,
+                        RsiLongMax = 41.0,
+                        RsiShortMin = 59.0,
+                        AdxMin = 9.0,
+                        AdxMax = 40.0,
+                        MinScore = 4,
+                        HardStopR = 0.88,
+                        BreakevenR = 0.40,
+                        TrailR = 0.25,
+                        GivebackPct = 0.22,
+                        Tp1R = 0.55,
+                        Tp2R = 1.00,
+                        MaxHoldBars = 24,
+                        UseFixedGivebackUsdCap = true,
+                        UseVariableGivebackUsdCap = true,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("balanced", () => new StrategyV11(new V11Config
+                    {
+                        RiskPerTradeDollars = 30.0,
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.18,
+                        MaxShares = 6000,
+                        CooldownBars = 5,
+                        RvolMin = 0.95,
+                        L2LiquidityMin = 24.0,
+                        SpreadZMax = 1.9,
+                        VolAccelMin = -0.10,
+                        BbLongThreshold = 0.10,
+                        BbShortThreshold = 0.90,
+                        VwapDeviationAtr = 0.70,
+                        RsiLongMax = 37.0,
+                        RsiShortMin = 63.0,
+                        AdxMin = 12.0,
+                        AdxMax = 34.0,
+                        MinScore = 5,
+                        HardStopR = 0.82,
+                        BreakevenR = 0.40,
+                        TrailR = 0.25,
+                        GivebackPct = 0.20,
+                        Tp1R = 0.60,
+                        Tp2R = 1.10,
+                        MaxHoldBars = 22,
+                        UseFixedGivebackUsdCap = true,
+                        UseVariableGivebackUsdCap = true,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("short-edge", () => new StrategyV11(new V11Config
+                    {
+                        RiskPerTradeDollars = 32.0,
+                        AllowLong = false,
+                        AllowShort = true,
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.18,
+                        MaxShares = 6000,
+                        CooldownBars = 4,
+                        RvolMin = 0.90,
+                        L2LiquidityMin = 20.0,
+                        SpreadZMax = 2.0,
+                        VolAccelMin = -0.20,
+                        BbShortThreshold = 0.90,
+                        VwapDeviationAtr = 0.60,
+                        RsiShortMin = 62.0,
+                        MinScore = 5,
+                        HardStopR = 0.82,
+                        BreakevenR = 0.40,
+                        TrailR = 0.25,
+                        GivebackPct = 0.20,
+                        Tp1R = 0.60,
+                        Tp2R = 1.10,
+                        MaxHoldBars = 22,
+                        UseFixedGivebackUsdCap = true,
+                        UseVariableGivebackUsdCap = true,
+                        GivebackUsdCap = 30.0,
+                    })),
+                    new StrategyVariant("defensive", () => new StrategyV11(new V11Config
+                    {
+                        RiskPerTradeDollars = 20.0,
+                        AccountSize = 25_000.0,
+                        MaxPositionNotionalPctOfAccount = 0.16,
+                        MaxShares = 5000,
+                        RvolMin = 0.90,
+                        L2LiquidityMin = 24.0,
+                        SpreadZMax = 2.0,
+                        VolAccelMin = -0.15,
+                        BbLongThreshold = 0.14,
+                        BbShortThreshold = 0.86,
+                        VwapDeviationAtr = 0.50,
+                        RsiLongMax = 38.0,
+                        RsiShortMin = 62.0,
+                        AdxMin = 10.0,
+                        AdxMax = 38.0,
+                        MinScore = 5,
+                        HardStopR = 0.80,
+                        BreakevenR = 0.45,
+                        TrailR = 0.28,
+                        GivebackPct = 0.22,
+                        Tp1R = 0.70,
+                        Tp2R = 1.20,
+                        MaxHoldBars = 26,
+                        UseFixedGivebackUsdCap = true,
+                        UseVariableGivebackUsdCap = true,
+                        GivebackUsdCap = 30.0,
                     }))
                 ]),
         ];
