@@ -74,6 +74,7 @@ public sealed class StrategyV10 : BacktestStrategyBase
             GivebackPct = _cfg.GivebackPct,
             GivebackMinPeakR = 0.20,
             UseFixedGivebackUsdCap = true,
+            UseVariableGivebackUsdCap = true,
             GivebackUsdCap = 30.0,
             Tp1R = _cfg.Tp1R,
             Tp2R = _cfg.Tp2R,

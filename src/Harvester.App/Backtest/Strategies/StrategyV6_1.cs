@@ -103,6 +103,7 @@ public sealed class StrategyV6_1 : BacktestStrategyBase
             GivebackPct = _cfg.GivebackPct,
             GivebackMinPeakR = 0.0,
             UseFixedGivebackUsdCap = true,
+            UseVariableGivebackUsdCap = true,
             GivebackUsdCap = 30.0,
             Tp1R = _cfg.Tp1R,
             Tp2R = _cfg.Tp2R,
@@ -110,7 +111,7 @@ public sealed class StrategyV6_1 : BacktestStrategyBase
             SlippageCents = _cfg.SlippageCents,
             CommissionPerShare = _cfg.CommissionPerShare,
             DeductCommission = true,   // fixed: deduct commission consistently
-            Tp1TightenToBe = false,
+            Tp1TightenToBe = true,
             ReversalFlatten = _cfg.ReversalFlatten,
             MicroTrail = true,
             MicroTrailCents = _cfg.MicroTrailCents,
