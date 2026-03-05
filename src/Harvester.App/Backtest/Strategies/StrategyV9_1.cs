@@ -130,8 +130,6 @@ public sealed class StrategyV9_1 : BacktestStrategyBase
         var signals = new List<BacktestSignal>();
         if (triggerBars.Length < 80) return signals;
 
-        string htfBias = ComputeHtfBias(bars1h, bars1d);
-
         for (int i = 60; i < triggerBars.Length; i++)
         {
             var row = triggerBars[i];
@@ -150,6 +148,9 @@ public sealed class StrategyV9_1 : BacktestStrategyBase
             int minuteEt = TradingTime.GetMinuteOfDayEt(row.Bar.Timestamp);
             if (minuteEt < _cfg.MarketOpenMinute + _cfg.SkipFirstNMinutes) continue;
             if (!InEntryWindow(minuteEt)) continue;
+
+            // Compute HTF bias per-bar (no lookahead)
+            string htfBias = ComputeHtfBias(row.Bar.Timestamp, bars1h, bars1d);
 
             // ---- Conservative missing-data policy for critical filters ----
             if (double.IsNaN(row.Rvol) || row.Rvol < _cfg.RvolMin) continue;
@@ -352,13 +353,15 @@ public sealed class StrategyV9_1 : BacktestStrategyBase
         return false;
     }
 
-    private static string ComputeHtfBias(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
+    private static string ComputeHtfBias(DateTime ts, EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
     {
         var scores = new List<int>();
         foreach (var bars in new[] { bars1h, bars1d })
         {
-            if (bars == null || bars.Length < 30) continue;
-            var last = bars[^1];
+            if (bars == null || bars.Length < 2) continue;
+            int idx = FindAsOfIndex(bars, ts);
+            if (idx < 0) continue;
+            var last = bars[idx];
 
             int s = 0;
             s += last.Ema21 > last.Ema50 ? 1 : -1;

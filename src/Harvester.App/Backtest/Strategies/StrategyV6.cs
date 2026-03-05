@@ -99,7 +99,6 @@ public sealed class StrategyV6 : BacktestStrategyBase
         EnrichedBar[]? bars1d = null)
     {
         var signals = new List<BacktestSignal>();
-        string htfBias = HtfBiasHelper(bars1h, bars1d);
 
         // Group bars by trading day and compute opening ranges
         var dayGroups = GroupByTradingDay(triggerBars);
@@ -130,6 +129,9 @@ public sealed class StrategyV6 : BacktestStrategyBase
                 // Time window check
                 int minuteOfDay = GetMinuteOfDay(row.Bar.Timestamp);
                 if (!InEntryWindow(minuteOfDay)) continue;
+
+                // Compute HTF bias per-bar (no lookahead)
+                string htfBias = HtfBiasAtTime(row.Bar.Timestamp, bars1h, bars1d);
 
                 // 20MA distance
                 if (double.IsNaN(row.Sma20)) continue;
@@ -283,13 +285,15 @@ public sealed class StrategyV6 : BacktestStrategyBase
         return false;
     }
 
-    private static string HtfBiasHelper(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
+    private static string HtfBiasAtTime(DateTime ts, EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
     {
         var scores = new List<int>();
         foreach (var bars in new[] { bars1h, bars1d })
         {
-            if (bars == null || bars.Length < 30) continue;
-            var last = bars[^1];
+            if (bars == null || bars.Length < 2) continue;
+            int idx = FindBarAtOrBefore(bars, ts);
+            if (idx < 0) continue;
+            var last = bars[idx];
             int vote = last.Bar.Close > last.Ema21 ? 1 : -1;
             scores.Add(vote);
         }
@@ -298,6 +302,18 @@ public sealed class StrategyV6 : BacktestStrategyBase
         if (avg >= 0.5) return "BULL";
         if (avg <= -0.5) return "BEAR";
         return "NEUTRAL";
+    }
+
+    private static int FindBarAtOrBefore(EnrichedBar[] bars, DateTime ts)
+    {
+        int lo = 0, hi = bars.Length - 1, best = -1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (bars[mid].Bar.Timestamp <= ts) { best = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return best;
     }
 }
 

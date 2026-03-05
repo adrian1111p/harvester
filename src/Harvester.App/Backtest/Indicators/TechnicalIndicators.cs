@@ -216,15 +216,24 @@ public static class TechnicalIndicators
 
     // ── VWAP ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Cumulative VWAP (assumes single session).</summary>
+    /// <summary>Session-anchored VWAP – resets each trading day.</summary>
     public static double[] Vwap(BacktestBar[] bars)
     {
         var result = new double[bars.Length];
         double cumTpVol = 0;
         double cumVol = 0;
+        DateOnly prevDate = default;
 
         for (int i = 0; i < bars.Length; i++)
         {
+            var curDate = DateOnly.FromDateTime(bars[i].Timestamp);
+            if (curDate != prevDate)
+            {
+                cumTpVol = 0;
+                cumVol = 0;
+                prevDate = curDate;
+            }
+
             double typical = (bars[i].High + bars[i].Low + bars[i].Close) / 3.0;
             cumTpVol += typical * bars[i].Volume;
             cumVol += bars[i].Volume;

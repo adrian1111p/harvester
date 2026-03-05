@@ -90,7 +90,6 @@ public sealed class StrategyV3 : BacktestStrategyBase
         EnrichedBar[]? bars1d = null)
     {
         var signals = new List<BacktestSignal>();
-        string htfBias = HtfGuard(bars1h, bars1d);
         int squeezeCount = 0;
 
         for (int i = 50; i < triggerBars.Length; i++)
@@ -98,6 +97,9 @@ public sealed class StrategyV3 : BacktestStrategyBase
             var row = triggerBars[i];
             double atrVal = row.Atr14;
             if (double.IsNaN(atrVal) || atrVal <= 0) continue;
+
+            // Compute HTF bias per-bar (no lookahead)
+            string htfBias = HtfGuardAtTime(row.Bar.Timestamp, bars1h, bars1d);
 
             double price = row.Bar.Close;
 
@@ -229,14 +231,16 @@ public sealed class StrategyV3 : BacktestStrategyBase
     public override BacktestTradeResult? SimulateTrade(BacktestSignal signal, EnrichedBar[] triggerBars)
         => ExitEngine.SimulateTrade(signal, triggerBars, _exitCfg);
 
-    private static string HtfGuard(EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
+    private static string HtfGuardAtTime(DateTime ts, EnrichedBar[]? bars1h, EnrichedBar[]? bars1d)
     {
         var scores = new List<int>();
         foreach (var bars in new[] { bars1h, bars1d })
         {
-            if (bars == null || bars.Length < 30) continue;
-            var last = bars[^1];
-            var prev = bars[^2];
+            if (bars == null || bars.Length < 2) continue;
+            int idx = FindBarAtOrBefore(bars, ts);
+            if (idx < 1) continue;  // need at least 2 bars for slope
+            var last = bars[idx];
+            var prev = bars[idx - 1];
             int slope = last.Ema21 > prev.Ema21 ? 1 : -1;
             if (!double.IsNaN(last.Rsi14))
             {
@@ -250,6 +254,18 @@ public sealed class StrategyV3 : BacktestStrategyBase
         if (avg >= 2) return "STRONG_BULL";
         if (avg <= -2) return "STRONG_BEAR";
         return "NEUTRAL";
+    }
+
+    private static int FindBarAtOrBefore(EnrichedBar[] bars, DateTime ts)
+    {
+        int lo = 0, hi = bars.Length - 1, best = -1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (bars[mid].Bar.Timestamp <= ts) { best = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return best;
     }
 }
 

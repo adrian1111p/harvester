@@ -100,16 +100,16 @@ public static class ExitEngine
             else
                 troughPrice = Math.Min(troughPrice, low);
 
-            // ── Priority 1: Hard stop ──
+            // ── Priority 1: Hard stop (handle gap-through: fill at worse of open vs stop) ──
             if (side == TradeSide.Long && low <= stopPrice)
             {
-                exitPrice = stopPrice;
+                exitPrice = Math.Min(bar.Open, stopPrice);
                 exitReason = ExitReason.HardStop;
                 exitBar = j; exited = true; break;
             }
             if (side == TradeSide.Short && high >= stopPrice)
             {
-                exitPrice = stopPrice;
+                exitPrice = Math.Max(bar.Open, stopPrice);
                 exitReason = ExitReason.HardStop;
                 exitBar = j; exited = true; break;
             }
@@ -141,6 +141,12 @@ public static class ExitEngine
             double unrealizedR = side == TradeSide.Long
                 ? (price - entryPrice) / riskPerShare
                 : (entryPrice - price) / riskPerShare;
+
+            // Best intra-bar unrealised R (uses H/L for TP detection)
+            double bestUnrealizedR = side == TradeSide.Long
+                ? (high - entryPrice) / riskPerShare
+                : (entryPrice - low) / riskPerShare;
+
             double peakR = side == TradeSide.Long
                 ? (peakPrice - entryPrice) / riskPerShare
                 : (entryPrice - troughPrice) / riskPerShare;
@@ -165,16 +171,18 @@ public static class ExitEngine
                 }
             }
 
-            // ── TP2 (full close) ──
-            if (unrealizedR >= cfg.Tp2R)
+            // ── TP2 (full close) — use intra-bar H/L, fill at exact TP level ──
+            if (bestUnrealizedR >= cfg.Tp2R)
             {
-                exitPrice = price;
+                exitPrice = side == TradeSide.Long
+                    ? entryPrice + cfg.Tp2R * riskPerShare
+                    : entryPrice - cfg.Tp2R * riskPerShare;
                 exitReason = ExitReason.Tp2;
                 exitBar = j; exited = true; break;
             }
 
             // ── TP1 scale-out → tighten to BE ──
-            if (cfg.Tp1TightenToBe && unrealizedR >= cfg.Tp1R && !beActivated)
+            if (cfg.Tp1TightenToBe && bestUnrealizedR >= cfg.Tp1R && !beActivated)
             {
                 beActivated = true;
                 if (side == TradeSide.Long)
@@ -190,7 +198,7 @@ public static class ExitEngine
             }
 
             // ── Break-even ──
-            if (!beActivated && unrealizedR >= cfg.BreakevenR)
+            if (!beActivated && bestUnrealizedR >= cfg.BreakevenR)
             {
                 beActivated = true;
                 if (side == TradeSide.Long)
