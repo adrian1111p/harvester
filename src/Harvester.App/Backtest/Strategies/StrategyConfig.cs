@@ -9,6 +9,12 @@ public sealed class StrategyConfig
     // ── Risk Sizing ──
     public double RiskPerTradeDollars { get; set; } = 50.0;
     public double AccountSize { get; set; } = 25_000.0;
+    public double MaxPositionNotionalPctOfAccount { get; set; } = 0.25;
+    public int MaxShares { get; set; } = 10_000;
+    public double MinRiskPerShare { get; set; } = 0.01;
+    public int CooldownBars { get; set; } = 1;
+    public bool UseNextBarOpenEntry { get; set; } = true;
+    public bool StrictMissingDataChecks { get; set; } = true;
 
     // ── Entry Filters ──
     public double AdxThreshold { get; set; } = 20.0;
@@ -17,6 +23,7 @@ public sealed class StrategyConfig
     public double RvolMin { get; set; } = 1.3;
     public int PullbackEmaPeriod { get; set; } = 9;
     public bool RequireSupertrend { get; set; } = true;
+    public bool RequireMtfAlignment { get; set; } = false;
 
     // ── Exit Rules ──
     public double HardStopR { get; set; } = 1.0;

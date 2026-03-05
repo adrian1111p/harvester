@@ -49,7 +49,7 @@ public static class QuickScanner
     /// </summary>
     public static readonly (string Name, Func<IBacktestStrategy> Factory)[] Strategies =
     [
-        ("Trend-V1.3", () => new ConductStrategyV2(new StrategyConfig
+        ("Trend-V1.3", () => new ConductStrategyV3(new StrategyConfig
         {
             RiskPerTradeDollars = 50.0,
             TrailR = 1.5, GivebackPct = 0.70, Tp1R = 2.0, Tp2R = 4.0,

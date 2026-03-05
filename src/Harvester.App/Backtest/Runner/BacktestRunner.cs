@@ -123,7 +123,7 @@ public static class BacktestRunner
     {
         var syms = symbols ?? DefaultSymbols;
         var cfg = OptimizedConfig();
-        var strategy = new ConductStrategyV2(cfg);
+        var strategy = new ConductStrategyV3(cfg);
         return RunAll(syms, strategy, cfg, log);
     }
 

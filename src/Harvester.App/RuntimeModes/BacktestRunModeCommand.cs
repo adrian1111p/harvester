@@ -44,7 +44,7 @@ public sealed class BacktestRunModeCommand : IRunModeCommand
                     firstCfg.GivebackUsdCap = 30.0;
 
                     Console.WriteLine("Profile: FIRST (giveback=min(1% of notional, $30))");
-                    var firstStrategy = new ConductStrategyV2(firstCfg);
+                    var firstStrategy = new ConductStrategyV3(firstCfg);
                     var results = BacktestRunner.RunAll(backtestSymbols, firstStrategy, firstCfg);
                     BacktestRunner.PrintVerdict(results);
                 }

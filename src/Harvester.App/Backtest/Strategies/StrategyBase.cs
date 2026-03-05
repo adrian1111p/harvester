@@ -33,18 +33,18 @@ public abstract class BacktestStrategyBase : IBacktestStrategy
 }
 
 /// <summary>
-/// Shared adapter base for strategy versions that delegate to <see cref="ConductStrategyV2"/>.
+/// Shared adapter base for strategy versions that delegate to <see cref="ConductStrategyV3"/>.
 /// </summary>
 public abstract class ConductStrategyAdapterBase : IBacktestStrategy
 {
-    private readonly ConductStrategyV2 _inner;
+    private readonly ConductStrategyV3 _inner;
 
     public StrategyConfig Config { get; }
 
     protected ConductStrategyAdapterBase(StrategyConfig? cfg, Func<StrategyConfig> defaultConfigFactory)
     {
         Config = cfg ?? defaultConfigFactory();
-        _inner = new ConductStrategyV2(Config);
+        _inner = new ConductStrategyV3(Config);
     }
 
     public IReadOnlyList<BacktestSignal> GenerateSignals(

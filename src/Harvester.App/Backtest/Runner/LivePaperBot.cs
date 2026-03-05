@@ -560,13 +560,13 @@ public sealed class LivePaperBot
 
     private static IBacktestStrategy CreateStrategy(LiveStrategyType stratType) => stratType switch
     {
-        LiveStrategyType.TrendV13 => new ConductStrategyV2(CfgTrend),
+        LiveStrategyType.TrendV13 => new ConductStrategyV3(CfgTrend),
         LiveStrategyType.V3Balanced => new StrategyV3(CfgV3),
         LiveStrategyType.V4ExhRunner => new StrategyV4(CfgV4ExhRunner),
         LiveStrategyType.V4ExhBase => new StrategyV4(CfgV4ExhBase),
         LiveStrategyType.V5PullbackVwap => new StrategyV5(CfgV5PullbackVwap),
         LiveStrategyType.V5Tight => new StrategyV5(CfgV5Tight),
-        _ => new ConductStrategyV2(CfgTrend),
+        _ => new ConductStrategyV3(CfgTrend),
     };
 
     private static (double Stop, double Trail, double Tp1, double Tp2, double Be, double Giveback, V5Config? V5, int MaxMinutes)

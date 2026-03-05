@@ -24,6 +24,8 @@ public static class ExitEngine
         // ── Giveback threshold (minimum peak_r before checking giveback) ──
         public double GivebackMinPeakR { get; init; } = 0.0;
         public bool UseFixedGivebackUsdCap { get; init; } = false;
+        public bool UseNotionalGivebackCap { get; init; } = false;
+        public double GivebackPctOfNotional { get; init; } = 0.01;
         public double GivebackUsdCap { get; init; } = 30.0;
         public bool UseVariableGivebackUsdCap { get; init; } = true;
         public double GivebackCapAnchorLowPrice { get; init; } = 1.0;
@@ -286,8 +288,27 @@ public static class ExitEngine
             }
 
             // ── Giveback from peak (fixed USD cap mode) ──
-            if (cfg.UseFixedGivebackUsdCap && cfg.GivebackUsdCap > 0)
+            if ((cfg.UseFixedGivebackUsdCap && cfg.GivebackUsdCap > 0) || cfg.UseNotionalGivebackCap)
             {
+                double effectiveGivebackUsdCap;
+                if (cfg.UseNotionalGivebackCap)
+                {
+                    double positionNotional = Math.Abs(entryPrice * posSize);
+                    double notionalCap = Math.Max(0.0, cfg.GivebackPctOfNotional * positionNotional);
+                    effectiveGivebackUsdCap = cfg.GivebackUsdCap > 0
+                        ? Math.Min(notionalCap, cfg.GivebackUsdCap)
+                        : notionalCap;
+                }
+                else
+                {
+                    effectiveGivebackUsdCap = cfg.UseVariableGivebackUsdCap
+                        ? ComputeVariableGivebackUsdCap(price, cfg)
+                        : cfg.GivebackUsdCap;
+                }
+
+                if (effectiveGivebackUsdCap <= 0)
+                    continue;
+
                 double peakPnlUsd = side == TradeSide.Long
                     ? (peakPrice - entryPrice) * posSize
                     : (entryPrice - troughPrice) * posSize;
@@ -295,9 +316,6 @@ public static class ExitEngine
                     ? (price - entryPrice) * posSize
                     : (entryPrice - price) * posSize;
                 double givebackUsd = peakPnlUsd - currentPnlUsd;
-                double effectiveGivebackUsdCap = cfg.UseVariableGivebackUsdCap
-                    ? ComputeVariableGivebackUsdCap(price, cfg)
-                    : cfg.GivebackUsdCap;
 
                 if (currentPnlUsd > 0 && givebackUsd >= effectiveGivebackUsdCap)
                 {

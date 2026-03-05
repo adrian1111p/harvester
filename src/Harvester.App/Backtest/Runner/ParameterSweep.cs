@@ -182,7 +182,7 @@ public static class ParameterSweep
         for (int i = 0; i < configs.Count; i++)
         {
             var cfg = configs[i];
-            var strategy = new ConductStrategyV2(cfg);
+            var strategy = new ConductStrategyV3(cfg);
             var allTrades = new List<BacktestTradeResult>();
             var symPnls = new Dictionary<string, double>();
 
