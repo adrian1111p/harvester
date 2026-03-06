@@ -931,11 +931,15 @@ public sealed partial class SnapshotRuntime
         Console.WriteLine($"[OK] Positions monitor loop open-orders export: {openOrdersPath} (rows={_wrapper.OpenOrders.Count})");
     }
 
+    private int _scannerHistoryReqIdSeed = 19100;
+    private readonly UsEquitiesExchangeCalendarService _exchangeCalendar = new();
+
     private async Task RunPositionsAutoReplaceScanLoopMode(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
     {
         EnsureSteadyStateForOrderRoute(nameof(RunPositionsAutoReplaceScanLoopMode));
 
-        const int maxTradesPerRun = 8;
+        const int maxTradesPerWindow = 8;
+        const int historyBatchSize = 20;
         var scannerRefreshInterval = TimeSpan.FromMinutes(15);
 
         var allowed = _options.AllowedSymbols
@@ -953,15 +957,15 @@ public sealed partial class SnapshotRuntime
             .ToArray();
         var desiredSlots = Math.Clamp(_options.LiveScannerTopN, 5, 8);
         var targetSlots = initialPlans.Length > 0
-            ? Math.Clamp(initialPlans.Length, 1, 8)
+            ? Math.Clamp(initialPlans.Length, 1, desiredSlots)
             : Math.Min(desiredSlots, allowed.Count);
 
         DateTime nextScannerRefreshUtc = DateTime.MinValue;
         Queue<ScannerReplacementCandidate> replacementCandidates = new();
-        var placedTrades = 0;
+        var windowPlacedTrades = 0;
 
-        Console.WriteLine($"[INFO] Auto-replace loop: allowedSymbols={allowed.Count} targetSlots={targetSlots}.");
-        Console.WriteLine($"[INFO] Auto-replace loop: scanner-refresh={scannerRefreshInterval.TotalMinutes:F0}m history-batch-size=20 max-trades={maxTradesPerRun}.");
+        Console.WriteLine($"[INFO] Auto-replace loop: allowedSymbols={allowed.Count} targetSlots={targetSlots} desiredSlots={desiredSlots}.");
+        Console.WriteLine($"[INFO] Auto-replace loop: scanner-refresh={scannerRefreshInterval.TotalMinutes:F0}m history-batch-size={historyBatchSize} max-trades-per-window={maxTradesPerWindow}.");
 
         var previousBySymbol = initialPlans
             .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
@@ -992,7 +996,8 @@ public sealed partial class SnapshotRuntime
                 }
 
                 var nowUtc = DateTime.UtcNow;
-                if (nowUtc >= nextScannerRefreshUtc || replacementCandidates.Count == 0)
+                var isRefreshDue = nowUtc >= nextScannerRefreshUtc || replacementCandidates.Count == 0;
+                if (isRefreshDue)
                 {
                     var excludedForRefresh = new HashSet<string>(currentSymbols, StringComparer.OrdinalIgnoreCase);
                     foreach (var closedSymbol in closedSymbols)
@@ -1005,11 +1010,13 @@ public sealed partial class SnapshotRuntime
                         brokerAdapter,
                         allowed,
                         excludedForRefresh,
+                        historyBatchSize,
                         token);
                     replacementCandidates = new Queue<ScannerReplacementCandidate>(refreshed);
                     nextScannerRefreshUtc = nowUtc.Add(scannerRefreshInterval);
+                    windowPlacedTrades = 0;
 
-                    Console.WriteLine($"[INFO] Auto-replace loop: scanner refresh produced {refreshed.Length} candidate(s); next refresh at {nextScannerRefreshUtc:O}.");
+                    Console.WriteLine($"[INFO] Auto-replace loop: scanner refresh produced {refreshed.Length} candidate(s); windowTrades reset; next refresh at {nextScannerRefreshUtc:O}.");
                 }
 
                 var replacementQuantityQueue = new Queue<double>(
@@ -1027,9 +1034,9 @@ public sealed partial class SnapshotRuntime
 
                 for (var slot = 0; slot < missingSlots && !token.IsCancellationRequested; slot++)
                 {
-                    if (placedTrades >= maxTradesPerRun)
+                    if (windowPlacedTrades >= maxTradesPerWindow)
                     {
-                        Console.WriteLine($"[WARN] Auto-replace loop: max trade cap reached ({maxTradesPerRun}); no further entries will be placed this run.");
+                        Console.WriteLine($"[WARN] Auto-replace loop: max trade cap reached ({windowPlacedTrades}/{maxTradesPerWindow}) for this scanner window; waiting for next refresh.");
                         break;
                     }
 
@@ -1087,7 +1094,8 @@ public sealed partial class SnapshotRuntime
                             nameof(RunPositionsAutoReplaceScanLoopMode),
                             token,
                             quoteRequestSeed: 12917 + (cycle * 100) + (slot * 10));
-                        placedTrades++;
+                        windowPlacedTrades++;
+                        Console.WriteLine($"[INFO] Auto-replace loop: windowPlacedTrades={windowPlacedTrades}/{maxTradesPerWindow}.");
                     }
                     catch (Exception ex)
                     {
@@ -1114,19 +1122,29 @@ public sealed partial class SnapshotRuntime
         }
     }
 
+    /// <summary>
+    /// Loads scanner Excel lists for the current market phase, filters candidates by eligibility/score/allowed-list,
+    /// probes IBKR historical data in batches, and returns the top N candidates ranked by weighted score + average volume.
+    /// </summary>
     private async Task<ScannerReplacementCandidate[]> BuildScannerReplacementCandidatesAsync(
         EClientSocket client,
         IBrokerAdapter brokerAdapter,
         IReadOnlySet<string> allowedSymbols,
         IReadOnlySet<string> excludedSymbols,
+        int historyBatchSize,
         CancellationToken token)
     {
-        var scannerRows = LoadConfiguredScannerRowsForCurrentPhase();
+        var (scannerRows, phaseTag) = LoadConfiguredScannerRowsForCurrentPhase();
         if (scannerRows.Length == 0)
         {
+            Console.WriteLine("[INFO] BuildScannerCandidates: no scanner rows loaded for current phase.");
             return [];
         }
 
+        Console.WriteLine($"[INFO] BuildScannerCandidates: loaded {scannerRows.Length} raw rows from phase={phaseTag}.");
+
+        // Normalize, deduplicate, and pre-filter candidates
+        var maxPreFilterCandidates = Math.Max(historyBatchSize, Math.Min(200, scannerRows.Length));
         var filteredRows = scannerRows
             .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
             .Select(x => new LiveScannerCandidateRow
@@ -1150,18 +1168,22 @@ public sealed partial class SnapshotRuntime
                 .First())
             .OrderByDescending(x => x.WeightedScore)
             .ThenBy(x => x.AverageRank)
-            .Take(400)
+            .Take(maxPreFilterCandidates)
             .ToArray();
 
         if (filteredRows.Length == 0)
         {
+            Console.WriteLine("[INFO] BuildScannerCandidates: all rows filtered out after eligibility/score/allowed check.");
             return [];
         }
+
+        Console.WriteLine($"[INFO] BuildScannerCandidates: {filteredRows.Length} candidates passed pre-filter; probing history in batches of {historyBatchSize}.");
 
         var historyMetrics = await LoadHistoryMetricsInBatchesAsync(
             client,
             brokerAdapter,
             filteredRows.Select(x => x.Symbol).ToArray(),
+            historyBatchSize,
             token);
 
         var targetCount = Math.Min(Math.Clamp(_options.LiveScannerTopN, 5, 8), filteredRows.Length);
@@ -1177,14 +1199,21 @@ public sealed partial class SnapshotRuntime
             .Take(targetCount)
             .Select(x => new ScannerReplacementCandidate(
                 x.Symbol,
-                SeedLimitPrice: x.Ask > 0 ? x.Ask : (x.Mark > 0 ? x.Mark : (x.Bid > 0 ? x.Bid : Math.Max(0.01, _options.LiveLimitPrice))),
-                SourceTag: "excel-history-filtered"))
+                SeedLimitPrice: ResolveSeedLimitPrice(x),
+                SourceTag: phaseTag))
             .ToArray();
 
+        Console.WriteLine($"[INFO] BuildScannerCandidates: selected {selected.Length}/{targetCount} candidates: [{string.Join(", ", selected.Select(c => c.Symbol))}].");
         return selected;
     }
 
-    private LiveScannerCandidateRow[] LoadConfiguredScannerRowsForCurrentPhase()
+    /// <summary>
+    /// Determines which Excel scanner lists to load based on the current market session phase.
+    /// During the first N minutes after market open: gap list only.
+    /// After that window: gainers + losers lists combined.
+    /// Returns rows and a phase tag for traceability.
+    /// </summary>
+    private (LiveScannerCandidateRow[] Rows, string PhaseTag) LoadConfiguredScannerRowsForCurrentPhase()
     {
         if (string.IsNullOrWhiteSpace(_options.LiveScannerOpenPhaseInputPath)
             || string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenGainersInputPath)
@@ -1193,50 +1222,96 @@ public sealed partial class SnapshotRuntime
             var singlePath = ResolveLiveScannerInputPath("BUY");
             if (string.IsNullOrWhiteSpace(singlePath))
             {
-                return [];
+                return ([], "none");
             }
 
             var full = Path.GetFullPath(singlePath);
             return File.Exists(full)
-                ? LoadLiveScannerCandidateRows(full)
-                : [];
+                ? (LoadLiveScannerCandidateRows(full), "single-file")
+                : ([], "single-file-missing");
         }
 
         var openPath = Path.GetFullPath(_options.LiveScannerOpenPhaseInputPath);
         var gainersPath = Path.GetFullPath(_options.LiveScannerPostOpenGainersInputPath);
         var losersPath = Path.GetFullPath(_options.LiveScannerPostOpenLosersInputPath);
-        var allThreeExist = File.Exists(openPath) && File.Exists(gainersPath) && File.Exists(losersPath);
 
-        if (!allThreeExist)
+        // Log which files exist for diagnostics
+        var openExists = File.Exists(openPath);
+        var gainersExists = File.Exists(gainersPath);
+        var losersExists = File.Exists(losersPath);
+
+        if (!openExists && !gainersExists && !losersExists)
         {
-            return [];
+            Console.WriteLine($"[WARN] LoadScannerPhase: none of the three scanner files exist.");
+            return ([], "all-missing");
         }
 
-        var calendar = new UsEquitiesExchangeCalendarService();
         var nowUtc = DateTime.UtcNow;
-        var useGapOpenPhaseOnly = false;
+        var isOpenPhase = false;
 
-        if (calendar.TryGetSessionWindowUtc("US-EQUITIES", nowUtc, out var session) && session.IsTradingDay)
+        if (_exchangeCalendar.TryGetSessionWindowUtc("US-EQUITIES", nowUtc, out var session) && session.IsTradingDay)
         {
             var gapWindowEnd = session.SessionOpenUtc.AddMinutes(Math.Max(1, _options.LiveScannerOpenPhaseMinutes));
-            useGapOpenPhaseOnly = nowUtc >= session.SessionOpenUtc && nowUtc < gapWindowEnd;
+            isOpenPhase = nowUtc >= session.SessionOpenUtc && nowUtc < gapWindowEnd;
         }
 
-        if (useGapOpenPhaseOnly)
+        if (isOpenPhase)
         {
-            return LoadLiveScannerCandidateRows(openPath);
+            // During first 45 min: use gap list (required), plus gainers/losers if available
+            var merged = new List<LiveScannerCandidateRow>();
+            if (openExists)
+            {
+                merged.AddRange(LoadLiveScannerCandidateRows(openPath));
+            }
+
+            if (gainersExists)
+            {
+                merged.AddRange(LoadLiveScannerCandidateRows(gainersPath));
+            }
+
+            if (losersExists)
+            {
+                merged.AddRange(LoadLiveScannerCandidateRows(losersPath));
+            }
+
+            Console.WriteLine($"[INFO] LoadScannerPhase: open-phase=true loaded gap={openExists} gainers={gainersExists} losers={losersExists} total={merged.Count}.");
+            return (merged.ToArray(), "open-phase-gap+gainers+losers");
         }
 
-        var merged = new List<LiveScannerCandidateRow>();
-        merged.AddRange(LoadLiveScannerCandidateRows(gainersPath));
-        merged.AddRange(LoadLiveScannerCandidateRows(losersPath));
-        return merged.ToArray();
+        // After the open-phase window: gainers + losers only (gap list no longer relevant)
+        {
+            var merged = new List<LiveScannerCandidateRow>();
+            if (gainersExists)
+            {
+                merged.AddRange(LoadLiveScannerCandidateRows(gainersPath));
+            }
+
+            if (losersExists)
+            {
+                merged.AddRange(LoadLiveScannerCandidateRows(losersPath));
+            }
+
+            if (merged.Count == 0)
+            {
+                Console.WriteLine($"[WARN] LoadScannerPhase: post-open phase but gainers/losers files missing or empty.");
+                return ([], "post-open-empty");
+            }
+
+            Console.WriteLine($"[INFO] LoadScannerPhase: open-phase=false loaded gainers={gainersExists} losers={losersExists} total={merged.Count}.");
+            return (merged.ToArray(), "post-open-gainers+losers");
+        }
     }
 
+    /// <summary>
+    /// Requests IBKR historical bars for batches of symbols and extracts LastClose + AverageVolume20 metrics.
+    /// Uses monotonically incrementing request IDs and snapshots the HistoricalBars queue before/after
+    /// each batch to avoid stale data contamination.
+    /// </summary>
     private async Task<Dictionary<string, HistoricalProbeMetric>> LoadHistoryMetricsInBatchesAsync(
         EClientSocket client,
         IBrokerAdapter brokerAdapter,
         IReadOnlyList<string> symbols,
+        int batchSize,
         CancellationToken token)
     {
         var results = new Dictionary<string, HistoricalProbeMetric>(StringComparer.OrdinalIgnoreCase);
@@ -1245,15 +1320,19 @@ public sealed partial class SnapshotRuntime
             return results;
         }
 
-        var reqIdSeed = 19100;
-        foreach (var batch in symbols.Chunk(20))
+        var batchIndex = 0;
+        foreach (var batch in symbols.Chunk(batchSize))
         {
+            batchIndex++;
             token.ThrowIfCancellationRequested();
+
+            // Snapshot the queue size before this batch so we only look at bars arriving after our requests
+            var preSnapshotCount = _wrapper.HistoricalBars.Count;
 
             var requests = new List<(int RequestId, string Symbol)>();
             foreach (var symbol in batch)
             {
-                var requestId = reqIdSeed++;
+                var requestId = Interlocked.Increment(ref _scannerHistoryReqIdSeed);
                 var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
                     BrokerAssetType.Stock,
                     symbol,
@@ -1275,12 +1354,22 @@ public sealed partial class SnapshotRuntime
                 requests.Add((requestId, symbol));
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            var batchReqIds = requests.Select(r => r.RequestId).ToHashSet();
 
-            var bars = _wrapper.HistoricalBars.ToArray();
+            // Wait for IBKR to deliver bars — use adaptive delay: 5s base + 1s per 10 symbols in batch
+            var batchDelayMs = 5000 + (batch.Length / 10) * 1000;
+            await Task.Delay(batchDelayMs, token);
+
+            // Only inspect bars that arrived during this batch window by skipping pre-existing entries
+            var allBars = _wrapper.HistoricalBars.ToArray();
+            var batchBars = allBars
+                .Where(b => batchReqIds.Contains(b.RequestId))
+                .ToArray();
+
+            var receivedSymbols = 0;
             foreach (var req in requests)
             {
-                var byReq = bars
+                var byReq = batchBars
                     .Where(x => x.RequestId == req.RequestId)
                     .OrderBy(x => x.TimestampUtc)
                     .ToArray();
@@ -1289,6 +1378,7 @@ public sealed partial class SnapshotRuntime
                     continue;
                 }
 
+                receivedSymbols++;
                 var latestClose = byReq[^1].Close;
                 var lookback = byReq.TakeLast(Math.Min(20, byReq.Length)).ToArray();
                 var avgVolume20 = lookback.Length == 0
@@ -1297,9 +1387,20 @@ public sealed partial class SnapshotRuntime
 
                 results[req.Symbol] = new HistoricalProbeMetric(latestClose, avgVolume20, byReq.Length);
             }
+
+            Console.WriteLine($"[INFO] HistoryBatch {batchIndex}: requested={batch.Length} received={receivedSymbols} delay={batchDelayMs}ms.");
         }
 
         return results;
+    }
+
+    /// <summary>Resolves the best available seed limit price from scanner row quote data.</summary>
+    private double ResolveSeedLimitPrice(LiveScannerCandidateRow row)
+    {
+        if (row.Ask > 0) return row.Ask;
+        if (row.Mark > 0) return row.Mark;
+        if (row.Bid > 0) return row.Bid;
+        return Math.Max(0.01, _options.LiveLimitPrice);
     }
 
     private sealed record ScannerReplacementCandidate(
