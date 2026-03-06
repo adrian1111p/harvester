@@ -41,6 +41,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly V3LiveCandleAggregator _candleAggregator = new();
     private readonly V3LivePositionTracker _positionTracker = new();
     private readonly V3LivePositionMonitor _positionMonitor;
+    private readonly V3LiveExecutionStateMachine _executionStateMachine = new();
     private readonly ILogger<V3LiveRuntime> _logger;
 
     // ── Per-symbol state ───────────────────────────────────────────────────
@@ -89,6 +90,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         }
         _stateBySymbol.Clear();
         _historicalBarWatermarkBySymbol.Clear();
+        _executionStateMachine.Reset();
 
         lock (_intentLock) _pendingIntents.Clear();
 
@@ -241,6 +243,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         V3LiveSignalRow[] signalsSnapshot;
         V3LiveExitEventRow[] exitEventsSnapshot;
         V3LiveRiskEventRow[] riskEventsSnapshot;
+        var executionSnapshot = _executionStateMachine.Snapshot();
         int evaluationCount;
         int passedCount;
         int failedCount;
@@ -300,6 +303,16 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             JsonSerializer.Serialize(positionSummaries, options),
             cancellationToken);
 
+        await File.WriteAllTextAsync(
+            Path.Combine(outputDir, $"v3live_execution_intents_{stamp}.json"),
+            JsonSerializer.Serialize(executionSnapshot.Statuses, options),
+            cancellationToken);
+
+        await File.WriteAllTextAsync(
+            Path.Combine(outputDir, $"v3live_execution_transitions_{stamp}.json"),
+            JsonSerializer.Serialize(executionSnapshot.Transitions, options),
+            cancellationToken);
+
         _logger.LogInformation("V3Live shutdown evaluations={Evaluations} signals={Signals} exits={Exits} pnl={Pnl}", evaluationCount, signalsSnapshot.Length, exitEventCount, _positionTracker.TotalRealizedPnlToday);
     }
 
@@ -316,6 +329,10 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
             var snapshot = _pendingIntents.ToArray();
             _pendingIntents.Clear();
+            foreach (var intent in snapshot)
+            {
+                _executionStateMachine.OnIntentDequeued(intent.IntentId);
+            }
             return snapshot;
         }
     }
@@ -338,6 +355,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         }
 
         _positionTracker.RecordEntry(symbol, side, filledQuantity, fillPrice, estimatedRisk, intentId);
+        _executionStateMachine.OnIntentTransmitted(intentId, symbol, filledQuantity, fillPrice);
 
         // Update tracked position's stop/TP from the proposed order
         var tracked = _positionTracker.GetPosition(symbol);
@@ -352,6 +370,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     {
         _logger.LogInformation("V3Live position closed symbol={Symbol} quantity={Quantity} realizedPnl={RealizedPnl}", symbol, closedQuantity, realizedPnl);
         _positionTracker.RecordClose(symbol, closedQuantity, realizedPnl);
+        _executionStateMachine.OnPositionClosed(symbol, closedQuantity, realizedPnl);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -687,6 +706,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     private void EnqueueIntent(LiveOrderIntent intent)
     {
+        _executionStateMachine.OnIntentCreated(intent);
         lock (_intentLock)
         {
             _pendingIntents.Add(intent);
