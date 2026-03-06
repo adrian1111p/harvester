@@ -3,16 +3,15 @@ using Harvester.App.Backtest.Engine;
 namespace Harvester.App.Strategy;
 
 /// <summary>
-/// Signal engine evaluating three sub-strategies: VWAP Reversion, BB Bounce, Keltner Squeeze.
-/// Refactored for backtest-live parity (H-02, BB confirmation, squeeze semantics).
+/// Signal engine implementing V11-style composite scoring with regime filters.
 /// </summary>
 public sealed class V3LiveSignalEngine
 {
     /// <summary>Per-symbol squeeze state for tracking bar count and release transitions.</summary>
     private readonly Dictionary<string, SqueezeState> _squeezeBySymbol = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Minimum consecutive squeeze bars before a breakout signal fires (matching backtest).</summary>
-    private const int MinSqueezeBarCount = 10;
+    /// <summary>Minimum consecutive squeeze bars before a breakout signal fires.</summary>
+    private const int MinSqueezeBarCount = 8;
 
     /// <summary>OFI tiebreaker threshold for resolving long/short conflicts.</summary>
     private const double OfiTiebreakerThreshold = 0.05;
@@ -31,42 +30,106 @@ public sealed class V3LiveSignalEngine
 
         var longReasons = new List<string>();
         var shortReasons = new List<string>();
+        var longScore = 0;
+        var shortScore = 0;
 
-        // V3a: VWAP Reversion (strict inequality matching backtest: < not <=)
-        var vwapLong = f.DistFromVwapAtr < -cfg.VwapStretchAtr && f.Rsi14 < cfg.RsiOversold && f.OfiSignal > 0;
-        var vwapShort = f.DistFromVwapAtr > cfg.VwapStretchAtr && f.Rsi14 > cfg.RsiOverbought && f.OfiSignal < 0;
+        var priceValid = f.Price >= cfg.MinPrice && f.Price <= cfg.MaxPrice;
+        if (!priceValid)
+            return new V3LiveSignalDecision(false, null, "NONE", "price-out-of-range");
 
-        if (vwapLong) longReasons.Add("VWAP");
-        if (vwapShort) shortReasons.Add("VWAP");
+        var adxValid = double.IsNaN(f.Adx14) || (f.Adx14 >= cfg.AdxMin && f.Adx14 <= cfg.AdxMax);
+        if (!adxValid)
+            return new V3LiveSignalDecision(false, null, "NONE", "adx-out-of-range");
 
-        // V3b: BB Bounce (restored backtest confirmation: stochK threshold)
-        var bbLong = f.BbPctB < cfg.BbEntryPctbLow
-            && !double.IsNaN(f.StochK) && !double.IsNaN(f.StochD)
-            && f.StochK < 25.0 && f.StochK > f.StochD;
-        var bbShort = f.BbPctB > cfg.BbEntryPctbHigh
-            && !double.IsNaN(f.StochK) && !double.IsNaN(f.StochD)
-            && f.StochK > 75.0 && f.StochK < f.StochD;
+        if (!double.IsNaN(f.Rvol) && f.Rvol >= cfg.RvolMin)
+        {
+            longScore++;
+            shortScore++;
+            longReasons.Add("RVOL");
+            shortReasons.Add("RVOL");
+        }
 
-        if (bbLong) longReasons.Add("BB");
-        if (bbShort) shortReasons.Add("BB");
+        if (f.VolAccel >= cfg.VolAccelMin)
+        {
+            longScore++;
+            shortScore++;
+            longReasons.Add("VOLACC");
+            shortReasons.Add("VOLACC");
+        }
 
-        // V3c: Keltner Squeeze Breakout (fixed: fires on RELEASE, not during squeeze)
+        if (f.L2.HasDepth)
+        {
+            var liquidity = Math.Min(f.L2.BidDepthN, f.L2.AskDepthN) / 100.0;
+            if (liquidity >= cfg.L2LiquidityMin)
+            {
+                longScore++;
+                shortScore++;
+                longReasons.Add("LIQ");
+                shortReasons.Add("LIQ");
+            }
+        }
+
+        // Mean-reversion setup components
+        var vwapLong = f.DistFromVwapAtr <= -cfg.VwapDeviationAtr && f.Rsi14 <= cfg.RsiOversold;
+        var vwapShort = f.DistFromVwapAtr >= cfg.VwapDeviationAtr && f.Rsi14 >= cfg.RsiOverbought;
+        if (vwapLong)
+        {
+            longScore += 2;
+            longReasons.Add("VWAP");
+        }
+        if (vwapShort)
+        {
+            shortScore += 2;
+            shortReasons.Add("VWAP");
+        }
+
+        var bbLong = f.BbPctB <= cfg.BbEntryPctbLow;
+        var bbShort = f.BbPctB >= cfg.BbEntryPctbHigh;
+        if (bbLong)
+        {
+            longScore += 2;
+            longReasons.Add("BB");
+        }
+        if (bbShort)
+        {
+            shortScore += 2;
+            shortReasons.Add("BB");
+        }
+
         var squeezeSignal = EvaluateSqueezeBreakout(f, cfg, symbol);
-        if (squeezeSignal.HasLong) longReasons.Add("SQUEEZE");
-        if (squeezeSignal.HasShort) shortReasons.Add("SQUEEZE");
+        if (squeezeSignal.HasLong)
+        {
+            longScore += 2;
+            longReasons.Add("SQUEEZE");
+        }
+        if (squeezeSignal.HasShort)
+        {
+            shortScore += 2;
+            shortReasons.Add("SQUEEZE");
+        }
 
-        // RVOL filter
-        var longValid = longReasons.Count > 0 && (!double.IsNaN(f.Rvol) ? f.Rvol >= 0.5 : true);
-        var shortValid = shortReasons.Count > 0 && (!double.IsNaN(f.Rvol) ? f.Rvol >= 0.5 : true);
+        if (f.OfiSignal > 0)
+        {
+            longScore++;
+            longReasons.Add("OFI");
+        }
+        if (f.OfiSignal < 0)
+        {
+            shortScore++;
+            shortReasons.Add("OFI");
+        }
+
+        var longValid = cfg.AllowLong && longScore >= cfg.MinScore;
+        var shortValid = cfg.AllowShort && shortScore >= cfg.MinScore;
 
         if (longValid && !shortValid)
         {
-            return new V3LiveSignalDecision(true, TradeSide.Long, string.Join("+", longReasons), string.Empty);
+            return new V3LiveSignalDecision(true, TradeSide.Long, $"V11[{longScore}]::{string.Join("+", longReasons)}", string.Empty);
         }
 
         if (shortValid && !longValid)
         {
-            return new V3LiveSignalDecision(true, TradeSide.Short, string.Join("+", shortReasons), string.Empty);
+            return new V3LiveSignalDecision(true, TradeSide.Short, $"V11[{shortScore}]::{string.Join("+", shortReasons)}", string.Empty);
         }
 
         if (longValid && shortValid)
@@ -75,15 +138,15 @@ public sealed class V3LiveSignalEngine
             {
                 var side = f.OfiSignal >= 0 ? TradeSide.Long : TradeSide.Short;
                 var setup = side == TradeSide.Long
-                    ? string.Join("+", longReasons)
-                    : string.Join("+", shortReasons);
+                    ? $"V11[{longScore}]::{string.Join("+", longReasons)}"
+                    : $"V11[{shortScore}]::{string.Join("+", shortReasons)}";
                 return new V3LiveSignalDecision(true, side, setup, "resolved-by-ofi");
             }
 
             return new V3LiveSignalDecision(false, null, "NONE", "long-short-conflict");
         }
 
-        return new V3LiveSignalDecision(false, null, "NONE", "no-v3-setup");
+        return new V3LiveSignalDecision(false, null, "NONE", $"score-below-min:{Math.Max(longScore, shortScore)}/{cfg.MinScore}");
     }
 
     /// <summary>

@@ -38,6 +38,7 @@ public sealed class V3LiveFeatureBuilder
                 KcMid: double.NaN,
                 StochK: double.NaN,
                 StochD: double.NaN,
+                Adx14: double.NaN,
                 Rvol: double.NaN,
                 VolAccel: double.NaN,
                 OfiSignal: l2.OfiSignal,
@@ -54,6 +55,7 @@ public sealed class V3LiveFeatureBuilder
         var bb = TechnicalIndicators.BollingerBands(closes, 20, 2.0);
         var kc = TechnicalIndicators.KeltnerChannels(bars, 20, 14, 1.5);
         var stoch = TechnicalIndicators.Stochastic(bars, 14, 3, 3);
+        var adx = TechnicalIndicators.Adx(bars, 14);
         var rvol = TechnicalIndicators.RelativeVolume(volumes, 20);
 
         var lastIdx = bars.Length - 1;
@@ -86,6 +88,7 @@ public sealed class V3LiveFeatureBuilder
             KcMid: kcNow.Mid,
             StochK: stoch[lastIdx].K,
             StochD: stoch[lastIdx].D,
+            Adx14: adx[lastIdx].Adx,
             Rvol: rvol[lastIdx],
             VolAccel: volAccel,
             OfiSignal: l2.OfiSignal,
@@ -201,6 +204,7 @@ public sealed record V3LiveFeatureSnapshot(
     double KcMid,
     double StochK,
     double StochD,
+    double Adx14,
     double Rvol,
     double VolAccel,
     double OfiSignal,

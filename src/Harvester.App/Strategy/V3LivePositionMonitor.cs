@@ -102,7 +102,19 @@ public sealed class V3LivePositionMonitor
         {
             var giveback = position.UnrealizedPnlPeak - position.UnrealizedPnl;
             var givebackPct = giveback / position.UnrealizedPnlPeak;
-            if (givebackPct >= _config.GivebackPct && position.UnrealizedPnlPeak >= riskPerShare * Math.Abs(position.Quantity) * 0.3)
+            var effectiveUsdCap = _config.UseFixedGivebackUsdCap
+                ? Math.Max(0.0, _config.GivebackUsdCap)
+                : 0.0;
+
+            if (effectiveUsdCap > 0)
+            {
+                if (position.UnrealizedPnl > 0 && giveback >= effectiveUsdCap)
+                {
+                    return V3LiveExitDecision.Exit("giveback-usd-cap",
+                        $"Gave back ${giveback:F2} (cap ${effectiveUsdCap:F2}) from peak ${position.UnrealizedPnlPeak:F2}");
+                }
+            }
+            else if (givebackPct >= _config.GivebackPct && position.UnrealizedPnlPeak >= riskPerShare * Math.Abs(position.Quantity) * 0.3)
             {
                 return V3LiveExitDecision.Exit("giveback",
                     $"Gave back {givebackPct:P0} of peak PnL (${position.UnrealizedPnlPeak:F2} → ${position.UnrealizedPnl:F2})");

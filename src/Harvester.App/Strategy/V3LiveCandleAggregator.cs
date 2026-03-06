@@ -10,7 +10,6 @@ namespace Harvester.App.Strategy;
 public sealed class V3LiveCandleAggregator
 {
     public static readonly int[] TimeframeSeconds = [60, 300, 900, 3600, 86400];
-    public static readonly string[] TimeframeLabels = ["1m", "5m", "15m", "1h", "1D"];
 
     /// <summary>Max completed candles to retain per timeframe (rolling window).</summary>
     private const int MaxHistoryPerTimeframe = 500;
@@ -121,28 +120,6 @@ public sealed class V3LiveCandleAggregator
         }
 
         return new V3LiveCandleSnapshot(normalized, DateTime.UtcNow, timeframes);
-    }
-
-    /// <summary>
-    /// Get completed candle history for a specific symbol and timeframe as an array.
-    /// Includes the current in-progress candle as the last element.
-    /// </summary>
-    public LiveCandle[] GetCandlesWithCurrent(string symbol, int timeframeSeconds)
-    {
-        var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
-        if (!_stateBySymbol.TryGetValue(normalized, out var state)) return [];
-
-        var history = state.HistoryByTimeframe.TryGetValue(timeframeSeconds, out var h)
-            ? h.ToArray()
-            : Array.Empty<LiveCandle>();
-
-        if (!state.CurrentByTimeframe.TryGetValue(timeframeSeconds, out var current))
-            return history;
-
-        var result = new LiveCandle[history.Length + 1];
-        Array.Copy(history, result, history.Length);
-        result[^1] = current;
-        return result;
     }
 
     /// <summary>

@@ -37,26 +37,26 @@ public sealed class V3LiveOrderBridge
         var quantity = Math.Max(1, Math.Min(_config.MaxShares, Math.Min(qtyByRisk, qtyByNotional)));
 
         var takeProfitPrice = side == TradeSide.Long
-            ? entryPrice + _config.Tp1R * features.Atr14
-            : entryPrice - _config.Tp1R * features.Atr14;
+            ? entryPrice + _config.Tp2R * features.Atr14
+            : entryPrice - _config.Tp2R * features.Atr14;
 
         var estimatedRisk = riskPerShare * quantity;
         var action = side == TradeSide.Long ? "BUY" : "SELL";
 
         return new V3LiveProposedOrder(
-            IntentId: $"V3LIVE-{symbol}-{timestampUtc:yyyyMMddHHmmssfff}",
+            IntentId: $"V11LIVE-{symbol}-{timestampUtc:yyyyMMddHHmmssfff}",
             TimestampUtc: timestampUtc,
             Symbol: symbol,
             Side: action,
-            OrderType: "LMT",
-            TimeInForce: "DAY",
+            OrderType: "MKT",
+            TimeInForce: "IOC",
             Quantity: quantity,
             EntryPrice: entryPrice,
             StopPrice: stopPrice,
             TakeProfitPrice: takeProfitPrice,
             EstimatedRiskDollars: estimatedRisk,
             Setup: setup,
-            Source: "v3-live-runtime");
+            Source: "v11-live-runtime");
     }
 
     private static double ResolveEntryPrice(V3LiveFeatureSnapshot features, TradeSide side)

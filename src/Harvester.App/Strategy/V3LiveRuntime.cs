@@ -35,7 +35,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly V3LiveSignalEngine _signalEngine = new();
     private readonly V3LiveRiskGuard _riskGuard;
     private readonly V3LiveOrderBridge _orderBridge;
-    private readonly ScannerSelectionEngineV2 _scannerV2Engine;
+    private readonly HashSet<string> _tradeUniverse;
 
     // ── New components (audit fixes) ───────────────────────────────────────
     private readonly V3LiveCandleAggregator _candleAggregator = new();
@@ -60,15 +60,11 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     public V3LiveRuntime(V3LiveConfig? config = null, ILogger<V3LiveRuntime>? logger = null)
     {
         _config = config ?? V3LiveConfig.FromEnvironment();
-        _scannerV2Engine = new ScannerSelectionEngineV2(new ScannerSelectionV2Config
-        {
-            TopN = 1,
-            MinFileScore = _config.ScannerMinCompositeScore,
-            MaxSpreadPct = _config.MaxSpreadPct,
-            MinBidDepthShares = _config.MinDepthPerSideShares,
-            MinAskDepthShares = _config.MinDepthPerSideShares,
-            DepthLevels = _config.DepthLevels
-        });
+        _tradeUniverse = new HashSet<string>(
+            _config.Symbols
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .Select(s => s.Trim().ToUpperInvariant()),
+            StringComparer.OrdinalIgnoreCase);
         _riskGuard = new V3LiveRiskGuard(_config);
         _orderBridge = new V3LiveOrderBridge(_config);
         _positionMonitor = new V3LivePositionMonitor(_config);
@@ -99,7 +95,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _stateBySymbol[symbol] = new V3LiveSymbolState();
         }
 
-        _logger.LogInformation("V3Live initialized symbols={Symbols} account={Account}", string.Join(",", _config.Symbols), context.Account);
+        _logger.LogInformation("V11Live initialized symbols={Symbols} account={Account}", string.Join(",", _config.Symbols), context.Account);
         return Task.CompletedTask;
     }
 
@@ -109,7 +105,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             || string.Equals(eventName, "pre-close", StringComparison.OrdinalIgnoreCase))
         {
             _closeOnly = true;
-            _logger.LogInformation("V3Live close-only mode activated");
+            _logger.LogInformation("V11Live close-only mode activated");
         }
 
         if (string.Equals(eventName, "mode-start", StringComparison.OrdinalIgnoreCase)
@@ -123,7 +119,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 state.EntriesToday = 0;
                 state.LastSignalUtc = null;
             }
-            _logger.LogInformation("V3Live session reset; daily counters cleared");
+            _logger.LogInformation("V11Live session reset; daily counters cleared");
         }
 
         return Task.CompletedTask;
@@ -133,6 +129,9 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     {
         var symbol = ResolveSymbol(dataSlice);
         if (string.IsNullOrWhiteSpace(symbol))
+            return Task.CompletedTask;
+
+        if (_tradeUniverse.Count > 0 && !_tradeUniverse.Contains(symbol))
             return Task.CompletedTask;
 
         if (!_stateBySymbol.TryGetValue(symbol, out var symbolState))
@@ -384,7 +383,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 : (features.L1.HasQuote ? features.L1.Ask : features.Price);
 
             var exitIntent = new LiveOrderIntent(
-                IntentId: $"V3EXIT-{symbol}-{now:yyyyMMddHHmmssfff}",
+                IntentId: $"V11EXIT-{symbol}-{now:yyyyMMddHHmmssfff}",
                 TimestampUtc: now,
                 Symbol: symbol,
                 Side: exitSide,
@@ -396,7 +395,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 TakeProfitPrice: 0,
                 EstimatedRiskDollars: 0,
                 Setup: $"EXIT:{exitDecision.Reason}",
-                Source: "v3-live-exit-monitor");
+                Source: "v11-live-exit-monitor");
 
             EnqueueIntent(exitIntent);
 
@@ -419,7 +418,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         else if (exitDecision.IsAdvisory)
         {
             // Log advisory but don't exit
-            _logger.LogInformation("V3Live advisory symbol={Symbol} reason={Reason} detail={Detail}", symbol, exitDecision.Reason, exitDecision.Detail);
+            _logger.LogInformation("V11Live advisory symbol={Symbol} reason={Reason} detail={Detail}", symbol, exitDecision.Reason, exitDecision.Detail);
         }
     }
 
@@ -479,7 +478,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
         if (_config.UseScannerSelectionV2Gate)
         {
-            var scannerGate = EvaluateScannerV2Gate(symbol, dataSlice, features, now);
+            var scannerGate = EvaluateLiveSelectionGate(symbol, features);
             if (!scannerGate.Passed)
                 reasonCodes.Add(scannerGate.ReasonCode);
         }
@@ -518,7 +517,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         if (emittedSignal && decision.Side is { } signalSide)
         {
             symbolState.LastSignalUtc = now;
-            symbolState.EntriesToday++;
 
             lock (_eventsLock)
             {
@@ -579,7 +577,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                             Source: proposed.Source);
 
                         EnqueueIntent(liveIntent);
-                        _logger.LogInformation("V3Live entry intent symbol={Symbol} side={Side} quantity={Quantity} entryPrice={EntryPrice} stopPrice={StopPrice} setup={Setup}", symbol, proposed.Side, proposed.Quantity, proposed.EntryPrice, proposed.StopPrice, proposed.Setup);
+                        symbolState.EntriesToday++;
+                        _logger.LogInformation("V11Live entry intent symbol={Symbol} side={Side} quantity={Quantity} entryPrice={EntryPrice} stopPrice={StopPrice} setup={Setup}", symbol, proposed.Side, proposed.Quantity, proposed.EntryPrice, proposed.StopPrice, proposed.Setup);
                     }
                     else
                     {
@@ -592,6 +591,10 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                         }
                     }
                 }
+            }
+            else
+            {
+                symbolState.EntriesToday++;
             }
         }
 
@@ -708,118 +711,36 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         return t >= start && t <= end;
     }
 
-    private (bool Passed, string ReasonCode) EvaluateScannerV2Gate(
+    private (bool Passed, string ReasonCode) EvaluateLiveSelectionGate(
         string symbol,
-        StrategyDataSlice dataSlice,
-        V3LiveFeatureSnapshot features,
-        DateTime nowUtc)
+        V3LiveFeatureSnapshot features)
     {
-        var candidate = new ScannerV2CandidateFileRow
-        {
-            Symbol = symbol,
-            WeightedScore = 100.0,
-            Eligible = true,
-            AverageRank = 1.0,
-            Bid = features.L1.Bid,
-            Ask = features.L1.Ask,
-            Mark = features.Price,
-            Exchange = "SMART"
-        };
+        if (_tradeUniverse.Count > 0 && !_tradeUniverse.Contains(symbol))
+            return (false, "scanner-symbol-outside-universe");
 
-        var volume = dataSlice.HistoricalBars
-            .OrderByDescending(x => x.TimestampUtc)
-            .Select(x => (double)x.Volume)
-            .FirstOrDefault();
-        var l1Snapshot = new ScannerV2L1Snapshot(
-            Symbol: symbol,
-            Bid: features.L1.Bid,
-            Ask: features.L1.Ask,
-            Last: features.L1.Last > 0 ? features.L1.Last : features.Price,
-            Volume: Math.Max(0.0, volume),
-            TimestampUtc: nowUtc);
+        if (!features.L1.HasQuote)
+            return (false, "scanner-l1-missing");
 
-        var l2Snapshot = BuildScannerL2Snapshot(symbol, dataSlice, nowUtc);
-        var l2Map = l2Snapshot is null
-            ? new Dictionary<string, ScannerV2L2DepthSnapshot>(StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, ScannerV2L2DepthSnapshot>(StringComparer.OrdinalIgnoreCase)
-            {
-                [symbol] = l2Snapshot
-            };
+        var spreadScore = features.L1.SpreadPct <= 0
+            ? 0.0
+            : Math.Clamp(((_config.MaxSpreadPct - features.L1.SpreadPct) / Math.Max(1e-6, _config.MaxSpreadPct)) * 100.0, 0.0, 100.0);
 
-        var sessionStart = ParseSessionBoundary(nowUtc, _config.SessionStartUtc, new TimeSpan(13, 35, 0));
-        var sessionEnd = ParseSessionBoundary(nowUtc, _config.SessionEndUtc, new TimeSpan(20, 0, 0));
+        var depthMin = Math.Min(features.L2.BidDepthN, features.L2.AskDepthN);
+        var depthScore = Math.Clamp((depthMin / Math.Max(1.0, _config.MinDepthPerSideShares)) * 100.0, 0.0, 100.0);
 
-        var selection = _scannerV2Engine.Evaluate(
-            fileCandidates: [candidate],
-            l1Snapshots: new Dictionary<string, ScannerV2L1Snapshot>(StringComparer.OrdinalIgnoreCase) { [symbol] = l1Snapshot },
-            l2Snapshots: l2Map,
-            biasEntries: [],
-            sessionOpenUtc: sessionStart,
-            sessionCloseUtc: sessionEnd,
-            nowUtc: nowUtc,
-            sourcePath: "strategy-live-v3-inline");
+        var rvolScore = double.IsNaN(features.Rvol)
+            ? 0.0
+            : Math.Clamp((features.Rvol / Math.Max(0.1, _config.RvolMin)) * 100.0, 0.0, 100.0);
 
-        var ranked = selection.RankedCandidates.FirstOrDefault();
-        if (ranked is null)
-            return (false, "scanner-v2-no-candidate");
+        var imbalanceMid = 0.5 * (_config.MinImbalanceLong + _config.MaxImbalanceShort);
+        var imbalancePenalty = Math.Min(1.0, Math.Abs(features.L2.ImbalanceRatio - imbalanceMid));
+        var imbalanceScore = Math.Clamp((1.0 - imbalancePenalty) * 100.0, 0.0, 100.0);
 
-        if (!ranked.Eligible)
-        {
-            var reason = string.IsNullOrWhiteSpace(ranked.RejectReason)
-                ? "rejected"
-                : ranked.RejectReason.Replace(' ', '-').ToLowerInvariant();
-            return (false, $"scanner-v2-{reason}");
-        }
-
-        if (ranked.CompositeScore < _config.ScannerMinCompositeScore)
-            return (false, "scanner-v2-score-low");
+        var composite = 0.35 * spreadScore + 0.30 * depthScore + 0.25 * rvolScore + 0.10 * imbalanceScore;
+        if (composite < _config.ScannerMinCompositeScore)
+            return (false, "scanner-score-low");
 
         return (true, string.Empty);
-    }
-
-    private ScannerV2L2DepthSnapshot? BuildScannerL2Snapshot(string symbol, StrategyDataSlice dataSlice, DateTime nowUtc)
-    {
-        var depthRows = dataSlice.DepthRows
-            .Where(x => x.Price > 0)
-            .ToArray();
-        if (depthRows.Length == 0)
-            return null;
-
-        var bids = depthRows
-            .Where(x => x.Side == 1)
-            .GroupBy(x => x.Position)
-            .Select(group => group.OrderByDescending(x => x.TimestampUtc).First())
-            .OrderBy(x => x.Position)
-            .Take(Math.Max(1, _config.DepthLevels))
-            .Select(x => new ScannerV2DepthLevel(x.Position, x.Price, Math.Max(0.0, x.Size)))
-            .ToArray();
-
-        var asks = depthRows
-            .Where(x => x.Side == 0)
-            .GroupBy(x => x.Position)
-            .Select(group => group.OrderByDescending(x => x.TimestampUtc).First())
-            .OrderBy(x => x.Position)
-            .Take(Math.Max(1, _config.DepthLevels))
-            .Select(x => new ScannerV2DepthLevel(x.Position, x.Price, Math.Max(0.0, x.Size)))
-            .ToArray();
-
-        if (bids.Length == 0 || asks.Length == 0)
-            return null;
-
-        return new ScannerV2L2DepthSnapshot(symbol, bids, asks, nowUtc);
-    }
-
-    private static DateTime ParseSessionBoundary(DateTime nowUtc, string value, TimeSpan fallback)
-    {
-        var time = TimeSpan.TryParse(value, out var parsed) ? parsed : fallback;
-        return new DateTime(
-            nowUtc.Year,
-            nowUtc.Month,
-            nowUtc.Day,
-            time.Hours,
-            time.Minutes,
-            time.Seconds,
-            DateTimeKind.Utc);
     }
 
     // ════════════════════════════════════════════════════════════════════════

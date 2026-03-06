@@ -68,6 +68,21 @@ public sealed class V3LiveRiskGuard
             }
         }
 
+        if (features.Price < _config.MinPrice || features.Price > _config.MaxPrice)
+        {
+            reasons.Add("risk-price-out-of-range");
+        }
+
+        if (!double.IsNaN(features.Rvol) && features.Rvol < _config.RvolMin)
+        {
+            reasons.Add("risk-rvol-too-low");
+        }
+
+        if (!double.IsNaN(features.Adx14) && (features.Adx14 < _config.AdxMin || features.Adx14 > _config.AdxMax))
+        {
+            reasons.Add("risk-adx-out-of-range");
+        }
+
         var pass = reasons.Count == 0;
         return new V3LiveRiskCheckResult(pass, reasons, state.OpenRiskDollars, order.EstimatedRiskDollars);
     }
