@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Harvester.App.IBKR.Risk;
+using Harvester.Contracts;
 
 namespace Harvester.App.IBKR.Runtime;
 
@@ -198,132 +199,8 @@ public sealed record AppOptions(
     }
 }
 
-public enum ReconciliationGateAction
-{
-    Off,
-    Warn,
-    Fail
-}
-
-public enum ClockSkewAction
-{
-    Off,
-    Warn,
-    Fail
-}
-
-public enum RunMode
-{
-    Connect,
-    Orders,
-    OrdersAllOpen,
-    Positions,
-    PositionsMonitor1Pct,
-    PositionsMonitor1PctLoop,
-    PositionsAutoReplaceScanLoop,
-    SnapshotAll,
-    ContractsValidate,
-    OrdersDryRun,
-    OrdersPlaceSim,
-    OrdersCancelSim,
-    OrdersWhatIf,
-    TopData,
-    MarketDepth,
-    RealtimeBars,
-    MarketDataAll,
-    HistoricalBars,
-    HistoricalBarsKeepUpToDate,
-    Histogram,
-    HistoricalTicks,
-    HeadTimestamp,
-    ManagedAccounts,
-    FamilyCodes,
-    AccountUpdates,
-    AccountUpdatesMulti,
-    AccountSummaryOnly,
-    PositionsMulti,
-    PnlAccount,
-    PnlSingle,
-    OptionChains,
-    OptionExercise,
-    OptionGreeks,
-    CryptoPermissions,
-    CryptoContract,
-    CryptoStreaming,
-    CryptoHistorical,
-    CryptoOrder,
-    FaAllocationGroups,
-    FaGroupsProfiles,
-    FaUnification,
-    FaModelPortfolios,
-    FaOrder,
-    FundamentalData,
-    WshFilters,
-    ErrorCodes,
-    ScannerExamples,
-    ScannerComplex,
-    ScannerParameters,
-    ScannerWorkbench,
-    ScannerPreview,
-    DisplayGroupsQuery,
-    DisplayGroupsSubscribe,
-    DisplayGroupsUpdate,
-    DisplayGroupsUnsubscribe,
-    StrategyReplay,
-    StrategyLiveV3,
-    PositionsMonitorUi,
-    BacktestRun,
-    BacktestSweep,
-    BacktestOptimize,
-    BacktestScan,
-    BacktestLiveSim,
-    BacktestCompare,
-}
-
-public sealed record ContractDetailsRow(
-    int ConId,
-    string Symbol,
-    string SecType,
-    string Exchange,
-    string PrimaryExchange,
-    string Currency,
-    string LocalSymbol,
-    string TradingClass,
-    string MarketName,
-    string LongName,
-    double MinTick
-);
-
-public sealed record OrderTemplateRow(
-    string Name,
-    int OrderId,
-    int ParentId,
-    string Action,
-    string OrderType,
-    double Quantity,
-    double LimitPrice,
-    double StopPrice,
-    string Tif,
-    bool Transmit
-);
-
-public sealed record LiveOrderPlacementRow(
-    string TimestampUtc,
-    int OrderId,
-    string Symbol,
-    string Action,
-    double Quantity,
-    double LimitPrice,
-    double Notional,
-    string Account,
-    string OrderRef
-);
-
-public sealed record SimOrderCancellationRow(
-    string TimestampUtc,
-    int OrderId,
-    string Account
-);
+// RunMode, ReconciliationGateAction, ClockSkewAction — moved to Harvester.Contracts/RuntimeEnums.cs
+// ContractDetailsRow, OrderTemplateRow, LiveOrderPlacementRow, SimOrderCancellationRow — moved to Harvester.Contracts/OrderContracts.cs
 
 internal sealed record LiveOrderPlacementPlan(
     string Symbol,
@@ -509,40 +386,9 @@ internal sealed class ConductTradeEpisode
     public string EngineVersion { get; init; } = "V1.2";
 }
 
-public sealed record ScannerPreviewSummaryRow(
-    DateTime TimestampUtc,
-    string Action,
-    string ResolvedInputPath,
-    string ResolvedInputFullPath,
-    bool FileConfigured,
-    bool FileExists,
-    bool FileIsTempLock,
-    string Phase,
-    bool IsTradingDay,
-    DateTime SessionOpenUtc,
-    DateTime OpenPhaseEndUtc,
-    DateTime PostOpenEndUtc,
-    int RawRowCount,
-    int NormalizedRowCount,
-    int SelectedRowCount,
-    string[] SelectedSymbols,
-    string[] Notes
-);
+// ScannerPreviewSummaryRow, ScannerPreviewCandidateRow — moved to Harvester.Contracts/ScannerContracts.cs
 
-public sealed record ScannerPreviewCandidateRow(
-    string Symbol,
-    double WeightedScore,
-    bool? Eligible,
-    double AverageRank,
-    bool AllowListed,
-    bool MeetsScoreAndEligibility,
-    bool Selected
-);
-
-public sealed record ManagedAccountRow(
-    DateTime TimestampUtc,
-    string AccountId
-);
+// ManagedAccountRow — moved to Harvester.Contracts/OrderContracts.cs
 
 public sealed record OptionExerciseRequestRow(
     DateTime TimestampUtc,
@@ -644,77 +490,9 @@ public sealed record ObservedErrorRow(
     string Raw
 );
 
-public sealed record ScannerRequestRow(
-    int RequestId,
-    string Instrument,
-    string LocationCode,
-    string ScanCode,
-    int NumberOfRows,
-    string ScannerSettingPairs,
-    string FilterTagPairs,
-    string OptionTagPairs
-);
-
-public sealed record ScannerWorkbenchRunRow(
-    DateTime TimestampUtc,
-    int RequestId,
-    string ScanCode,
-    int RunIndex,
-    int Rows,
-    double DurationSeconds,
-    double? FirstRowSeconds,
-    int ErrorCount,
-    string ErrorCodes
-);
-
-public sealed record ScannerWorkbenchScoreRow(
-    string ScanCode,
-    int Runs,
-    double AverageRows,
-    double AverageFirstRowSeconds,
-    double AverageErrors,
-    double CoverageScore,
-    double SpeedScore,
-    double StabilityScore,
-    double CleanlinessScore,
-    double WeightedScore,
-    bool HardFail
-);
-
-public sealed record ScannerWorkbenchCandidateObservationRow(
-    DateTime TimestampUtc,
-    int RequestId,
-    string ScanCode,
-    int RunIndex,
-    string Symbol,
-    int ConId,
-    int Rank,
-    string Exchange,
-    string PrimaryExchange,
-    string Currency,
-    string Distance,
-    string Benchmark,
-    string Projection
-);
-
-public sealed record ScannerWorkbenchCandidateRow(
-    string Symbol,
-    int ConId,
-    string Exchange,
-    string Currency,
-    int ObservationCount,
-    int DistinctScanCodes,
-    double AverageRank,
-    int BestRank,
-    double? AverageProjection,
-    double RankScore,
-    double ConsistencyScore,
-    double CoverageScore,
-    double SignalScore,
-    double WeightedScore,
-    bool Eligible,
-    string RejectReason
-);
+// ScannerRequestRow, ScannerWorkbenchRunRow, ScannerWorkbenchScoreRow,
+// ScannerWorkbenchCandidateObservationRow, ScannerWorkbenchCandidateRow
+// — moved to Harvester.Contracts/ScannerContracts.cs
 
 public sealed record DisplayGroupActionRow(
     DateTime TimestampUtc,

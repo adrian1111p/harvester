@@ -13,7 +13,8 @@ public interface ILiveFeatureBuilder
     /// </summary>
     /// <param name="dataSlice">Market data slice from the host runtime.</param>
     /// <param name="depthLevels">Number of L2 depth levels to include.</param>
-    V3LiveFeatureSnapshot Build(StrategyDataSlice dataSlice, int depthLevels);
+    /// <param name="symbol">Optional symbol key for indicator caching.</param>
+    V3LiveFeatureSnapshot Build(StrategyDataSlice dataSlice, int depthLevels, string? symbol = null);
 }
 
 /// <summary>

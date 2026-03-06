@@ -26,7 +26,7 @@ public static class ExitEngine
         public bool UseFixedGivebackUsdCap { get; init; } = false;
         public bool UseNotionalGivebackCap { get; init; } = false;
         public double GivebackPctOfNotional { get; init; } = 0.01;
-        public double GivebackUsdCap { get; init; } = 30.0;
+        public double GivebackUsdCap { get; init; } = 38.0;
         public bool UseVariableGivebackUsdCap { get; init; } = true;
         public double GivebackCapAnchorLowPrice { get; init; } = 1.0;
         public double GivebackCapAnchorHighPrice { get; init; } = 300.0;

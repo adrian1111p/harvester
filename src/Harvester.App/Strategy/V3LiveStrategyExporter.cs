@@ -25,7 +25,8 @@ public sealed record V3LiveExportPayload(
     V3LiveExitEventRow[] ExitEvents,
     V3LiveRiskEventRow[] RiskEvents,
     IReadOnlyList<V3LiveExecutionIntentStatus> ExecutionStatuses,
-    IReadOnlyList<V3LiveExecutionTransition> ExecutionTransitions);
+    IReadOnlyList<V3LiveExecutionTransition> ExecutionTransitions,
+    TradeJournalEntry[]? TradeJournal = null);
 
 /// <summary>
 /// Position summary record for export (avoids anonymous types in serialization).
@@ -98,5 +99,13 @@ public sealed class JsonStrategyExporter : IStrategyExporter
             Path.Combine(dir, $"v3live_execution_transitions_{stamp}.json"),
             JsonSerializer.Serialize(payload.ExecutionTransitions, ExportOptions),
             cancellationToken);
+
+        if (payload.TradeJournal is { Length: > 0 })
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(dir, $"v3live_trade_journal_{stamp}.json"),
+                JsonSerializer.Serialize(payload.TradeJournal, ExportOptions),
+                cancellationToken);
+        }
     }
 }

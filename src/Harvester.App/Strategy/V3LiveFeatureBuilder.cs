@@ -6,7 +6,12 @@ namespace Harvester.App.Strategy;
 
 public sealed class V3LiveFeatureBuilder : ILiveFeatureBuilder
 {
-    public V3LiveFeatureSnapshot Build(StrategyDataSlice dataSlice, int depthLevels)
+    // ── Phase 3: Per-symbol indicator cache ──────────────────────────────
+    // Bars change every ~60s (1-min bars) but Build() is called every ~1s per symbol.
+    // Caching indicator arrays per symbol eliminates ~98% of redundant heavy computations.
+    private readonly Dictionary<string, IndicatorCache> _cacheBySymbol = new(StringComparer.OrdinalIgnoreCase);
+
+    public V3LiveFeatureSnapshot Build(StrategyDataSlice dataSlice, int depthLevels, string? symbol = null)
     {
         var l1 = BuildL1Snapshot(dataSlice);
         var l2 = BuildL2Snapshot(dataSlice, depthLevels);
@@ -37,45 +42,94 @@ public sealed class V3LiveFeatureBuilder : ILiveFeatureBuilder
                 VolAccel: double.NaN,
                 OfiSignal: l2.OfiSignal,
                 SqueezeOn: false,
+                BbBandwidth: double.NaN,
+                AtrRatio: double.NaN,
                 RejectReason: "insufficient-bars");
         }
 
-        var bars = new BacktestBar[count];
-        var closes = new double[count];
-        var volumes = new double[count];
+        // ── Phase 3: Check indicator cache validity per symbol ──────────
+        var symbolKey = symbol ?? "_default";
+        var lastBarTs = sortedRows[^1].TimestampUtc;
+        var cacheHit = _cacheBySymbol.TryGetValue(symbolKey, out var cache)
+                       && cache.BarCount == count
+                       && cache.LastBarTimestampUtc == lastBarTs;
 
-        for (var i = 0; i < count; i++)
+        if (!cacheHit)
         {
-            var r = sortedRows[i];
-            bars[i] = new BacktestBar(r.TimestampUtc, r.Open, r.High, r.Low, r.Close, (double)r.Volume);
-            closes[i] = r.Close;
-            volumes[i] = (double)r.Volume;
+            // Cache miss — recompute all indicators
+            var bars = new BacktestBar[count];
+            var closes = new double[count];
+            var volumes = new double[count];
+
+            for (var i = 0; i < count; i++)
+            {
+                var r = sortedRows[i];
+                bars[i] = new BacktestBar(r.TimestampUtc, r.Open, r.High, r.Low, r.Close, (double)r.Volume);
+                closes[i] = r.Close;
+                volumes[i] = (double)r.Volume;
+            }
+
+            cache = new IndicatorCache
+            {
+                BarCount = count,
+                LastBarTimestampUtc = lastBarTs,
+                Bars = bars,
+                Volumes = volumes,
+                Atr = TechnicalIndicators.Atr(bars, 14),
+                Rsi = TechnicalIndicators.Rsi(closes, 14),
+                Vwap = TechnicalIndicators.Vwap(bars),
+                Bb = TechnicalIndicators.BollingerBands(closes, 20, 2.0),
+                Kc = TechnicalIndicators.KeltnerChannels(bars, 20, 14, 1.5),
+                Stoch = TechnicalIndicators.Stochastic(bars, 14, 3, 3),
+                Adx = TechnicalIndicators.Adx(bars, 14),
+                Rvol = TechnicalIndicators.RelativeVolume(volumes, 20)
+            };
+            _cacheBySymbol[symbolKey] = cache;
         }
 
-        var atr = TechnicalIndicators.Atr(bars, 14);
-        var rsi = TechnicalIndicators.Rsi(closes, 14);
-        var vwap = TechnicalIndicators.Vwap(bars);
-        var bb = TechnicalIndicators.BollingerBands(closes, 20, 2.0);
-        var kc = TechnicalIndicators.KeltnerChannels(bars, 20, 14, 1.5);
-        var stoch = TechnicalIndicators.Stochastic(bars, 14, 3, 3);
-        var adx = TechnicalIndicators.Adx(bars, 14);
-        var rvol = TechnicalIndicators.RelativeVolume(volumes, 20);
-
+        // cache is guaranteed non-null after the block above
+        var c = cache!;
         var lastIdx = count - 1;
         var prevIdx = Math.Max(0, lastIdx - 1);
 
-        var price = bars[lastIdx].Close;
-        var atr14 = atr[lastIdx];
-        var vwapNow = vwap[lastIdx];
+        // Use L1 price for sub-bar precision (updates every tick, not just on bar close)
+        var price = l1.Last > 0 ? l1.Last : c.Bars[lastIdx].Close;
+        var atr14 = c.Atr[lastIdx];
+        var vwapNow = c.Vwap[lastIdx];
         var distFromVwapAtr = (atr14 > 0 && !double.IsNaN(vwapNow)) ? (price - vwapNow) / atr14 : double.NaN;
-        var volAccel = volumes[prevIdx] > 0 ? (volumes[lastIdx] - volumes[prevIdx]) / volumes[prevIdx] : 0.0;
+        var volAccel = c.Volumes[prevIdx] > 0 ? (c.Volumes[lastIdx] - c.Volumes[prevIdx]) / c.Volumes[prevIdx] : 0.0;
 
-        var bbNow = bb[lastIdx];
-        var kcNow = kc[lastIdx];
+        var bbNow = c.Bb[lastIdx];
+        var kcNow = c.Kc[lastIdx];
         var squeezeOn =
             !double.IsNaN(bbNow.Upper) && !double.IsNaN(bbNow.Lower) &&
             !double.IsNaN(kcNow.Upper) && !double.IsNaN(kcNow.Lower) &&
             bbNow.Upper < kcNow.Upper && bbNow.Lower > kcNow.Lower;
+
+        // ── Phase 2: Regime-detection features ──────────────────────────
+        // BB Bandwidth = (upper − lower) / middle — wider bands → more volatile
+        var bbBandwidth = (!double.IsNaN(bbNow.Upper) && !double.IsNaN(bbNow.Lower) && !double.IsNaN(bbNow.Mid) && bbNow.Mid > 0)
+            ? (bbNow.Upper - bbNow.Lower) / bbNow.Mid
+            : double.NaN;
+
+        // ATR ratio = current ATR / SMA(ATR, 20) — >1 means above-average volatility
+        var atrRatio = double.NaN;
+        if (!double.IsNaN(atr14) && count >= 34) // need 14 + 20 bars for a meaningful SMA
+        {
+            var atrSum = 0.0;
+            var atrCount = 0;
+            var startLookback = Math.Max(0, lastIdx - 19);
+            for (var i = startLookback; i <= lastIdx; i++)
+            {
+                if (!double.IsNaN(c.Atr[i]) && c.Atr[i] > 0)
+                {
+                    atrSum += c.Atr[i];
+                    atrCount++;
+                }
+            }
+            if (atrCount > 0)
+                atrRatio = atr14 / (atrSum / atrCount);
+        }
 
         return new V3LiveFeatureSnapshot(
             TimestampUtc: dataSlice.TimestampUtc,
@@ -84,18 +138,20 @@ public sealed class V3LiveFeatureBuilder : ILiveFeatureBuilder
             IsReady: true,
             Price: price,
             Atr14: atr14,
-            Rsi14: rsi[lastIdx],
+            Rsi14: c.Rsi[lastIdx],
             Vwap: vwapNow,
             DistFromVwapAtr: distFromVwapAtr,
             BbPctB: bbNow.PctB,
             KcMid: kcNow.Mid,
-            StochK: stoch[lastIdx].K,
-            StochD: stoch[lastIdx].D,
-            Adx14: adx[lastIdx].Adx,
-            Rvol: rvol[lastIdx],
+            StochK: c.Stoch[lastIdx].K,
+            StochD: c.Stoch[lastIdx].D,
+            Adx14: c.Adx[lastIdx].Adx,
+            Rvol: c.Rvol[lastIdx],
             VolAccel: volAccel,
             OfiSignal: l2.OfiSignal,
             SqueezeOn: squeezeOn,
+            BbBandwidth: bbBandwidth,
+            AtrRatio: atrRatio,
             RejectReason: string.Empty);
     }
 
@@ -174,6 +230,26 @@ public sealed class V3LiveFeatureBuilder : ILiveFeatureBuilder
         var row = ticks.FirstOrDefault(x => x.Field == field && x.Size > 0);
         return row?.Size ?? 0.0;
     }
+
+    /// <summary>Reset all cached indicator state (call on session/day reset).</summary>
+    public void ResetCache() => _cacheBySymbol.Clear();
+
+    /// <summary>Per-symbol cached indicator arrays. Invalidated when bar count or last bar timestamp changes.</summary>
+    private sealed class IndicatorCache
+    {
+        public int BarCount { get; init; }
+        public DateTime LastBarTimestampUtc { get; init; }
+        public BacktestBar[] Bars { get; init; } = [];
+        public double[] Volumes { get; init; } = [];
+        public double[] Atr { get; init; } = [];
+        public double[] Rsi { get; init; } = [];
+        public double[] Vwap { get; init; } = [];
+        public BollingerResult[] Bb { get; init; } = [];
+        public KeltnerResult[] Kc { get; init; } = [];
+        public StochasticResult[] Stoch { get; init; } = [];
+        public AdxResult[] Adx { get; init; } = [];
+        public double[] Rvol { get; init; } = [];
+    }
 }
 
 public sealed record V3LiveL1Snapshot(
@@ -212,4 +288,6 @@ public sealed record V3LiveFeatureSnapshot(
     double VolAccel,
     double OfiSignal,
     bool SqueezeOn,
+    double BbBandwidth,
+    double AtrRatio,
     string RejectReason) : IFeatureSnapshot;

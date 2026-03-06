@@ -16,6 +16,7 @@ using Harvester.App.Backtest.DataFetcher;
 using Harvester.App.Backtest.Engine;
 using Harvester.App.Backtest.Indicators;
 using Harvester.App.Backtest.Strategies;
+using Harvester.App.Strategy;
 
 namespace Harvester.App.Backtest.Runner;
 
@@ -227,8 +228,9 @@ public sealed class LivePaperBot
 
     /// <summary>
     /// Evaluate exit rules for an open position given the current price.
+    /// Delegates to the shared <see cref="ExitCascadeEngine"/> for core R-based exits,
+    /// then evaluates V5-specific reversal-flatten logic on top.
     /// Returns the exit reason if the position should be closed, null otherwise.
-    /// Also updates position state (peak, trailing stop, breakeven).
     /// </summary>
     public string? ManagePosition(string symbol, double currentPrice, DateTime nowEt,
         BacktestBar? lastBar = null, BacktestBar? prevBar = null)
@@ -239,87 +241,77 @@ public sealed class LivePaperBot
         if (!SymbolStrategy.TryGetValue(symbol, out var stratType))
             return null;
 
-        // Get config parameters based on strategy type
-        var (cfgStop, cfgTrail, cfgTp1, cfgTp2, cfgBe, cfgGiveback, v5Cfg, maxMinutes) =
-            GetExitParams(stratType);
-
         var rps = pos.RiskPerShare;
         if (rps <= 0) return null;
 
-        double unrealizedR, profitPerShare, peakR;
+        var isLong = pos.Side == TradeSide.Long;
 
-        if (pos.Side == TradeSide.Long)
-        {
-            unrealizedR = (currentPrice - pos.EntryPrice) / rps;
-            profitPerShare = currentPrice - pos.EntryPrice;
-            pos.PeakPrice = Math.Max(pos.PeakPrice, currentPrice);
-            peakR = (pos.PeakPrice - pos.EntryPrice) / rps;
-        }
-        else
-        {
-            unrealizedR = (pos.EntryPrice - currentPrice) / rps;
-            profitPerShare = pos.EntryPrice - currentPrice;
-            pos.PeakPrice = pos.PeakPrice > 0
-                ? Math.Min(pos.PeakPrice, currentPrice)
-                : currentPrice;
-            peakR = (pos.EntryPrice - pos.PeakPrice) / rps;
-        }
+        // Build shared cascade input
+        var cascadeParams = GetCascadeParams(stratType);
+        var holdSeconds = (nowEt - pos.EntryTimeEt).TotalSeconds;
+        var unrealizedPnlPeak = isLong
+            ? (pos.PeakPrice - pos.EntryPrice) * pos.Shares
+            : (pos.EntryPrice - pos.PeakPrice) * pos.Shares;
 
+        var input = new ExitCascadeInput
+        {
+            IsLong = isLong,
+            EntryPrice = pos.EntryPrice,
+            CurrentPrice = currentPrice,
+            StopPrice = pos.StopPrice,
+            AtrAtEntry = pos.AtrAtEntry,
+            RiskPerShare = rps,
+            PeakFavorablePrice = pos.PeakPrice,
+            TrailingStopPrice = pos.TrailingStop,
+            BreakevenActivated = pos.BreakevenActivated,
+            Tp1Activated = pos.Tp1Hit,
+            UnrealizedPnlPeak = Math.Max(0, unrealizedPnlPeak),
+            Quantity = pos.Shares,
+            HoldSeconds = holdSeconds,
+            Params = cascadeParams,
+        };
+
+        var result = ExitCascadeEngine.Evaluate(input);
+
+        // Apply state updates from the cascade engine
+        pos.PeakPrice = result.UpdatedPeakPrice;
+        pos.TrailingStop = result.UpdatedTrailingStop;
+        pos.StopPrice = result.UpdatedStopPrice;
+        pos.BreakevenActivated = result.UpdatedBreakevenActivated;
+        pos.Tp1Hit = result.UpdatedTp1Activated;
+
+        // Log position state
+        double unrealizedR = isLong
+            ? (currentPrice - pos.EntryPrice) / rps
+            : (pos.EntryPrice - currentPrice) / rps;
+        double peakR = isLong
+            ? (pos.PeakPrice - pos.EntryPrice) / rps
+            : (pos.EntryPrice - pos.PeakPrice) / rps;
         _log($"  [{symbol}] Price=${currentPrice:F2} UnR={unrealizedR:F2}R PeakR={peakR:F2}R");
 
-        string? exitReason = null;
-
-        // ═══ V5 MICRO-TRAIL ═══
-        if (v5Cfg != null && v5Cfg.MicroTrailCents > 0)
+        if (result.ShouldExit && !result.IsPartialExit)
         {
-            if (profitPerShare >= v5Cfg.MicroTrailActivateCents / 100.0)
-            {
-                var microTrailDist = v5Cfg.MicroTrailCents / 100.0;
-                if (pos.Side == TradeSide.Long)
-                {
-                    var microStop = pos.PeakPrice - microTrailDist;
-                    pos.TrailingStop = Math.Max(pos.TrailingStop, microStop);
-                    if (currentPrice <= pos.TrailingStop)
-                    {
-                        exitReason = "MICRO_TRAIL";
-                        _log($"    Micro-trail triggered: peak=${pos.PeakPrice:F2} trail=${pos.TrailingStop:F2}");
-                    }
-                }
-                else
-                {
-                    var microStop = pos.PeakPrice + microTrailDist;
-                    pos.TrailingStop = Math.Min(pos.TrailingStop, microStop);
-                    if (currentPrice >= pos.TrailingStop)
-                    {
-                        exitReason = "MICRO_TRAIL";
-                        _log($"    Micro-trail triggered: peak=${pos.PeakPrice:F2} trail=${pos.TrailingStop:F2}");
-                    }
-                }
-
-                // Update stop if moved (in live mode, this would update the broker stop)
-                if (exitReason == null && pos.TrailingStop != pos.StopPrice)
-                {
-                    pos.StopPrice = pos.TrailingStop;
-                }
-            }
+            _log($"    Exit: {result.ExitReason} — {result.Detail}");
+            return result.ExitReason;
         }
 
-        // ═══ V5 REVERSAL FLATTEN ═══
-        if (v5Cfg is { ReversalFlatten: true } && exitReason == null && unrealizedR > 0)
+        // ═══ V5 REVERSAL FLATTEN (backtest-specific, not in shared engine) ═══
+        var v5Cfg = GetV5Config(stratType);
+        if (v5Cfg is { ReversalFlatten: true } && unrealizedR > 0)
         {
             if (lastBar != null && prevBar != null)
             {
                 var barRange = lastBar.High - lastBar.Low;
                 if (barRange > 0)
                 {
-                    if (pos.Side == TradeSide.Long)
+                    if (isLong)
                     {
                         var upperWick = (lastBar.High - Math.Max(lastBar.Open, lastBar.Close)) / barRange;
                         var isEngulfing = lastBar.Close < lastBar.Open && lastBar.Close < prevBar.Open;
                         if (isEngulfing || upperWick > 0.6)
                         {
-                            exitReason = "REVERSAL_FLATTEN";
                             _log("    Reversal candle detected! Flattening LONG.");
+                            return "REVERSAL_FLATTEN";
                         }
                     }
                     else
@@ -328,77 +320,21 @@ public sealed class LivePaperBot
                         var isEngulfing = lastBar.Close > lastBar.Open && lastBar.Close > prevBar.Open;
                         if (isEngulfing || lowerWick > 0.6)
                         {
-                            exitReason = "REVERSAL_FLATTEN";
                             _log("    Reversal candle detected! Flattening SHORT.");
+                            return "REVERSAL_FLATTEN";
                         }
                     }
                 }
             }
         }
 
-        // TP2: full close
-        if (exitReason == null && unrealizedR >= cfgTp2)
-            exitReason = "TP2";
-
-        // Giveback
-        if (exitReason == null && peakR > 0 && unrealizedR > 0)
+        if (result.IsPartialExit)
         {
-            var giveback = (peakR - unrealizedR) / peakR;
-            if (giveback >= cfgGiveback)
-                exitReason = "GIVEBACK";
+            _log($"    Partial: {result.ExitReason} — {result.Detail}");
+            return result.ExitReason;
         }
 
-        // Trailing
-        if (exitReason == null && pos.BreakevenActivated)
-        {
-            var trailDist = cfgTrail * rps;
-            if (pos.Side == TradeSide.Long)
-            {
-                var newTrail = pos.PeakPrice - trailDist;
-                pos.TrailingStop = Math.Max(pos.TrailingStop, newTrail);
-                if (currentPrice <= pos.TrailingStop)
-                    exitReason = "TRAIL";
-            }
-            else
-            {
-                var newTrail = pos.PeakPrice + trailDist;
-                pos.TrailingStop = Math.Min(pos.TrailingStop, newTrail);
-                if (currentPrice >= pos.TrailingStop)
-                    exitReason = "TRAIL";
-            }
-        }
-
-        // TP1 → tighten stop to breakeven
-        if (unrealizedR >= cfgTp1 && !pos.Tp1Hit)
-        {
-            pos.Tp1Hit = true;
-            pos.BreakevenActivated = true;
-            var newStop = pos.EntryPrice;
-            pos.StopPrice = pos.Side == TradeSide.Long
-                ? Math.Max(pos.StopPrice, newStop)
-                : Math.Min(pos.StopPrice, newStop);
-            pos.TrailingStop = pos.StopPrice;
-            _log($"    TP1 hit! Stop moved to breakeven: ${pos.StopPrice:F2}");
-        }
-
-        // Breakeven
-        if (!pos.BreakevenActivated && unrealizedR >= cfgBe)
-        {
-            pos.BreakevenActivated = true;
-            var newStop = pos.EntryPrice;
-            pos.StopPrice = pos.Side == TradeSide.Long
-                ? Math.Max(pos.StopPrice, newStop)
-                : Math.Min(pos.StopPrice, newStop);
-            pos.TrailingStop = pos.StopPrice;
-            _log($"    Break-even activated! Stop: ${pos.StopPrice:F2}");
-        }
-
-        // Time stop
-        var elapsed = (nowEt - pos.EntryTimeEt).TotalMinutes;
-        if (exitReason == null && elapsed > maxMinutes)
-            exitReason = "TIME";
-
-        return exitReason;
+        return null;
     }
 
     /// <summary>
@@ -569,15 +505,65 @@ public sealed class LivePaperBot
         _ => new ConductStrategyV3(CfgTrend),
     };
 
-    private static (double Stop, double Trail, double Tp1, double Tp2, double Be, double Giveback, V5Config? V5, int MaxMinutes)
-        GetExitParams(LiveStrategyType stratType) => stratType switch
+    private static V5Config? GetV5Config(LiveStrategyType stratType) => stratType switch
     {
-        LiveStrategyType.TrendV13 => (CfgTrend.HardStopR, CfgTrend.TrailR, CfgTrend.Tp1R, CfgTrend.Tp2R, CfgTrend.BreakevenR, CfgTrend.GivebackPct, null, 90),
-        LiveStrategyType.V3Balanced => (CfgV3.HardStopR, CfgV3.TrailR, CfgV3.Tp1R, CfgV3.Tp2R, CfgV3.BreakevenR, CfgV3.GivebackPct, null, 90),
-        LiveStrategyType.V4ExhRunner => (CfgV4ExhRunner.HardStopR, CfgV4ExhRunner.TrailR, CfgV4ExhRunner.Tp1R, CfgV4ExhRunner.Tp2R, CfgV4ExhRunner.BreakevenR, CfgV4ExhRunner.GivebackPct, null, 120),
-        LiveStrategyType.V4ExhBase => (CfgV4ExhBase.HardStopR, CfgV4ExhBase.TrailR, CfgV4ExhBase.Tp1R, CfgV4ExhBase.Tp2R, CfgV4ExhBase.BreakevenR, CfgV4ExhBase.GivebackPct, null, 120),
-        LiveStrategyType.V5PullbackVwap => (CfgV5PullbackVwap.HardStopR, CfgV5PullbackVwap.TrailR, CfgV5PullbackVwap.Tp1R, CfgV5PullbackVwap.Tp2R, CfgV5PullbackVwap.BreakevenR, CfgV5PullbackVwap.GivebackPct, CfgV5PullbackVwap, (int)CfgV5PullbackVwap.MaxHoldBars),
-        LiveStrategyType.V5Tight => (CfgV5Tight.HardStopR, CfgV5Tight.TrailR, CfgV5Tight.Tp1R, CfgV5Tight.Tp2R, CfgV5Tight.BreakevenR, CfgV5Tight.GivebackPct, CfgV5Tight, (int)CfgV5Tight.MaxHoldBars),
-        _ => (CfgV4ExhBase.HardStopR, CfgV4ExhBase.TrailR, CfgV4ExhBase.Tp1R, CfgV4ExhBase.Tp2R, CfgV4ExhBase.BreakevenR, CfgV4ExhBase.GivebackPct, null, 90),
+        LiveStrategyType.V5PullbackVwap => CfgV5PullbackVwap,
+        LiveStrategyType.V5Tight => CfgV5Tight,
+        _ => null,
+    };
+
+    private static ExitCascadeParams GetCascadeParams(LiveStrategyType stratType) => stratType switch
+    {
+        LiveStrategyType.TrendV13 => new ExitCascadeParams
+        {
+            HardStopR = CfgTrend.HardStopR, TrailR = CfgTrend.TrailR,
+            Tp1R = CfgTrend.Tp1R, Tp2R = CfgTrend.Tp2R,
+            BreakevenR = CfgTrend.BreakevenR, GivebackPct = CfgTrend.GivebackPct,
+            MaxHoldSeconds = 90 * 60,
+        },
+        LiveStrategyType.V3Balanced => new ExitCascadeParams
+        {
+            HardStopR = CfgV3.HardStopR, TrailR = CfgV3.TrailR,
+            Tp1R = CfgV3.Tp1R, Tp2R = CfgV3.Tp2R,
+            BreakevenR = CfgV3.BreakevenR, GivebackPct = CfgV3.GivebackPct,
+            MaxHoldSeconds = 90 * 60,
+        },
+        LiveStrategyType.V4ExhRunner => new ExitCascadeParams
+        {
+            HardStopR = CfgV4ExhRunner.HardStopR, TrailR = CfgV4ExhRunner.TrailR,
+            Tp1R = CfgV4ExhRunner.Tp1R, Tp2R = CfgV4ExhRunner.Tp2R,
+            BreakevenR = CfgV4ExhRunner.BreakevenR, GivebackPct = CfgV4ExhRunner.GivebackPct,
+            MaxHoldSeconds = 120 * 60,
+        },
+        LiveStrategyType.V4ExhBase => new ExitCascadeParams
+        {
+            HardStopR = CfgV4ExhBase.HardStopR, TrailR = CfgV4ExhBase.TrailR,
+            Tp1R = CfgV4ExhBase.Tp1R, Tp2R = CfgV4ExhBase.Tp2R,
+            BreakevenR = CfgV4ExhBase.BreakevenR, GivebackPct = CfgV4ExhBase.GivebackPct,
+            MaxHoldSeconds = 120 * 60,
+        },
+        LiveStrategyType.V5PullbackVwap => new ExitCascadeParams
+        {
+            HardStopR = CfgV5PullbackVwap.HardStopR, TrailR = CfgV5PullbackVwap.TrailR,
+            Tp1R = CfgV5PullbackVwap.Tp1R, Tp2R = CfgV5PullbackVwap.Tp2R,
+            BreakevenR = CfgV5PullbackVwap.BreakevenR, GivebackPct = CfgV5PullbackVwap.GivebackPct,
+            MaxHoldSeconds = (int)CfgV5PullbackVwap.MaxHoldBars * 60,
+        },
+        LiveStrategyType.V5Tight => new ExitCascadeParams
+        {
+            HardStopR = CfgV5Tight.HardStopR, TrailR = CfgV5Tight.TrailR,
+            Tp1R = CfgV5Tight.Tp1R, Tp2R = CfgV5Tight.Tp2R,
+            BreakevenR = CfgV5Tight.BreakevenR, GivebackPct = CfgV5Tight.GivebackPct,
+            MicroTrailCents = CfgV5Tight.MicroTrailCents,
+            MicroTrailActivateCents = CfgV5Tight.MicroTrailActivateCents,
+            MaxHoldSeconds = (int)CfgV5Tight.MaxHoldBars * 60,
+        },
+        _ => new ExitCascadeParams
+        {
+            HardStopR = CfgV4ExhBase.HardStopR, TrailR = CfgV4ExhBase.TrailR,
+            Tp1R = CfgV4ExhBase.Tp1R, Tp2R = CfgV4ExhBase.Tp2R,
+            BreakevenR = CfgV4ExhBase.BreakevenR, GivebackPct = CfgV4ExhBase.GivebackPct,
+            MaxHoldSeconds = 90 * 60,
+        },
     };
 }

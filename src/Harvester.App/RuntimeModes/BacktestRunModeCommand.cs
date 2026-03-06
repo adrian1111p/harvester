@@ -1,6 +1,7 @@
 using Harvester.App.Backtest.Runner;
 using Harvester.App.Backtest.Strategies;
 using Harvester.App.IBKR.Runtime;
+using Harvester.App.Strategy;
 using Microsoft.Extensions.Logging;
 
 namespace Harvester.App.RuntimeModes;
@@ -11,7 +12,8 @@ public sealed class BacktestRunModeCommand : IRunModeCommand
     {
         return mode is RunMode.BacktestRun or RunMode.BacktestSweep
             or RunMode.BacktestOptimize or RunMode.BacktestScan
-            or RunMode.BacktestLiveSim or RunMode.BacktestCompare;
+            or RunMode.BacktestLiveSim or RunMode.BacktestCompare
+            or RunMode.BacktestWalkForward;
     }
 
     public Task<int> ExecuteAsync(AppOptions options, string[] args, ILoggerFactory loggerFactory)
@@ -86,6 +88,12 @@ public sealed class BacktestRunModeCommand : IRunModeCommand
 
             case RunMode.BacktestCompare:
                 StrategyComparisonRunner.RunAll(backtestSymbols, minTrades: 50);
+                break;
+
+            case RunMode.BacktestWalkForward:
+                var wfOutputDir = Path.Combine("exports", "walk_forward");
+                var wfo = new WalkForwardOrchestrator();
+                wfo.RunAndExport(wfOutputDir, backtestSymbols);
                 break;
         }
 

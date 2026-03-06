@@ -42,6 +42,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly V3LivePositionMonitor _positionMonitor;
     private readonly V3LiveExecutionStateMachine _executionStateMachine;
     private readonly V3LiveHistoricalBarDeduplicator _historicalBarDeduplicator = new();
+    private readonly SelfLearningSignalAdapter _selfLearningAdapter = new();
+    private readonly V3LiveTradeJournal _tradeJournal;
     private readonly ILogger<V3LiveRuntime> _logger;
 
     // ── Per-symbol state ───────────────────────────────────────────────────
@@ -78,6 +80,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         _candleAggregator = new V3LiveCandleAggregator(_timeProvider, _config.MaxCandleHistoryPerTimeframe);
         _positionTracker = new V3LivePositionTracker(_timeProvider);
         _executionStateMachine = new V3LiveExecutionStateMachine(_timeProvider);
+        _tradeJournal = new V3LiveTradeJournal(_timeProvider, logger);
         _logger = logger ?? NullLogger<V3LiveRuntime>.Instance;
     }
 
@@ -100,6 +103,13 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         _historicalBarDeduplicator.Reset();
         _executionStateMachine.Reset();
 
+        // ── Phase 3: Initialize trade journal JSONL file ──
+        var journalDir = string.IsNullOrWhiteSpace(context.OutputDirectory)
+            ? Path.Combine(Directory.GetCurrentDirectory(), "exports")
+            : context.OutputDirectory;
+        _tradeJournal.Initialize(journalDir);
+        _tradeJournal.Reset();
+
         lock (_intentLock) _pendingIntents.Clear();
 
         foreach (var symbol in _config.Symbols)
@@ -110,6 +120,17 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         // ── Startup diagnostics ──
         _config.LogEffectiveConfig(_logger);
         _config.Validate(_logger);
+
+        // ── Phase 2: Load self-learning recommendations if available ──
+        var selfLearnDir = Environment.GetEnvironmentVariable("V3LIVE_SELF_LEARNING_DIR") ?? "";
+        if (!string.IsNullOrWhiteSpace(selfLearnDir))
+        {
+            _selfLearningAdapter.TryLoadFromDirectory(selfLearnDir, _logger);
+        }
+        else
+        {
+            _logger.LogInformation("SelfLearning: V3LIVE_SELF_LEARNING_DIR not set — signal weight feedback disabled");
+        }
 
         _logger.LogInformation("V11Live initialized symbols={Symbols} account={Account}", string.Join(",", _config.Symbols), context.Account);
         return Task.CompletedTask;
@@ -132,6 +153,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 _closeOnly = false;
                 _positionTracker.ResetDaily();
                 _signalEngine.ResetState();
+                if (_featureBuilder is V3LiveFeatureBuilder fb) fb.ResetCache();
+                _tradeJournal.Reset();
                 foreach (var state in _stateBySymbol.Values)
                 {
                     state.EntriesToday = 0;
@@ -171,7 +194,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         UpdateCandleAggregator(symbol, dataSlice);
 
         // ── Step 3: Build features (L1 + L2 + indicators) ──
-        var features = _featureBuilder.Build(dataSlice, _config.DepthLevels);
+        var features = _featureBuilder.Build(dataSlice, _config.DepthLevels, symbol);
         var l1 = features.L1;
         var l2 = features.L2;
 
@@ -286,7 +309,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             ExitEvents: exitEventsSnapshot,
             RiskEvents: riskEventsSnapshot,
             ExecutionStatuses: executionSnapshot.Statuses,
-            ExecutionTransitions: executionSnapshot.Transitions);
+            ExecutionTransitions: executionSnapshot.Transitions,
+            TradeJournal: _tradeJournal.Snapshot());
 
         await _exporter.ExportAsync(payload, cancellationToken);
 
@@ -423,6 +447,68 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                     HoldSeconds: (now - position.EntryUtc).TotalSeconds,
                     EntryPrice: position.EntryPrice));
             }
+
+            // ── Phase 3: Trade Journal — record full exit ──
+            var journalIntentId = _tradeJournal.FindOpenIntentId(symbol) ?? position.IntentId;
+            _tradeJournal.RecordExit(
+                journalIntentId, now, exitPrice, (int)exitQty,
+                exitDecision.Reason, exitDecision.Detail,
+                position.UnrealizedPnl, position.UnrealizedPnlPeak,
+                (now - position.EntryUtc).TotalSeconds, position.EntryPrice,
+                position.MostFavorablePriceSinceEntry, position.MostAdversePriceSinceEntry,
+                position.RealizedPnl);
+        }
+        else if (exitDecision.IsPartialExit)
+        {
+            // Phase 1: Partial exit at TP1 — close a fraction while keeping the remainder open
+            var partialQty = exitDecision.PartialQuantity;
+            _logger.LogInformation("V3Live PARTIAL exit symbol={Symbol} qty={Qty} reason={Reason} detail={Detail}",
+                symbol, partialQty, exitDecision.Reason, exitDecision.Detail);
+
+            var exitSide = position.Side.ClosingSide();
+            var exitPrice = position.Side == PositionSide.Long
+                ? (features.L1.HasQuote ? features.L1.Bid : features.Price)
+                : (features.L1.HasQuote ? features.L1.Ask : features.Price);
+
+            var partialIntent = new LiveOrderIntent(
+                IntentId: $"V11PARTIAL-{symbol}-{now:yyyyMMddHHmmssfff}",
+                TimestampUtc: now,
+                Symbol: symbol,
+                Side: exitSide,
+                OrderType: OrderType.Market,
+                TimeInForce: OrderTimeInForce.Ioc,
+                Quantity: partialQty,
+                EntryPrice: exitPrice,
+                StopPrice: 0,
+                TakeProfitPrice: 0,
+                EstimatedRiskDollars: 0,
+                Setup: $"PARTIAL:{exitDecision.Reason}",
+                Source: "v11-live-partial-exit");
+
+            EnqueueIntent(partialIntent);
+
+            lock (_eventsLock)
+            {
+                _exitEvents.Add(new V3LiveExitEventRow(
+                    TimestampUtc: now,
+                    Symbol: symbol,
+                    Side: exitSide,
+                    Quantity: partialQty,
+                    ExitPrice: exitPrice,
+                    Reason: exitDecision.Reason,
+                    Detail: exitDecision.Detail,
+                    UnrealizedPnl: position.UnrealizedPnl,
+                    UnrealizedPnlPeak: position.UnrealizedPnlPeak,
+                    HoldSeconds: (now - position.EntryUtc).TotalSeconds,
+                    EntryPrice: position.EntryPrice));
+            }
+
+            // ── Phase 3: Trade Journal — record partial exit ──
+            var partialJournalId = _tradeJournal.FindOpenIntentId(symbol) ?? position.IntentId;
+            _tradeJournal.RecordPartialExit(
+                partialJournalId, now, exitPrice, partialQty,
+                exitDecision.Reason, exitDecision.Detail,
+                position.UnrealizedPnl, position.UnrealizedPnlPeak);
         }
         else if (exitDecision.IsAdvisory)
         {
@@ -495,6 +581,27 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         // ── Signal evaluation ──
         var decision = _signalEngine.Evaluate(features, _config, symbol);
 
+        // ── Phase 2: Self-learning signal weight feedback ──
+        // Apply per-symbol score adjustment from historical GLM bias.
+        // If the signal is borderline (just below threshold), a positive symbol bias
+        // can push it over; conversely a negative bias can suppress marginal signals.
+        if (_selfLearningAdapter.IsLoaded && decision.HasSignal == false && decision.Side == null)
+        {
+            // Signal didn't pass — check if symbol bias could have boosted it
+            var symAdj = _selfLearningAdapter.GetSymbolScoreAdjustment(symbol);
+            if (symAdj != 0)
+            {
+                // Re-evaluate isn't practical here; bias is informational for logging
+                _logger.LogTrace("SelfLearn symbol adjustment for {Symbol}: {Adj:+0;-0} (signal not passed)", symbol, symAdj);
+            }
+        }
+
+        // Warn if trading during historically worst hour
+        if (_selfLearningAdapter.IsLoaded && decision.HasSignal && _selfLearningAdapter.IsWorstHour(features.TimestampUtc))
+        {
+            _logger.LogWarning("SelfLearn: signal for {Symbol} during worst-performing hour (ET={Hour})", symbol, _selfLearningAdapter.WorstHourEt);
+        }
+
         // ── MTF confirmation (uses our own candle aggregator for live) ──
         if (_config.RequireMtfConfirmation && decision.HasSignal && decision.Side.HasValue)
         {
@@ -557,6 +664,33 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 }
                 else
                 {
+                    // ── Phase 2: Apply self-learning position size & stop distance multipliers ──
+                    if (_selfLearningAdapter.IsLoaded)
+                    {
+                        var posMult = _selfLearningAdapter.GetEffectivePositionSizeMultiplier(symbol);
+                        var stopMult = _selfLearningAdapter.GetEffectiveStopMultiplier();
+
+                        if (Math.Abs(posMult - 1.0) > 0.01 || Math.Abs(stopMult - 1.0) > 0.01)
+                        {
+                            var adjustedQty = Math.Max(1, (int)Math.Round(proposed.Quantity * posMult));
+                            var adjustedStopDist = Math.Abs(proposed.EntryPrice - proposed.StopPrice) * stopMult;
+                            var adjustedStopPrice = proposed.Side == OrderSide.Buy
+                                ? proposed.EntryPrice - adjustedStopDist
+                                : proposed.EntryPrice + adjustedStopDist;
+                            var adjustedRisk = adjustedStopDist * adjustedQty;
+
+                            proposed = proposed with
+                            {
+                                Quantity = adjustedQty,
+                                StopPrice = adjustedStopPrice,
+                                EstimatedRiskDollars = adjustedRisk
+                            };
+
+                            _logger.LogDebug("SelfLearn adjusted: {Symbol} qty={Qty} stop={Stop:F2} posMult={PM:F3} stopMult={SM:F3}",
+                                symbol, adjustedQty, adjustedStopPrice, posMult, stopMult);
+                        }
+                    }
+
                     // C-02/C-03 FIX: risk state from live position tracker
                     var riskState = _positionTracker.BuildRiskState(symbol);
                     riskState.HasOpenPosition = _positionTracker.HasOpenPosition(symbol);
@@ -587,6 +721,13 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
                         EnqueueIntent(liveIntent);
                         _logger.LogInformation("V11Live entry intent symbol={Symbol} side={Side} quantity={Quantity} entryPrice={EntryPrice} stopPrice={StopPrice} setup={Setup}", symbol, proposed.Side, proposed.Quantity, proposed.EntryPrice, proposed.StopPrice, proposed.Setup);
+
+                        // ── Phase 3: Trade Journal — record entry ──
+                        _tradeJournal.RecordEntry(
+                            proposed.IntentId, now, symbol,
+                            signalSide.ToString(), decision.Setup,
+                            features, proposed,
+                            decision.Regime.ToString());
                     }
                     else
                     {
@@ -597,6 +738,12 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                                 now, symbol, "order-rejected", orderIntentRejectReason,
                                 check.CurrentOpenRiskDollars, check.ProposedRiskDollars));
                         }
+
+                        // ── Phase 3: Trade Journal — record rejection ──
+                        _tradeJournal.RecordRejection(
+                            symbol, now, signalSide.ToString(), decision.Setup,
+                            decision.Regime.ToString(), string.Join(";", check.Reasons),
+                            check.ProposedRiskDollars, check.CurrentOpenRiskDollars);
                     }
                 }
             }

@@ -163,6 +163,7 @@ public sealed class V3LivePositionTracker
         tracked.UnrealizedPnl = 0;
         tracked.UnrealizedPnlPeak = 0;
         tracked.IsFlat = false;
+        tracked.Tp1Activated = false;
         _totalFilledOrdersToday++;
         } // lock
     }
@@ -295,6 +296,8 @@ public sealed class V3LiveTrackedPosition
     public double TakeProfitPrice { get; set; }
     /// <summary>ATR(14) captured at entry time — used for stop/TP calculations so they don't drift.</summary>
     public double EntryAtr14 { get; set; }
+    /// <summary>True once price has reached the TP1 zone. Prevents repeated partial closes.</summary>
+    public bool Tp1Activated { get; set; }
     public double LastMarkPrice { get; set; }
     public DateTime LastMarkUtc { get; set; }
     /// <summary>Best price since entry: highest for long, lowest for short.</summary>

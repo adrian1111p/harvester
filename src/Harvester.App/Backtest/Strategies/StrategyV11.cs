@@ -40,7 +40,7 @@ public sealed class V11Config
     public double GivebackPct { get; set; } = 0.30;
     public bool UseFixedGivebackUsdCap { get; set; } = true;
     public bool UseVariableGivebackUsdCap { get; set; } = true;
-    public double GivebackUsdCap { get; set; } = 30.0;
+    public double GivebackUsdCap { get; set; } = 38.0;
     public double Tp1R { get; set; } = 0.80;
     public double Tp2R { get; set; } = 1.45;
     public int MaxHoldBars { get; set; } = 30;
@@ -82,13 +82,15 @@ public sealed class StrategyV11 : BacktestStrategyBase
             RsiOversold = _cfg.RsiLongMax,
             RsiOverbought = _cfg.RsiShortMin,
             RequireVolumeConfirm = true,
-            HardStopR = Math.Max(1.1, _cfg.HardStopR),
-            TrailR = Math.Max(0.9, _cfg.TrailR),
-            GivebackPct = Math.Max(0.45, _cfg.GivebackPct),
-            Tp1R = Math.Max(0.8, _cfg.Tp1R),
-            Tp2R = Math.Max(1.8, _cfg.Tp2R),
-            BreakevenR = Math.Max(0.6, _cfg.BreakevenR),
-            MaxHoldBars = Math.Max(35, _cfg.MaxHoldBars),
+            // Phase 1 parity fix: use config values directly — no Math.Max() clamping.
+            // This ensures backtest and live use identical exit parameters.
+            HardStopR = _cfg.HardStopR,
+            TrailR = _cfg.TrailR,
+            GivebackPct = _cfg.GivebackPct,
+            Tp1R = _cfg.Tp1R,
+            Tp2R = _cfg.Tp2R,
+            BreakevenR = _cfg.BreakevenR,
+            MaxHoldBars = _cfg.MaxHoldBars,
             SlippageCents = _cfg.SlippageCents,
             CommissionPerShare = _cfg.CommissionPerShare,
             AllowLong = _cfg.AllowLong,

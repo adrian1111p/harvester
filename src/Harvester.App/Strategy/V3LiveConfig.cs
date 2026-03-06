@@ -57,10 +57,32 @@ public sealed record V3LiveConfig
     public double GivebackPct { get; init; } = 0.30;
     public bool UseFixedGivebackUsdCap { get; init; } = true;
     public bool UseVariableGivebackUsdCap { get; init; } = true;
-    public double GivebackUsdCap { get; init; } = 30.0;
+    public double GivebackUsdCap { get; init; } = 38.0;
     public double Tp1R { get; init; } = 0.8;
     public double Tp2R { get; init; } = 1.45;
     public int MaxHoldBars { get; init; } = 30;
+
+    // ── Phase 1: TP1 breakeven & partial exit ─────────────────────────────
+    /// <summary>When true, TP1 hit tightens the stop to breakeven (entry + buffer). Mirrors backtest ExitConfig.Tp1TightenToBe.</summary>
+    public bool Tp1TightenToBe { get; init; } = true;
+    /// <summary>Fraction of position to close at TP1 (e.g. 0.50 = close 50%). 0 = no partial close.</summary>
+    public double Tp1PartialClosePct { get; init; } = 0.50;
+    /// <summary>Buffer above entry (in ATR multiples) when moving stop to breakeven at TP1.</summary>
+    public double Tp1BreakevenBufferAtr { get; init; } = 0.02;
+
+    // ── Phase 2: Regime detection ───────────────────────────────────────
+    /// <summary>Extra score points required in ranging markets (ADX &lt; 20, tight BB). Default +1.</summary>
+    public int RegimeRangingScoreBoost { get; init; } = 1;
+    /// <summary>Extra score points required in volatile markets (high ATR ratio / wide BB). Default +1.</summary>
+    public int RegimeVolatileScoreBoost { get; init; } = 1;
+
+    // ── Phase 2: Time-of-day filters ────────────────────────────────────
+    /// <summary>Enable time-of-day signal score adjustments. Default true.</summary>
+    public bool EnableTimeOfDayFilter { get; init; } = true;
+    /// <summary>Score bonus applied during market open (first 90 min, 13:30-15:00 UTC). Default +1.</summary>
+    public int TodOpeningBonus { get; init; } = 1;
+    /// <summary>Score penalty applied during late session (18:00-20:00 UTC). Default -1.</summary>
+    public int TodAfternoonPenalty { get; init; } = -1;
 
     // ── Previously hardcoded constants (promoted from magic numbers) ──────
     /// <summary>Minimum consecutive squeeze bars before a breakout signal fires.</summary>
@@ -197,10 +219,18 @@ public sealed record V3LiveConfig
             GivebackPct = Math.Clamp(ReadDouble("V3LIVE_GIVEBACK_PCT", 0.30), 0.01, 1.0),
             UseFixedGivebackUsdCap = ReadBoolAny(["V11LIVE_USE_FIXED_GIVEBACK_USD_CAP", "V3LIVE_USE_FIXED_GIVEBACK_USD_CAP"], true),
             UseVariableGivebackUsdCap = ReadBoolAny(["V11LIVE_USE_VARIABLE_GIVEBACK_USD_CAP", "V3LIVE_USE_VARIABLE_GIVEBACK_USD_CAP"], true),
-            GivebackUsdCap = Math.Max(0.01, ReadDoubleAny(["V11LIVE_GIVEBACK_USD_CAP", "V3LIVE_GIVEBACK_USD_CAP"], 30.0)),
+            GivebackUsdCap = Math.Max(0.01, ReadDoubleAny(["V11LIVE_GIVEBACK_USD_CAP", "V3LIVE_GIVEBACK_USD_CAP"], 38.0)),
             Tp1R = Math.Max(0.1, ReadDoubleAny(["V11LIVE_TP1_R", "V3LIVE_TP1_R"], 0.8)),
             Tp2R = Math.Max(0.2, ReadDoubleAny(["V11LIVE_TP2_R", "V3LIVE_TP2_R"], 1.45)),
             MaxHoldBars = Math.Max(1, ReadIntAny(["V11LIVE_MAX_HOLD_BARS", "V3LIVE_MAX_HOLD_BARS"], 30)),
+            Tp1TightenToBe = ReadBoolAny(["V11LIVE_TP1_TIGHTEN_TO_BE", "V3LIVE_TP1_TIGHTEN_TO_BE"], true),
+            Tp1PartialClosePct = Math.Clamp(ReadDoubleAny(["V11LIVE_TP1_PARTIAL_CLOSE_PCT", "V3LIVE_TP1_PARTIAL_CLOSE_PCT"], 0.50), 0.0, 1.0),
+            Tp1BreakevenBufferAtr = Math.Max(0.0, ReadDoubleAny(["V11LIVE_TP1_BE_BUFFER_ATR", "V3LIVE_TP1_BE_BUFFER_ATR"], 0.02)),
+            RegimeRangingScoreBoost = Math.Max(0, ReadInt("V3LIVE_REGIME_RANGING_SCORE_BOOST", 1)),
+            RegimeVolatileScoreBoost = Math.Max(0, ReadInt("V3LIVE_REGIME_VOLATILE_SCORE_BOOST", 1)),
+            EnableTimeOfDayFilter = ReadBool("V3LIVE_ENABLE_TOD_FILTER", true),
+            TodOpeningBonus = Math.Max(0, ReadInt("V3LIVE_TOD_OPENING_BONUS", 1)),
+            TodAfternoonPenalty = Math.Min(0, ReadInt("V3LIVE_TOD_AFTERNOON_PENALTY", -1)),
             MinSqueezeBarCount = Math.Max(1, ReadInt("V3LIVE_MIN_SQUEEZE_BAR_COUNT", 8)),
             OfiTiebreakerThreshold = Math.Max(0.0, ReadDouble("V3LIVE_OFI_TIEBREAKER_THRESHOLD", 0.05)),
             ExitQuoteStalenessMultiplier = Math.Max(1, ReadInt("V3LIVE_EXIT_QUOTE_STALENESS_MULTIPLIER", 3)),
@@ -282,11 +312,16 @@ public sealed record V3LiveConfig
         logger.LogInformation(
             "V3LiveConfig effective: Symbols={Symbols} | Risk/Trade=${Risk} MaxDailyLoss=${MDL} MaxOpenRisk=${MOR} AccountSize=${Acct} | " +
             "HardStop={HS}R BE={BE}R Trail={TR}R TP1={TP1}R TP2={TP2}R Giveback={GB}% GivebackCap=${GBCap} | " +
+            "TP1_TightenBE={TP1BE} TP1_PartialPct={TP1Pct} TP1_BEBuffer={TP1Buf}ATR | " +
+            "Regime: RangingBoost={RB} VolatileBoost={VB} | TOD: Enabled={TOD} Open+{TOB} Afternoon{TAP} | " +
             "Session={Start}-{End}UTC MaxEntries={ME}/day Cooldown={CD}s | " +
             "L2={L2} MTF={MTF} Scanner={Scan} EmitOrders={Emit}",
             string.Join(",", Symbols),
             RiskPerTradeDollars, MaxDailyLossDollars, MaxOpenRiskDollars, AccountSize,
             HardStopR, BreakevenR, TrailR, Tp1R, Tp2R, GivebackPct * 100, GivebackUsdCap,
+            Tp1TightenToBe, Tp1PartialClosePct, Tp1BreakevenBufferAtr,
+            RegimeRangingScoreBoost, RegimeVolatileScoreBoost,
+            EnableTimeOfDayFilter, TodOpeningBonus, TodAfternoonPenalty,
             SessionStartUtc, SessionEndUtc,
             MaxEntriesPerSymbolPerDay, CooldownSeconds,
             RequireL2Depth, RequireMtfConfirmation, UseScannerSelectionV2Gate, EmitOrderIntents);

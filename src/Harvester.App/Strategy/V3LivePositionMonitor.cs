@@ -23,15 +23,19 @@ namespace Harvester.App.Strategy;
 public sealed class V3LivePositionMonitor
 {
     private readonly V3LiveConfig _config;
+    private readonly ExitCascadeParams _cascadeParams;
 
     public V3LivePositionMonitor(V3LiveConfig config)
     {
         _config = config;
+        _cascadeParams = ExitCascadeParams.FromLiveConfig(config);
     }
 
     /// <summary>
     /// Evaluate whether an open position should be exited.
     /// Called on every data tick (~1 second) for each symbol with an open position.
+    /// Delegates core R-based exits to <see cref="ExitCascadeEngine"/>,
+    /// then checks live-only conditions (L1 stale, L2 depth, squeeze, MTF reversal, session end).
     /// </summary>
     public V3LiveExitDecision Evaluate(
         V3LiveTrackedPosition position,
@@ -50,12 +54,13 @@ public sealed class V3LivePositionMonitor
 
         var isLong = position.Side == PositionSide.Long;
         var entryPrice = position.EntryPrice;
-        // Use entry-time ATR when available to prevent stop/TP drift as volatility changes
         var atrForRisk = position.EntryAtr14 > 0 && !double.IsNaN(position.EntryAtr14)
             ? position.EntryAtr14
             : (double.IsNaN(features.Atr14) || features.Atr14 <= 0 ? 1.0 : features.Atr14);
         var riskPerShare = _config.HardStopR * atrForRisk;
         var holdSeconds = (nowUtc - position.EntryUtc).TotalSeconds;
+
+        // ─── Live-only pre-checks (run before shared cascade) ───
 
         // --- E11: Session end / close-only mode ---
         if (closeOnlyMode)
@@ -75,101 +80,47 @@ public sealed class V3LivePositionMonitor
             }
         }
 
-        // --- E1: Hard stop ---
-        var stopDistance = riskPerShare;
-        var hardStopPrice = position.StopPrice > 0
-            ? position.StopPrice
-            : (isLong ? entryPrice - stopDistance : entryPrice + stopDistance);
-        if (isLong && price <= hardStopPrice)
+        // ─── Shared exit cascade (hard stop, TP2, giveback, trail, TP1, BE, time) ───
+        var cascadeInput = new ExitCascadeInput
         {
-            return V3LiveExitDecision.Exit("hard-stop",
-            $"Price {price:F2} <= stop {hardStopPrice:F2}");
-        }
-        if (!isLong && price >= hardStopPrice)
-        {
-            return V3LiveExitDecision.Exit("hard-stop",
-            $"Price {price:F2} >= stop {hardStopPrice:F2}");
-        }
+            IsLong = isLong,
+            EntryPrice = entryPrice,
+            CurrentPrice = price,
+            StopPrice = position.StopPrice,
+            AtrAtEntry = atrForRisk,
+            RiskPerShare = riskPerShare,
+            PeakFavorablePrice = position.MostFavorablePriceSinceEntry,
+            TrailingStopPrice = position.StopPrice, // live uses stop as trailing baseline
+            BreakevenActivated = position.Tp1Activated, // BE is TP1-gated in live
+            Tp1Activated = position.Tp1Activated,
+            UnrealizedPnlPeak = position.UnrealizedPnlPeak,
+            Quantity = position.Quantity,
+            HoldSeconds = holdSeconds,
+            Params = _cascadeParams,
+        };
 
-        // --- E7: Take-profit 2 (full exit) ---
-        var tp2Distance = _config.Tp2R * atrForRisk;
-        var tp2Price = position.TakeProfitPrice > 0
-            ? position.TakeProfitPrice
-            : (isLong ? entryPrice + tp2Distance : entryPrice - tp2Distance);
-        if (isLong && price >= tp2Price)
-        {
-            return V3LiveExitDecision.Exit("take-profit-2",
-            $"Price {price:F2} >= TP2 {tp2Price:F2}");
-        }
-        if (!isLong && price <= tp2Price)
-        {
-            return V3LiveExitDecision.Exit("take-profit-2",
-            $"Price {price:F2} <= TP2 {tp2Price:F2}");
-        }
+        var cascadeResult = ExitCascadeEngine.Evaluate(cascadeInput);
 
-        // --- E4: Giveback ---
-        if (position.UnrealizedPnlPeak > 0)
-        {
-            var giveback = position.UnrealizedPnlPeak - position.UnrealizedPnl;
-            var givebackPct = giveback / position.UnrealizedPnlPeak;
-            var effectiveUsdCap = _config.UseFixedGivebackUsdCap
-                ? Math.Max(0.0, _config.GivebackUsdCap)
-                : 0.0;
+        // Apply state updates from cascade engine to tracked position
+        position.StopPrice = cascadeResult.UpdatedStopPrice;
+        position.Tp1Activated = cascadeResult.UpdatedTp1Activated;
+        // MostFavorablePrice is managed by the tracker via UpdateMarkPrice, not overwritten here
 
-            if (effectiveUsdCap > 0)
+        if (cascadeResult.ShouldExit)
+        {
+            if (cascadeResult.IsPartialExit)
             {
-                if (position.UnrealizedPnl > 0 && giveback >= effectiveUsdCap)
-                {
-                    return V3LiveExitDecision.Exit("giveback-usd-cap",
-                        $"Gave back ${giveback:F2} (cap ${effectiveUsdCap:F2}) from peak ${position.UnrealizedPnlPeak:F2}");
-                }
+                return V3LiveExitDecision.PartialExit(cascadeResult.ExitReason!,
+                    cascadeResult.Detail, cascadeResult.PartialQuantity);
             }
-            else if (givebackPct >= _config.GivebackPct && position.UnrealizedPnlPeak >= riskPerShare * Math.Abs(position.Quantity) * 0.3)
-            {
-                return V3LiveExitDecision.Exit("giveback",
-                    $"Gave back {givebackPct:P0} of peak PnL (${position.UnrealizedPnlPeak:F2} → ${position.UnrealizedPnl:F2})");
-            }
+            return V3LiveExitDecision.Exit(cascadeResult.ExitReason!, cascadeResult.Detail);
         }
 
-        // --- E6: Trailing stop (after break-even activation) ---
-        var beActivationDistance = _config.BreakevenR * atrForRisk;
-        var trailDistance = _config.TrailR * atrForRisk;
-
-        if (isLong && position.MostFavorablePriceSinceEntry >= entryPrice + beActivationDistance)
-        {
-            var trailStop = position.MostFavorablePriceSinceEntry - trailDistance;
-            if (price <= trailStop)
-            {
-                return V3LiveExitDecision.Exit("trailing-stop",
-                    $"Price {price:F2} <= trail from peak {position.MostFavorablePriceSinceEntry:F2} - {trailDistance:F2}");
-            }
-        }
-        if (!isLong && position.MostFavorablePriceSinceEntry > 0 && position.MostFavorablePriceSinceEntry <= entryPrice - beActivationDistance)
-        {
-            var trailStop = position.MostFavorablePriceSinceEntry + trailDistance;
-            if (price >= trailStop)
-            {
-                return V3LiveExitDecision.Exit("trailing-stop",
-                    $"Price {price:F2} >= trail from peak {position.MostFavorablePriceSinceEntry:F2} + {trailDistance:F2}");
-            }
-        }
-
-        // --- E2: Time stop with progress check ---
-        var maxHoldSeconds = _config.MaxHoldBars * 60.0; // 1 bar = 1 minute in live context
-        if (holdSeconds >= maxHoldSeconds)
-        {
-            var progressR = position.UnrealizedPnl / (riskPerShare * Math.Abs(position.Quantity));
-            if (progressR < _config.TimeStopMinProgressR)
-            {
-                return V3LiveExitDecision.Exit("time-stop",
-                    $"Held {holdSeconds:F0}s (max {maxHoldSeconds:F0}s), progress only {progressR:F2}R");
-            }
-        }
+        // ─── Live-only post-checks (run after shared cascade) ───
 
         // --- E3: MTF reversal signal (short-term candles all reversed) ---
         if (isLong && mtfAlignment.ShortTermBearish)
         {
-            // Only exit on MTF reversal if we're at least at break-even or have some profit
             if (position.UnrealizedPnl >= 0)
             {
                 return V3LiveExitDecision.Exit("mtf-reversal",
@@ -202,19 +153,6 @@ public sealed class V3LivePositionMonitor
             var squeeze = EvaluateSqueezeRelease(position, features, candleSnapshot);
             if (squeeze is not null)
                 return squeeze;
-        }
-
-        // --- E7: Take-profit 1 (advisory — signal partial or tighten stop) ---
-        var tp1Distance = _config.Tp1R * atrForRisk;
-        if (isLong && price >= entryPrice + tp1Distance)
-        {
-            return V3LiveExitDecision.Advisory("take-profit-1-zone",
-                $"Price {price:F2} in TP1 zone (≥ {entryPrice + tp1Distance:F2}). Consider partial close.");
-        }
-        if (!isLong && price <= entryPrice - tp1Distance)
-        {
-            return V3LiveExitDecision.Advisory("take-profit-1-zone",
-                $"Price {price:F2} in TP1 zone (≤ {entryPrice - tp1Distance:F2}). Consider partial close.");
         }
 
         return V3LiveExitDecision.Hold("monitoring");
@@ -264,9 +202,12 @@ public sealed record V3LiveExitDecision
     public V3LiveExitAction Action { get; init; }
     public string Reason { get; init; } = string.Empty;
     public string Detail { get; init; } = string.Empty;
+    /// <summary>Quantity to close for PartialExit decisions. 0 for full exits.</summary>
+    public int PartialQuantity { get; init; }
 
     public bool ShouldExit => Action == V3LiveExitAction.Exit;
     public bool IsAdvisory => Action == V3LiveExitAction.Advisory;
+    public bool IsPartialExit => Action == V3LiveExitAction.PartialExit;
 
     public static V3LiveExitDecision Hold(string detail) =>
         new() { Action = V3LiveExitAction.Hold, Reason = "hold", Detail = detail };
@@ -276,11 +217,16 @@ public sealed record V3LiveExitDecision
 
     public static V3LiveExitDecision Advisory(string reason, string detail) =>
         new() { Action = V3LiveExitAction.Advisory, Reason = reason, Detail = detail };
+
+    public static V3LiveExitDecision PartialExit(string reason, string detail, int partialQuantity) =>
+        new() { Action = V3LiveExitAction.PartialExit, Reason = reason, Detail = detail, PartialQuantity = partialQuantity };
 }
 
 public enum V3LiveExitAction
 {
     Hold,
     Exit,
-    Advisory
+    Advisory,
+    /// <summary>Close a partial quantity (e.g. 50% at TP1) while keeping the remainder open.</summary>
+    PartialExit
 }
