@@ -6197,6 +6197,7 @@ public sealed partial class SnapshotRuntime
 
                 await NotifyScheduledEventsAsync(strategyContext, DateTime.UtcNow, token);
                 await NotifyStrategyDataSliceAsync(BuildStrategyDataSlice("strategy-live-v3"), token);
+                await TryTransmitLiveOrderIntentsAsync(client, brokerAdapter, token);
 
                 await Task.Delay(cadence, token);
             }
@@ -6227,6 +6228,90 @@ public sealed partial class SnapshotRuntime
         Console.WriteLine($"[OK] Strategy live V3 historical bars export: {barsPath} (rows={_wrapper.HistoricalBars.Count})");
         Console.WriteLine($"[OK] Strategy live V3 historical bar updates export: {barUpdatesPath} (rows={_wrapper.HistoricalBarUpdates.Count})");
         Console.WriteLine($"[OK] Strategy live V3 market data sanitization export: {sanitizationPath} (rows={_wrapper.MarketDataSanitizationRows.Count})");
+    }
+
+    private async Task TryTransmitLiveOrderIntentsAsync(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token)
+    {
+        if (_strategyRuntime is not ILiveOrderSignalSource liveSignalSource)
+        {
+            return;
+        }
+
+        IReadOnlyList<LiveOrderIntent> intents;
+        try
+        {
+            intents = liveSignalSource.ConsumeOrderIntents();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WARN] live intent consume failed: {ex.Message}");
+            return;
+        }
+
+        if (intents.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var intent in intents)
+        {
+            token.ThrowIfCancellationRequested();
+
+            try
+            {
+                var symbol = (intent.Symbol ?? string.Empty).Trim().ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(symbol) || intent.Quantity <= 0)
+                {
+                    Console.WriteLine($"[WARN] live intent skipped invalid payload intentId={intent.IntentId} symbol={intent.Symbol} quantity={intent.Quantity}");
+                    continue;
+                }
+
+                var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                    BrokerAssetType.Stock,
+                    symbol,
+                    "SMART",
+                    "USD",
+                    _options.PrimaryExchange));
+
+                var type = string.IsNullOrWhiteSpace(intent.OrderType)
+                    ? "MKT"
+                    : intent.OrderType.Trim().ToUpperInvariant();
+                var tif = string.IsNullOrWhiteSpace(intent.TimeInForce)
+                    ? "DAY"
+                    : intent.TimeInForce.Trim().ToUpperInvariant();
+
+                var orderIntent = new BrokerOrderIntent(
+                    Action: intent.Side,
+                    Type: type,
+                    Quantity: intent.Quantity,
+                    LimitPrice: type is "LMT" or "STP LMT" ? Math.Max(0.01, intent.EntryPrice) : null,
+                    StopPrice: type is "STP" or "STP LMT" ? Math.Max(0.01, intent.StopPrice) : null,
+                    TimeInForce: tif,
+                    WhatIf: false,
+                    Transmit: true,
+                    OrderRef: string.IsNullOrWhiteSpace(intent.IntentId) ? $"STRATLIVE_{DateTime.UtcNow:yyyyMMdd_HHmmss}" : intent.IntentId,
+                    Account: string.IsNullOrWhiteSpace(_options.UpdateAccount) ? _options.Account : _options.UpdateAccount);
+
+                var order = brokerAdapter.BuildOrder(orderIntent);
+                order.OrderId = await _wrapper.NextValidIdTask;
+                order.Transmit = true;
+
+                brokerAdapter.PlaceOrder(client, order.OrderId, contract, order);
+                _dailyTransmittedOrderCount++;
+
+                liveSignalSource.AcknowledgeOrderTransmitted(
+                    intent.IntentId,
+                    symbol,
+                    intent.Quantity,
+                    intent.EntryPrice);
+
+                Console.WriteLine($"[INFO] strategy-live-v3 intent transmitted intentId={intent.IntentId} symbol={symbol} side={intent.Side} qty={intent.Quantity} type={type}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[WARN] live intent transmit failed intentId={intent.IntentId}: {ex.Message}");
+            }
+        }
     }
 
     // ── V2 Self-Learning Bias Store persistence ──────────────────────

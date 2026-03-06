@@ -45,6 +45,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     // ── Per-symbol state ───────────────────────────────────────────────────
     private readonly Dictionary<string, V3LiveSymbolState> _stateBySymbol = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, HistoricalBarWatermark> _historicalBarWatermarkBySymbol = new(StringComparer.OrdinalIgnoreCase);
 
     // ── Live order intent queue (consumed by SnapshotRuntime via ILiveOrderSignalSource) ──
     private readonly List<LiveOrderIntent> _pendingIntents = [];
@@ -87,6 +88,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _riskEvents.Clear();
         }
         _stateBySymbol.Clear();
+        _historicalBarWatermarkBySymbol.Clear();
 
         lock (_intentLock) _pendingIntents.Clear();
 
@@ -322,10 +324,14 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     {
         _logger.LogInformation("V3Live order transmitted intentId={IntentId} symbol={Symbol} quantity={Quantity} fillPrice={FillPrice}", intentId, symbol, filledQuantity, fillPrice);
 
+        _stateBySymbol.TryGetValue(symbol, out var symbolState);
+        if (symbolState is not null)
+            symbolState.EntriesToday += 1;
+
         // Find the matching proposed order to get risk/side info
         var side = "LONG"; // default
         var estimatedRisk = 0.0;
-        if (_stateBySymbol.TryGetValue(symbol, out var symbolState) && symbolState.LastProposedOrder is not null)
+        if (symbolState?.LastProposedOrder is not null)
         {
             side = symbolState.LastProposedOrder.Side == "BUY" ? "LONG" : "SHORT";
             estimatedRisk = symbolState.LastProposedOrder.EstimatedRiskDollars;
@@ -577,7 +583,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                             Source: proposed.Source);
 
                         EnqueueIntent(liveIntent);
-                        symbolState.EntriesToday++;
                         _logger.LogInformation("V11Live entry intent symbol={Symbol} side={Side} quantity={Quantity} entryPrice={EntryPrice} stopPrice={StopPrice} setup={Setup}", symbol, proposed.Side, proposed.Quantity, proposed.EntryPrice, proposed.StopPrice, proposed.Setup);
                     }
                     else
@@ -591,10 +596,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                         }
                     }
                 }
-            }
-            else
-            {
-                symbolState.EntriesToday++;
             }
         }
 
@@ -633,11 +634,40 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     private void UpdateCandleAggregator(string symbol, StrategyDataSlice dataSlice)
     {
-        // Feed historical bars (1m bars from IBKR)
-        foreach (var bar in dataSlice.HistoricalBars)
+        // Feed historical bars (1m bars from IBKR) with dedupe watermark
+        var normalized = symbol.Trim().ToUpperInvariant();
+        _historicalBarWatermarkBySymbol.TryGetValue(normalized, out var watermark);
+
+        foreach (var bar in dataSlice.HistoricalBars.OrderBy(x => x.TimestampUtc))
         {
+            if (watermark is not null &&
+                bar.TimestampUtc == watermark.TimestampUtc &&
+                bar.Open == watermark.Open &&
+                bar.High == watermark.High &&
+                bar.Low == watermark.Low &&
+                bar.Close == watermark.Close &&
+                bar.Volume == watermark.Volume)
+            {
+                continue;
+            }
+
+            if (watermark is not null && bar.TimestampUtc < watermark.TimestampUtc)
+            {
+                continue;
+            }
+
             _candleAggregator.UpdateFromHistoricalBar(symbol, bar);
+            watermark = new HistoricalBarWatermark(
+                bar.TimestampUtc,
+                bar.Open,
+                bar.High,
+                bar.Low,
+                bar.Close,
+                bar.Volume);
         }
+
+        if (watermark is not null)
+            _historicalBarWatermarkBySymbol[normalized] = watermark;
 
         // Feed L1 last tick for sub-minute candle updates
         var lastTick = dataSlice.TopTicks
@@ -754,6 +784,14 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         /// <summary>Last accepted proposed order — cached for AcknowledgeOrderTransmitted.</summary>
         public V3LiveProposedOrder? LastProposedOrder { get; set; }
     }
+
+    private sealed record HistoricalBarWatermark(
+        DateTime TimestampUtc,
+        double Open,
+        double High,
+        double Low,
+        double Close,
+        decimal Volume);
 
     private sealed record V3LiveRuntimeSummary(
         DateTime TimestampUtc,
