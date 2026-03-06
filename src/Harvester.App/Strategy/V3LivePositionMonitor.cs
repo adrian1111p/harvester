@@ -73,28 +73,34 @@ public sealed class V3LivePositionMonitor
 
         // --- E1: Hard stop ---
         var stopDistance = riskPerShare;
-        if (isLong && price <= entryPrice - stopDistance)
+        var hardStopPrice = position.StopPrice > 0
+            ? position.StopPrice
+            : (isLong ? entryPrice - stopDistance : entryPrice + stopDistance);
+        if (isLong && price <= hardStopPrice)
         {
             return V3LiveExitDecision.Exit("hard-stop",
-                $"Price {price:F2} <= stop {entryPrice - stopDistance:F2}");
+            $"Price {price:F2} <= stop {hardStopPrice:F2}");
         }
-        if (!isLong && price >= entryPrice + stopDistance)
+        if (!isLong && price >= hardStopPrice)
         {
             return V3LiveExitDecision.Exit("hard-stop",
-                $"Price {price:F2} >= stop {entryPrice + stopDistance:F2}");
+            $"Price {price:F2} >= stop {hardStopPrice:F2}");
         }
 
         // --- E7: Take-profit 2 (full exit) ---
         var tp2Distance = _config.Tp2R * (double.IsNaN(features.Atr14) ? riskPerShare : features.Atr14);
-        if (isLong && price >= entryPrice + tp2Distance)
+        var tp2Price = position.TakeProfitPrice > 0
+            ? position.TakeProfitPrice
+            : (isLong ? entryPrice + tp2Distance : entryPrice - tp2Distance);
+        if (isLong && price >= tp2Price)
         {
             return V3LiveExitDecision.Exit("take-profit-2",
-                $"Price {price:F2} >= TP2 {entryPrice + tp2Distance:F2}");
+            $"Price {price:F2} >= TP2 {tp2Price:F2}");
         }
-        if (!isLong && price <= entryPrice - tp2Distance)
+        if (!isLong && price <= tp2Price)
         {
             return V3LiveExitDecision.Exit("take-profit-2",
-                $"Price {price:F2} <= TP2 {entryPrice - tp2Distance:F2}");
+            $"Price {price:F2} <= TP2 {tp2Price:F2}");
         }
 
         // --- E4: Giveback ---

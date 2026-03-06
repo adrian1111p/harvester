@@ -699,7 +699,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     /// <summary>
     /// Resolve the active symbol from available data sources.
-    /// Priority: 1) context.Symbol, 2) positions data, 3) TopTick.Kind, 4) config fallback.
+    /// Priority: 1) context.Symbol, 2) positions data, 3) config fallback.
     /// </summary>
     private string ResolveSymbol(StrategyDataSlice dataSlice)
     {
@@ -715,14 +715,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             .FirstOrDefault();
         if (!string.IsNullOrWhiteSpace(posSymbol))
             return posSymbol;
-
-        // Tertiary: extract from TopTick.Kind (carries symbol in some flows)
-        var tickSymbol = dataSlice.TopTicks
-            .Where(t => !string.IsNullOrWhiteSpace(t.Kind))
-            .Select(t => t.Kind.Trim().ToUpperInvariant())
-            .FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(tickSymbol))
-            return tickSymbol;
 
         // Fallback: first configured symbol
         return _config.Symbols.FirstOrDefault() ?? string.Empty;

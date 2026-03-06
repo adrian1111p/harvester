@@ -163,14 +163,21 @@ public sealed class V3LivePositionTracker
         _totalRealizedPnlToday += realizedPnl;
         tracked.OpenRiskDollars = 0;
 
-        if (Math.Abs(closedQuantity) >= Math.Abs(tracked.Quantity))
+        var closeQty = Math.Abs(closedQuantity);
+        var currentQtyAbs = Math.Abs(tracked.Quantity);
+
+        if (closeQty >= currentQtyAbs)
         {
             tracked.Quantity = 0;
             tracked.IsFlat = true;
         }
         else
         {
-            tracked.Quantity -= closedQuantity;
+            var residualQtyAbs = currentQtyAbs - closeQty;
+            tracked.Quantity = tracked.Side == "SHORT"
+                ? -residualQtyAbs
+                : residualQtyAbs;
+            tracked.IsFlat = false;
         }
     }
 
