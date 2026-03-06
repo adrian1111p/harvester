@@ -11,7 +11,7 @@ public enum V3LiveExecutionState
 public sealed record V3LiveExecutionIntentStatus(
     string IntentId,
     string Symbol,
-    string Side,
+    OrderSide Side,
     int Quantity,
     V3LiveExecutionState State,
     DateTime CreatedUtc,
@@ -38,6 +38,12 @@ public sealed class V3LiveExecutionStateMachine
     private readonly object _sync = new();
     private readonly Dictionary<string, V3LiveExecutionIntentStatus> _statusByIntentId = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<V3LiveExecutionTransition> _transitions = [];
+    private readonly TimeProvider _timeProvider;
+
+    public V3LiveExecutionStateMachine(TimeProvider? timeProvider = null)
+    {
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
 
     public void Reset()
     {
@@ -55,7 +61,7 @@ public sealed class V3LiveExecutionStateMachine
 
         lock (_sync)
         {
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             var created = new V3LiveExecutionIntentStatus(
                 IntentId: intent.IntentId,
                 Symbol: (intent.Symbol ?? string.Empty).Trim().ToUpperInvariant(),
@@ -84,7 +90,7 @@ public sealed class V3LiveExecutionStateMachine
 
             if (status.State == V3LiveExecutionState.Created)
             {
-                var now = DateTime.UtcNow;
+                var now = _timeProvider.GetUtcNow().UtcDateTime;
                 var updated = status with
                 {
                     State = V3LiveExecutionState.Dequeued,
@@ -115,14 +121,15 @@ public sealed class V3LiveExecutionStateMachine
         {
             if (!_statusByIntentId.TryGetValue(intentId, out var status))
             {
+                var fallbackNow = _timeProvider.GetUtcNow().UtcDateTime;
                 status = new V3LiveExecutionIntentStatus(
                     IntentId: intentId,
                     Symbol: (symbol ?? string.Empty).Trim().ToUpperInvariant(),
-                    Side: string.Empty,
+                    Side: OrderSide.Buy, // default when intent not found
                     Quantity: (int)Math.Round(Math.Abs(quantity)),
                     State: V3LiveExecutionState.Transmitted,
-                    CreatedUtc: DateTime.UtcNow,
-                    LastUpdatedUtc: DateTime.UtcNow,
+                    CreatedUtc: fallbackNow,
+                    LastUpdatedUtc: fallbackNow,
                     LastKnownPrice: fillPrice,
                     RealizedPnl: 0.0,
                     Notes: "transmitted-without-create");
@@ -135,7 +142,7 @@ public sealed class V3LiveExecutionStateMachine
             if (from == V3LiveExecutionState.Transmitted || from == V3LiveExecutionState.Closed)
                 return;
 
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             var updated = status with
             {
                 State = V3LiveExecutionState.Transmitted,
@@ -175,7 +182,7 @@ public sealed class V3LiveExecutionStateMachine
             if (candidate is null)
                 return;
 
-            var now = DateTime.UtcNow;
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
             var updated = candidate with
             {
                 State = V3LiveExecutionState.Closed,

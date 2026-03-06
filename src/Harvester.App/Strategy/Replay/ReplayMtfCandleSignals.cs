@@ -9,7 +9,11 @@ public sealed record ReplayMtfSignalSnapshot(
     bool BearishEntryReady,
     bool ExitLongSignal,
     bool ExitShortSignal
-);
+) : IMtfAlignment
+{
+    bool IMtfAlignment.IsBullish => BullishEntryReady;
+    bool IMtfAlignment.IsBearish => BearishEntryReady;
+}
 
 public interface IReplayMtfSignalSource
 {
@@ -206,11 +210,7 @@ public sealed class ReplayMtfCandleSignalEngine : IReplayMtfSignalSource
     }
 
     private static DateTime AlignToBucketStart(DateTime timestampUtc, int bucketSeconds)
-    {
-        var epochSeconds = (long)(timestampUtc - DateTime.UnixEpoch).TotalSeconds;
-        var aligned = epochSeconds - (epochSeconds % Math.Max(1, bucketSeconds));
-        return DateTime.UnixEpoch.AddSeconds(aligned);
-    }
+        => CandleTimeUtils.AlignToBucketStart(timestampUtc, bucketSeconds);
 
     private sealed class SymbolState
     {

@@ -1,5 +1,3 @@
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using Harvester.App.Backtest.Engine;
 using Harvester.App.IBKR.Runtime;
 using Microsoft.Extensions.Logging;
@@ -27,21 +25,22 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 {
     // ── Core config & context ──────────────────────────────────────────────
     private readonly V3LiveConfig _config;
+    private readonly TimeProvider _timeProvider;
     private StrategyRuntimeContext? _context;
     private bool _closeOnly;
 
     // ── Sub-engines ────────────────────────────────────────────────────────
-    private readonly V3LiveFeatureBuilder _featureBuilder = new();
-    private readonly V3LiveSignalEngine _signalEngine = new();
-    private readonly V3LiveRiskGuard _riskGuard;
+    private readonly ILiveFeatureBuilder _featureBuilder = new V3LiveFeatureBuilder();
+    private readonly ILiveSignalEngine _signalEngine = new V3LiveSignalEngine();
+    private readonly ILiveRiskGuard _riskGuard;
     private readonly V3LiveOrderBridge _orderBridge;
     private readonly HashSet<string> _tradeUniverse;
 
     // ── New components (audit fixes) ───────────────────────────────────────
-    private readonly V3LiveCandleAggregator _candleAggregator = new();
-    private readonly V3LivePositionTracker _positionTracker = new();
+    private readonly V3LiveCandleAggregator _candleAggregator;
+    private readonly V3LivePositionTracker _positionTracker;
     private readonly V3LivePositionMonitor _positionMonitor;
-    private readonly V3LiveExecutionStateMachine _executionStateMachine = new();
+    private readonly V3LiveExecutionStateMachine _executionStateMachine;
     private readonly V3LiveHistoricalBarDeduplicator _historicalBarDeduplicator = new();
     private readonly ILogger<V3LiveRuntime> _logger;
 
@@ -52,16 +51,22 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly List<LiveOrderIntent> _pendingIntents = [];
     private readonly object _intentLock = new();
 
+    // ── Data-path lock: serialises OnDataAsync vs host callbacks ───────────
+    private readonly object _dataLock = new();
+
     // ── Logging / export ───────────────────────────────────────────────────
     private readonly List<V3LiveEvaluationRow> _evaluations = [];
     private readonly List<V3LiveSignalRow> _signals = [];
     private readonly List<V3LiveExitEventRow> _exitEvents = [];
     private readonly List<V3LiveRiskEventRow> _riskEvents = [];
     private readonly object _eventsLock = new();
+    private readonly IStrategyExporter _exporter;
 
-    public V3LiveRuntime(V3LiveConfig? config = null, ILogger<V3LiveRuntime>? logger = null)
+    public V3LiveRuntime(V3LiveConfig? config = null, ILogger<V3LiveRuntime>? logger = null, TimeProvider? timeProvider = null, IStrategyExporter? exporter = null)
     {
         _config = config ?? V3LiveConfig.FromEnvironment();
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _exporter = exporter ?? new JsonStrategyExporter();
         _tradeUniverse = new HashSet<string>(
             _config.Symbols
                 .Where(s => !string.IsNullOrWhiteSpace(s))
@@ -70,6 +75,9 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         _riskGuard = new V3LiveRiskGuard(_config);
         _orderBridge = new V3LiveOrderBridge(_config);
         _positionMonitor = new V3LivePositionMonitor(_config);
+        _candleAggregator = new V3LiveCandleAggregator(_timeProvider, _config.MaxCandleHistoryPerTimeframe);
+        _positionTracker = new V3LivePositionTracker(_timeProvider);
+        _executionStateMachine = new V3LiveExecutionStateMachine(_timeProvider);
         _logger = logger ?? NullLogger<V3LiveRuntime>.Instance;
     }
 
@@ -99,31 +107,38 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _stateBySymbol[symbol] = new V3LiveSymbolState();
         }
 
+        // ── Startup diagnostics ──
+        _config.LogEffectiveConfig(_logger);
+        _config.Validate(_logger);
+
         _logger.LogInformation("V11Live initialized symbols={Symbols} account={Account}", string.Join(",", _config.Symbols), context.Account);
         return Task.CompletedTask;
     }
 
     public Task OnScheduledEventAsync(string eventName, StrategyRuntimeContext context, CancellationToken cancellationToken)
     {
-        if (string.Equals(eventName, "market-close-warning", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(eventName, "pre-close", StringComparison.OrdinalIgnoreCase))
+        lock (_dataLock)
         {
-            _closeOnly = true;
-            _logger.LogInformation("V11Live close-only mode activated");
-        }
-
-        if (string.Equals(eventName, "mode-start", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(eventName, "session-open-reset", StringComparison.OrdinalIgnoreCase))
-        {
-            _closeOnly = false;
-            _positionTracker.ResetDaily();
-            _signalEngine.ResetState();
-            foreach (var state in _stateBySymbol.Values)
+            if (string.Equals(eventName, "market-close-warning", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(eventName, "pre-close", StringComparison.OrdinalIgnoreCase))
             {
-                state.EntriesToday = 0;
-                state.LastSignalUtc = null;
+                _closeOnly = true;
+                _logger.LogInformation("V11Live close-only mode activated");
             }
-            _logger.LogInformation("V11Live session reset; daily counters cleared");
+
+            if (string.Equals(eventName, "mode-start", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(eventName, "session-open-reset", StringComparison.OrdinalIgnoreCase))
+            {
+                _closeOnly = false;
+                _positionTracker.ResetDaily();
+                _signalEngine.ResetState();
+                foreach (var state in _stateBySymbol.Values)
+                {
+                    state.EntriesToday = 0;
+                    state.LastSignalUtc = null;
+                }
+                _logger.LogInformation("V11Live session reset; daily counters cleared");
+            }
         }
 
         return Task.CompletedTask;
@@ -131,6 +146,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     public Task OnDataAsync(StrategyDataSlice dataSlice, CancellationToken cancellationToken)
     {
+        lock (_dataLock)
+        {
         var symbol = V3LiveSymbolResolver.Resolve(_context?.Symbol, dataSlice.Positions, _config.Symbols);
         if (string.IsNullOrWhiteSpace(symbol))
             return Task.CompletedTask;
@@ -206,6 +223,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             }
         }
 
+        } // lock (_dataLock)
+
         return Task.CompletedTask;
     }
 
@@ -215,29 +234,13 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             ? Path.Combine(Directory.GetCurrentDirectory(), "exports")
             : context.OutputDirectory;
 
-        Directory.CreateDirectory(outputDir);
-        var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-
-        var options = new JsonSerializerOptions
-        {
-            WriteIndented = true,
-            NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals
-        };
+        var stamp = _timeProvider.GetUtcNow().UtcDateTime.ToString("yyyyMMdd_HHmmss");
 
         // Build position summary from tracker
-        var positionSummaries = _positionTracker.Positions.Values.Select(p => new
-        {
-            p.Symbol,
-            p.Side,
-            p.Quantity,
-            p.EntryPrice,
-            p.LastMarkPrice,
-            p.UnrealizedPnl,
-            p.RealizedPnl,
-            p.PeakPriceSinceEntry,
-            p.TroughPriceSinceEntry,
-            p.IsFlat
-        }).ToArray();
+        var positionSummaries = _positionTracker.Positions.Values.Select(p => new V3LivePositionSummary(
+            p.Symbol, p.Side, p.Quantity, p.EntryPrice, p.LastMarkPrice,
+            p.UnrealizedPnl, p.RealizedPnl, p.MostFavorablePriceSinceEntry,
+            p.MostAdversePriceSinceEntry, p.IsFlat)).ToArray();
 
         V3LiveEvaluationRow[] evaluationsSnapshot;
         V3LiveSignalRow[] signalsSnapshot;
@@ -262,7 +265,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         }
 
         var summary = new V3LiveRuntimeSummary(
-            TimestampUtc: DateTime.UtcNow,
+            TimestampUtc: _timeProvider.GetUtcNow().UtcDateTime,
             ExitCode: exitCode,
             Symbols: _config.Symbols,
             Evaluations: evaluationCount,
@@ -273,45 +276,19 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             FilledOrdersToday: _positionTracker.TotalFilledOrdersToday,
             Config: _config);
 
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_runtime_summary_{stamp}.json"),
-            JsonSerializer.Serialize(summary, options),
-            cancellationToken);
+        var payload = new V3LiveExportPayload(
+            OutputDirectory: outputDir,
+            TimestampStamp: stamp,
+            Summary: summary,
+            Positions: positionSummaries,
+            Evaluations: evaluationsSnapshot,
+            Signals: signalsSnapshot,
+            ExitEvents: exitEventsSnapshot,
+            RiskEvents: riskEventsSnapshot,
+            ExecutionStatuses: executionSnapshot.Statuses,
+            ExecutionTransitions: executionSnapshot.Transitions);
 
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_evaluations_{stamp}.json"),
-            JsonSerializer.Serialize(evaluationsSnapshot, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_signals_{stamp}.json"),
-            JsonSerializer.Serialize(signalsSnapshot, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_exit_events_{stamp}.json"),
-            JsonSerializer.Serialize(exitEventsSnapshot, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_risk_events_{stamp}.json"),
-            JsonSerializer.Serialize(riskEventsSnapshot, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_positions_{stamp}.json"),
-            JsonSerializer.Serialize(positionSummaries, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_execution_intents_{stamp}.json"),
-            JsonSerializer.Serialize(executionSnapshot.Statuses, options),
-            cancellationToken);
-
-        await File.WriteAllTextAsync(
-            Path.Combine(outputDir, $"v3live_execution_transitions_{stamp}.json"),
-            JsonSerializer.Serialize(executionSnapshot.Transitions, options),
-            cancellationToken);
+        await _exporter.ExportAsync(payload, cancellationToken);
 
         _logger.LogInformation("V3Live shutdown evaluations={Evaluations} signals={Signals} exits={Exits} pnl={Pnl}", evaluationCount, signalsSnapshot.Length, exitEventCount, _positionTracker.TotalRealizedPnlToday);
     }
@@ -339,6 +316,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     public void AcknowledgeOrderTransmitted(string intentId, string symbol, double filledQuantity, double fillPrice)
     {
+        lock (_dataLock)
+        {
         _logger.LogInformation("V3Live order transmitted intentId={IntentId} symbol={Symbol} quantity={Quantity} fillPrice={FillPrice}", intentId, symbol, filledQuantity, fillPrice);
 
         _stateBySymbol.TryGetValue(symbol, out var symbolState);
@@ -346,11 +325,11 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             symbolState.EntriesToday += 1;
 
         // Find the matching proposed order to get risk/side info
-        var side = "LONG"; // default
+        var side = PositionSide.Long; // default
         var estimatedRisk = 0.0;
         if (symbolState?.LastProposedOrder is not null)
         {
-            side = symbolState.LastProposedOrder.Side == "BUY" ? "LONG" : "SHORT";
+            side = symbolState.LastProposedOrder.Side.ToPositionSide();
             estimatedRisk = symbolState.LastProposedOrder.EstimatedRiskDollars;
         }
 
@@ -363,14 +342,19 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         {
             tracked.StopPrice = symbolState.LastProposedOrder.StopPrice;
             tracked.TakeProfitPrice = symbolState.LastProposedOrder.TakeProfitPrice;
+            tracked.EntryAtr14 = symbolState.LastProposedOrder.Atr14;
         }
+        } // lock (_dataLock)
     }
 
     public void AcknowledgePositionClosed(string symbol, double closedQuantity, double realizedPnl)
     {
+        lock (_dataLock)
+        {
         _logger.LogInformation("V3Live position closed symbol={Symbol} quantity={Quantity} realizedPnl={RealizedPnl}", symbol, closedQuantity, realizedPnl);
         _positionTracker.RecordClose(symbol, closedQuantity, realizedPnl);
         _executionStateMachine.OnPositionClosed(symbol, closedQuantity, realizedPnl);
+        } // lock (_dataLock)
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -401,9 +385,9 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _logger.LogInformation("V3Live exit signal symbol={Symbol} reason={Reason} detail={Detail}", symbol, exitDecision.Reason, exitDecision.Detail);
 
             // Build exit order intent
-            var exitSide = position.Side == "LONG" ? "SELL" : "BUY";
+            var exitSide = position.Side.ClosingSide();
             var exitQty = Math.Abs(position.Quantity);
-            var exitPrice = position.Side == "LONG"
+            var exitPrice = position.Side == PositionSide.Long
                 ? (features.L1.HasQuote ? features.L1.Bid : features.Price)
                 : (features.L1.HasQuote ? features.L1.Ask : features.Price);
 
@@ -412,8 +396,8 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
                 TimestampUtc: now,
                 Symbol: symbol,
                 Side: exitSide,
-                OrderType: "MKT",
-                TimeInForce: "IOC",
+                OrderType: OrderType.Market,
+                TimeInForce: OrderTimeInForce.Ioc,
                 Quantity: (int)exitQty,
                 EntryPrice: exitPrice,
                 StopPrice: 0,
@@ -693,8 +677,16 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     private bool IsWithinSession(DateTime timestampUtc)
     {
-        if (!TimeSpan.TryParse(_config.SessionStartUtc, out var start)) return true;
-        if (!TimeSpan.TryParse(_config.SessionEndUtc, out var end)) return true;
+        if (!TimeSpan.TryParse(_config.SessionStartUtc, out var start))
+        {
+            _logger.LogWarning("V11Live session-start parse failed value={Value}, defaulting to all-hours", _config.SessionStartUtc);
+            return true;
+        }
+        if (!TimeSpan.TryParse(_config.SessionEndUtc, out var end))
+        {
+            _logger.LogWarning("V11Live session-end parse failed value={Value}, defaulting to all-hours", _config.SessionEndUtc);
+            return true;
+        }
 
         var t = timestampUtc.TimeOfDay;
         return t >= start && t <= end;
@@ -718,76 +710,78 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         /// <summary>Last accepted proposed order — cached for AcknowledgeOrderTransmitted.</summary>
         public V3LiveProposedOrder? LastProposedOrder { get; set; }
     }
-
-    private sealed record V3LiveRuntimeSummary(
-        DateTime TimestampUtc,
-        int ExitCode,
-        IReadOnlyList<string> Symbols,
-        int Evaluations,
-        int Passed,
-        int Failed,
-        int ExitEvents,
-        double RealizedPnlToday,
-        int FilledOrdersToday,
-        V3LiveConfig Config);
-
-    private sealed record V3LiveEvaluationRow(
-        DateTime TimestampUtc,
-        string Symbol,
-        bool PassedPreTradeGates,
-        bool EmittedSignal,
-        string SignalSide,
-        string SignalSetup,
-        bool OrderIntentAccepted,
-        string OrderIntentId,
-        string OrderIntentRejectReason,
-        IReadOnlyList<string> ReasonCodes,
-        double Bid,
-        double Ask,
-        double Last,
-        double SpreadPct,
-        double BidDepthN,
-        double AskDepthN,
-        double ImbalanceRatio,
-        double OfiSignal,
-        double DistFromVwapAtr,
-        double Rsi14,
-        double BbPctB,
-        int EntriesToday,
-        bool CloseOnlyMode);
-
-    private sealed record V3LiveSignalRow(
-        DateTime TimestampUtc,
-        string Symbol,
-        string Side,
-        string Setup,
-        double Price,
-        double Atr14,
-        double Rsi14,
-        double DistFromVwapAtr,
-        double BbPctB,
-        double ImbalanceRatio,
-        double OfiSignal,
-        double SpreadPct);
-
-    private sealed record V3LiveExitEventRow(
-        DateTime TimestampUtc,
-        string Symbol,
-        string Side,
-        int Quantity,
-        double ExitPrice,
-        string Reason,
-        string Detail,
-        double UnrealizedPnl,
-        double UnrealizedPnlPeak,
-        double HoldSeconds,
-        double EntryPrice);
-
-    private sealed record V3LiveRiskEventRow(
-        DateTime TimestampUtc,
-        string Symbol,
-        string EventType,
-        string Reason,
-        double CurrentOpenRiskDollars,
-        double ProposedRiskDollars);
 }
+
+// ─── Export record types (shared with IStrategyExporter) ─────────────────────
+
+public sealed record V3LiveRuntimeSummary(
+    DateTime TimestampUtc,
+    int ExitCode,
+    IReadOnlyList<string> Symbols,
+    int Evaluations,
+    int Passed,
+    int Failed,
+    int ExitEvents,
+    double RealizedPnlToday,
+    int FilledOrdersToday,
+    V3LiveConfig Config);
+
+public sealed record V3LiveEvaluationRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    bool PassedPreTradeGates,
+    bool EmittedSignal,
+    string SignalSide,
+    string SignalSetup,
+    bool OrderIntentAccepted,
+    string OrderIntentId,
+    string OrderIntentRejectReason,
+    IReadOnlyList<string> ReasonCodes,
+    double Bid,
+    double Ask,
+    double Last,
+    double SpreadPct,
+    double BidDepthN,
+    double AskDepthN,
+    double ImbalanceRatio,
+    double OfiSignal,
+    double DistFromVwapAtr,
+    double Rsi14,
+    double BbPctB,
+    int EntriesToday,
+    bool CloseOnlyMode);
+
+public sealed record V3LiveSignalRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string Side,
+    string Setup,
+    double Price,
+    double Atr14,
+    double Rsi14,
+    double DistFromVwapAtr,
+    double BbPctB,
+    double ImbalanceRatio,
+    double OfiSignal,
+    double SpreadPct);
+
+public sealed record V3LiveExitEventRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    OrderSide Side,
+    int Quantity,
+    double ExitPrice,
+    string Reason,
+    string Detail,
+    double UnrealizedPnl,
+    double UnrealizedPnlPeak,
+    double HoldSeconds,
+    double EntryPrice);
+
+public sealed record V3LiveRiskEventRow(
+    DateTime TimestampUtc,
+    string Symbol,
+    string EventType,
+    string Reason,
+    double CurrentOpenRiskDollars,
+    double ProposedRiskDollars);

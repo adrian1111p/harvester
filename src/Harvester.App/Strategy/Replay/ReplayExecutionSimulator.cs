@@ -21,7 +21,11 @@ public sealed record ReplayOrderIntent(
     string OcoGroup = "",
     string ComboGroupId = "",
     string Route = ""
-);
+) : IOrderIntent
+{
+    string IOrderIntent.SideLabel => Side;
+    double IOrderIntent.OrderQuantity => Quantity;
+}
 
 public sealed record ReplayFillRow(
     DateTime TimestampUtc,

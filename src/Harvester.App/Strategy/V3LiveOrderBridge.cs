@@ -41,20 +41,21 @@ public sealed class V3LiveOrderBridge
             : entryPrice - _config.Tp2R * features.Atr14;
 
         var estimatedRisk = riskPerShare * quantity;
-        var action = side == TradeSide.Long ? "BUY" : "SELL";
+        var action = side == TradeSide.Long ? OrderSide.Buy : OrderSide.Sell;
 
         return new V3LiveProposedOrder(
             IntentId: $"V11LIVE-{symbol}-{timestampUtc:yyyyMMddHHmmssfff}",
             TimestampUtc: timestampUtc,
             Symbol: symbol,
             Side: action,
-            OrderType: "MKT",
-            TimeInForce: "IOC",
+            OrderType: OrderType.Market,
+            TimeInForce: OrderTimeInForce.Ioc,
             Quantity: quantity,
             EntryPrice: entryPrice,
             StopPrice: stopPrice,
             TakeProfitPrice: takeProfitPrice,
             EstimatedRiskDollars: estimatedRisk,
+            Atr14: features.Atr14,
             Setup: setup,
             Source: "v11-live-runtime");
     }
@@ -74,13 +75,14 @@ public sealed record V3LiveProposedOrder(
     string IntentId,
     DateTime TimestampUtc,
     string Symbol,
-    string Side,
-    string OrderType,
-    string TimeInForce,
+    OrderSide Side,
+    OrderType OrderType,
+    OrderTimeInForce TimeInForce,
     int Quantity,
     double EntryPrice,
     double StopPrice,
     double TakeProfitPrice,
     double EstimatedRiskDollars,
+    double Atr14,
     string Setup,
     string Source);

@@ -11,8 +11,15 @@ namespace Harvester.App.Strategy;
 public sealed class V3LivePositionTracker
 {
     private readonly Dictionary<string, V3LiveTrackedPosition> _positions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _lock = new();
+    private readonly TimeProvider _timeProvider;
     private double _totalRealizedPnlToday;
     private int _totalFilledOrdersToday;
+
+    public V3LivePositionTracker(TimeProvider? timeProvider = null)
+    {
+        _timeProvider = timeProvider ?? TimeProvider.System;
+    }
 
     /// <summary>Current tracked positions keyed by symbol.</summary>
     public IReadOnlyDictionary<string, V3LiveTrackedPosition> Positions => _positions;
@@ -29,6 +36,8 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public void SyncFromPositions(IReadOnlyList<PositionRow> positionRows, string account)
     {
+        lock (_lock)
+        {
         // Mark all existing positions as potentially stale
         foreach (var pos in _positions.Values)
             pos.LastSyncSeen = false;
@@ -50,12 +59,12 @@ public sealed class V3LivePositionTracker
             tracked.Quantity = row.Quantity;
             tracked.AverageCost = row.AverageCost;
             tracked.LastSyncSeen = true;
-            tracked.LastSyncUtc = DateTime.UtcNow;
+            tracked.LastSyncUtc = _timeProvider.GetUtcNow().UtcDateTime;
 
             // Detect position close via quantity change: had position → now flat
             if (previousQty != 0 && row.Quantity == 0 && tracked.EntryPrice > 0)
             {
-                var estimatedRealizedPnl = tracked.Side == "LONG"
+                var estimatedRealizedPnl = tracked.Side == PositionSide.Long
                     ? (tracked.LastMarkPrice - tracked.EntryPrice) * Math.Abs(previousQty)
                     : (tracked.EntryPrice - tracked.LastMarkPrice) * Math.Abs(previousQty);
 
@@ -67,7 +76,7 @@ public sealed class V3LivePositionTracker
             else if (row.Quantity != 0)
             {
                 tracked.IsFlat = false;
-                tracked.Side = row.Quantity > 0 ? "LONG" : "SHORT";
+                tracked.Side = row.Quantity > 0 ? PositionSide.Long : PositionSide.Short;
             }
         }
 
@@ -82,6 +91,7 @@ public sealed class V3LivePositionTracker
                 kvp.Value.IsFlat = true;
             }
         }
+        } // lock
     }
 
     /// <summary>
@@ -92,6 +102,8 @@ public sealed class V3LivePositionTracker
     {
         if (string.IsNullOrWhiteSpace(symbol) || markPrice <= 0) return;
 
+        lock (_lock)
+        {
         var normalized = symbol.Trim().ToUpperInvariant();
         if (!_positions.TryGetValue(normalized, out var tracked)) return;
 
@@ -101,33 +113,36 @@ public sealed class V3LivePositionTracker
         if (tracked.Quantity == 0) return;
 
         // Update peak/trough for trailing stop logic
-        if (tracked.Side == "LONG")
+        if (tracked.Side == PositionSide.Long)
         {
-            tracked.PeakPriceSinceEntry = Math.Max(tracked.PeakPriceSinceEntry, markPrice);
-            tracked.TroughPriceSinceEntry = tracked.TroughPriceSinceEntry > 0
-                ? Math.Min(tracked.TroughPriceSinceEntry, markPrice)
+            tracked.MostFavorablePriceSinceEntry = Math.Max(tracked.MostFavorablePriceSinceEntry, markPrice);
+            tracked.MostAdversePriceSinceEntry = tracked.MostAdversePriceSinceEntry > 0
+                ? Math.Min(tracked.MostAdversePriceSinceEntry, markPrice)
                 : markPrice;
 
             tracked.UnrealizedPnl = (markPrice - tracked.EntryPrice) * Math.Abs(tracked.Quantity);
             tracked.UnrealizedPnlPeak = Math.Max(tracked.UnrealizedPnlPeak, tracked.UnrealizedPnl);
         }
-        else if (tracked.Side == "SHORT")
+        else if (tracked.Side == PositionSide.Short)
         {
-            tracked.PeakPriceSinceEntry = tracked.PeakPriceSinceEntry > 0
-                ? Math.Min(tracked.PeakPriceSinceEntry, markPrice)
+            tracked.MostFavorablePriceSinceEntry = tracked.MostFavorablePriceSinceEntry > 0
+                ? Math.Min(tracked.MostFavorablePriceSinceEntry, markPrice)
                 : markPrice;
-            tracked.TroughPriceSinceEntry = Math.Max(tracked.TroughPriceSinceEntry, markPrice);
+            tracked.MostAdversePriceSinceEntry = Math.Max(tracked.MostAdversePriceSinceEntry, markPrice);
 
             tracked.UnrealizedPnl = (tracked.EntryPrice - markPrice) * Math.Abs(tracked.Quantity);
             tracked.UnrealizedPnlPeak = Math.Max(tracked.UnrealizedPnlPeak, tracked.UnrealizedPnl);
         }
+        } // lock
     }
 
     /// <summary>
     /// Record an entry fill. Called when the host acknowledges an order was transmitted and filled.
     /// </summary>
-    public void RecordEntry(string symbol, string side, double quantity, double fillPrice, double estimatedRiskDollars, string intentId)
+    public void RecordEntry(string symbol, PositionSide side, double quantity, double fillPrice, double estimatedRiskDollars, string intentId)
     {
+        lock (_lock)
+        {
         var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
         if (!_positions.TryGetValue(normalized, out var tracked))
         {
@@ -136,19 +151,20 @@ public sealed class V3LivePositionTracker
         }
 
         tracked.IntentId = intentId;
-        tracked.Side = side.ToUpperInvariant() == "BUY" ? "LONG" : "SHORT";
-        tracked.Quantity = side.ToUpperInvariant() == "BUY" ? quantity : -quantity;
+        tracked.Side = side;
+        tracked.Quantity = side == PositionSide.Long ? quantity : -quantity;
         tracked.EntryPrice = fillPrice;
-        tracked.EntryUtc = DateTime.UtcNow;
+        tracked.EntryUtc = _timeProvider.GetUtcNow().UtcDateTime;
         tracked.AverageCost = fillPrice;
         tracked.OpenRiskDollars = estimatedRiskDollars;
-        tracked.PeakPriceSinceEntry = fillPrice;
-        tracked.TroughPriceSinceEntry = fillPrice;
+        tracked.MostFavorablePriceSinceEntry = fillPrice;
+        tracked.MostAdversePriceSinceEntry = fillPrice;
         tracked.LastMarkPrice = fillPrice;
         tracked.UnrealizedPnl = 0;
         tracked.UnrealizedPnlPeak = 0;
         tracked.IsFlat = false;
         _totalFilledOrdersToday++;
+        } // lock
     }
 
     /// <summary>
@@ -156,6 +172,8 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public void RecordClose(string symbol, double closedQuantity, double realizedPnl)
     {
+        lock (_lock)
+        {
         var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
         if (!_positions.TryGetValue(normalized, out var tracked)) return;
 
@@ -174,11 +192,12 @@ public sealed class V3LivePositionTracker
         else
         {
             var residualQtyAbs = currentQtyAbs - closeQty;
-            tracked.Quantity = tracked.Side == "SHORT"
+            tracked.Quantity = tracked.Side == PositionSide.Short
                 ? -residualQtyAbs
                 : residualQtyAbs;
             tracked.IsFlat = false;
         }
+        } // lock
     }
 
     /// <summary>
@@ -186,8 +205,11 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public bool HasOpenPosition(string symbol)
     {
-        var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
-        return _positions.TryGetValue(normalized, out var tracked) && tracked.Quantity != 0;
+        lock (_lock)
+        {
+            var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+            return _positions.TryGetValue(normalized, out var tracked) && tracked.Quantity != 0;
+        }
     }
 
     /// <summary>
@@ -195,8 +217,11 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public V3LiveTrackedPosition? GetPosition(string symbol)
     {
-        var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
-        return _positions.TryGetValue(normalized, out var tracked) ? tracked : null;
+        lock (_lock)
+        {
+            var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+            return _positions.TryGetValue(normalized, out var tracked) ? tracked : null;
+        }
     }
 
     /// <summary>
@@ -204,9 +229,12 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public double GetTotalOpenRisk()
     {
-        return _positions.Values
-            .Where(p => !p.IsFlat)
-            .Sum(p => p.OpenRiskDollars);
+        lock (_lock)
+        {
+            return _positions.Values
+                .Where(p => !p.IsFlat)
+                .Sum(p => p.OpenRiskDollars);
+        }
     }
 
     /// <summary>
@@ -214,14 +242,19 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public V3LiveSymbolRiskState BuildRiskState(string symbol)
     {
-        var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
-        var totalOpenRisk = GetTotalOpenRisk();
-
-        return new V3LiveSymbolRiskState
+        lock (_lock)
         {
-            OpenRiskDollars = totalOpenRisk,
-            RealizedPnlToday = _totalRealizedPnlToday
-        };
+            var normalized = (symbol ?? string.Empty).Trim().ToUpperInvariant();
+            var totalOpenRisk = _positions.Values
+                .Where(p => !p.IsFlat)
+                .Sum(p => p.OpenRiskDollars);
+
+            return new V3LiveSymbolRiskState
+            {
+                OpenRiskDollars = totalOpenRisk,
+                RealizedPnlToday = _totalRealizedPnlToday
+            };
+        }
     }
 
     /// <summary>
@@ -229,13 +262,16 @@ public sealed class V3LivePositionTracker
     /// </summary>
     public void ResetDaily()
     {
-        _totalRealizedPnlToday = 0;
-        _totalFilledOrdersToday = 0;
-
-        foreach (var pos in _positions.Values)
+        lock (_lock)
         {
-            pos.RealizedPnl = 0;
-            pos.UnrealizedPnlPeak = 0;
+            _totalRealizedPnlToday = 0;
+            _totalFilledOrdersToday = 0;
+
+            foreach (var pos in _positions.Values)
+            {
+                pos.RealizedPnl = 0;
+                pos.UnrealizedPnlPeak = 0;
+            }
         }
     }
 }
@@ -250,17 +286,21 @@ public sealed class V3LiveTrackedPosition
 
     public string Symbol { get; }
     public string IntentId { get; set; } = string.Empty;
-    public string Side { get; set; } = string.Empty;
+    public PositionSide Side { get; set; }
     public double Quantity { get; set; }
     public double AverageCost { get; set; }
     public double EntryPrice { get; set; }
     public DateTime EntryUtc { get; set; }
     public double StopPrice { get; set; }
     public double TakeProfitPrice { get; set; }
+    /// <summary>ATR(14) captured at entry time — used for stop/TP calculations so they don't drift.</summary>
+    public double EntryAtr14 { get; set; }
     public double LastMarkPrice { get; set; }
     public DateTime LastMarkUtc { get; set; }
-    public double PeakPriceSinceEntry { get; set; }
-    public double TroughPriceSinceEntry { get; set; }
+    /// <summary>Best price since entry: highest for long, lowest for short.</summary>
+    public double MostFavorablePriceSinceEntry { get; set; }
+    /// <summary>Worst price since entry: lowest for long, highest for short.</summary>
+    public double MostAdversePriceSinceEntry { get; set; }
     public double UnrealizedPnl { get; set; }
     public double UnrealizedPnlPeak { get; set; }
     public double RealizedPnl { get; set; }

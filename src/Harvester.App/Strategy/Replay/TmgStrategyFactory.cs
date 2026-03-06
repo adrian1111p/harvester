@@ -1,352 +1,76 @@
-using System.Text.Json;
-using Harvester.App.IBKR.Runtime;
-
 namespace Harvester.App.Strategy;
 
-public sealed class ScannerCandidateReplayRuntime :
-    IStrategyRuntime,
-    IReplayOrderSignalSource,
-    IReplaySimulationFeedbackSink,
-    IReplayScannerSelectionSource
+/// <summary>
+/// Centralizes construction of all Tmg trade management strategies.
+/// Reads configuration from environment variables, instantiates each strategy,
+/// and returns them as an array for use in <see cref="ReplayDayTradingPipeline"/>.
+/// </summary>
+internal static class TmgStrategyFactory
 {
-    private readonly ReplayScannerSymbolSelectionSnapshotRow _selectionSnapshot;
-    private readonly ScannerV2SelectionSnapshot? _selectionSnapshotV2;
-    private readonly Ovl001FlattenReversalAndGivebackCapStrategy _overlay;
-    private readonly ReplayMtfCandleSignalEngine _mtfSignalEngine;
-    private readonly ReplayDayTradingPipeline _pipeline;
-    private readonly ReplayRamSessionState _ramSessionState;
-    private readonly ReplayTradeEpisodeRecorder _episodeRecorder;
-    private readonly Dictionary<string, double> _positionBySymbol;
-    private double _positionQuantity;
-    private double _averagePrice;
-
-    public ScannerCandidateReplayRuntime(
-        string candidatesInputPath,
-        int topN,
-        double minScore,
-        double orderQuantity,
-        string orderSide,
-        string orderType,
-        string timeInForce,
-        double limitOffsetBps)
+    /// <summary>
+    /// Build all 49 Tmg trade management strategies from environment configuration.
+    /// Two strategies (Tmg048, Tmg049) require a shared MTF signal engine instance.
+    /// </summary>
+    public static IReplayTradeManagementStrategy[] CreateAll(ReplayMtfCandleSignalEngine mtfEngine)
     {
-        // ── V1 selection (backward compat) ──────────────────────────
-        var selectionModule = new ReplayScannerSymbolSelectionModule(candidatesInputPath, topN, minScore);
-        var v1Snapshot = selectionModule.GetSnapshot();
-
-        // ── V2 selection engine (alongside V1) ──────────────────────
-        var v2Config = BuildScannerSelectionV2ConfigFromEnvironment(topN, minScore);
-        var useV2 = TryReadEnvironmentBool("SCN_V2_ENABLED", false);
-        if (useV2)
-        {
-            var v2Engine = new ScannerSelectionEngineV2(v2Config);
-            var fileCandidates = v1Snapshot.RankedSymbols
-                .Select(r => new ScannerV2CandidateFileRow
-                {
-                    Symbol = r.Symbol,
-                    WeightedScore = r.WeightedScore,
-                    Eligible = r.Eligible,
-                    AverageRank = r.AverageRank
-                })
-                .ToList();
-
-            // Load self-learning V2 bias store if it exists
-            var biasEntries = LoadScannerV2BiasEntries();
-
-            // In replay mode we don't have live L1/L2, so pass empty maps.
-            // The V2 engine gracefully falls back to neutral sub-scores.
-            var emptyL1 = new Dictionary<string, ScannerV2L1Snapshot>();
-            var emptyL2 = new Dictionary<string, ScannerV2L2DepthSnapshot>();
-
-            _selectionSnapshotV2 = v2Engine.Evaluate(
-                fileCandidates,
-                emptyL1,
-                emptyL2,
-                biasEntries,
-                sessionOpenUtc: DateTime.MinValue,
-                sessionCloseUtc: DateTime.MinValue,
-                nowUtc: DateTime.UtcNow,
-                sourcePath: candidatesInputPath);
-
-            // Use V2 output (converted to V1 format) as the primary selection
-            _selectionSnapshot = ScannerSelectionEngineV2.ToV1Snapshot(_selectionSnapshotV2);
-
-            Console.WriteLine($"[INFO] Scanner Selection V2.0: {_selectionSnapshotV2.SelectedCount} selected " +
-                $"from {_selectionSnapshotV2.TotalCandidates} candidates " +
-                $"({_selectionSnapshotV2.EligibleCandidates} eligible, phase={_selectionSnapshotV2.SessionPhase})");
-
-            // Export V2 snapshot for diagnostics
-            ExportScannerV2Snapshot(_selectionSnapshotV2);
-        }
-        else
-        {
-            _selectionSnapshot = v1Snapshot;
-            _selectionSnapshotV2 = null;
-        }
-        _overlay = new Ovl001FlattenReversalAndGivebackCapStrategy(BuildOverlayConfigFromEnvironment());
-        _mtfSignalEngine = new ReplayMtfCandleSignalEngine();
-        var entry = new ReplayScannerSingleShotEntryStrategy(
-            orderQuantity,
-            orderSide,
-            orderType,
-            timeInForce,
-            limitOffsetBps,
-            _mtfSignalEngine,
-            BuildScannerRequireMtfAlignmentFromEnvironment(),
-            BuildScannerRequireBuySetupConfirmationFromEnvironment(),
-            BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment(),
-            BuildScannerRequireSellSetupConfirmationFromEnvironment(),
-            BuildScannerRequireBreakoutConfirmationFromEnvironment(),
-            BuildScannerRequireOneTwoThreeConfirmationFromEnvironment());
-        var tradeManagement = new Tmg001BracketExitStrategy(BuildTradeManagementConfigFromEnvironment());
-        var tradeManagementBreakEven = new Tmg002BreakEvenEscalationStrategy(BuildTradeManagementBreakEvenConfigFromEnvironment());
-        var tradeManagementTrailing = new Tmg003TrailingProgressionStrategy(BuildTradeManagementTrailingConfigFromEnvironment());
-        var tradeManagementPartialRunner = new Tmg004PartialTakeProfitRunnerTrailStrategy(BuildTradeManagementPartialRunnerConfigFromEnvironment());
-        var tradeManagementTimeStop = new Tmg005TimeStopStrategy(BuildTradeManagementTimeStopConfigFromEnvironment());
-        var tradeManagementAdaptive = new Tmg006VolatilityAdaptiveExitStrategy(BuildTradeManagementAdaptiveConfigFromEnvironment());
-        var tradeManagementDrawdownDerisk = new Tmg007DrawdownDeriskStrategy(BuildTradeManagementDrawdownDeriskConfigFromEnvironment());
-        var tradeManagementVwapReversion = new Tmg008SessionVwapReversionExitStrategy(BuildTradeManagementVwapReversionConfigFromEnvironment());
-        var tradeManagementSpreadGuard = new Tmg009LiquiditySpreadExitStrategy(BuildTradeManagementSpreadGuardConfigFromEnvironment());
-        var tradeManagementEventRisk = new Tmg010EventRiskCooldownGuardStrategy(BuildTradeManagementEventRiskConfigFromEnvironment());
-        var tradeManagementStallExit = new Tmg011StallExitGuardStrategy(BuildTradeManagementStallExitConfigFromEnvironment());
-        var tradeManagementPnlCapExit = new Tmg012PnlCapExitStrategy(BuildTradeManagementPnlCapExitConfigFromEnvironment());
-        var tradeManagementSpreadPersistence = new Tmg013SpreadPersistenceExitStrategy(BuildTradeManagementSpreadPersistenceConfigFromEnvironment());
-        var tradeManagementGapRisk = new Tmg014GapRiskExitStrategy(BuildTradeManagementGapRiskConfigFromEnvironment());
-        var tradeManagementAdverseDrift = new Tmg015AdverseDriftExitStrategy(BuildTradeManagementAdverseDriftConfigFromEnvironment());
-        var tradeManagementPeakPullback = new Tmg016PeakPullbackExitStrategy(BuildTradeManagementPeakPullbackConfigFromEnvironment());
-        var tradeManagementMicroStress = new Tmg017MicrostructureStressExitStrategy(BuildTradeManagementMicrostructureStressConfigFromEnvironment());
-        var tradeManagementStaleFavorable = new Tmg018StaleFavorableMoveExitStrategy(BuildTradeManagementStaleFavorableConfigFromEnvironment());
-        var tradeManagementRollingAdverse = new Tmg019RollingAdverseWindowExitStrategy(BuildTradeManagementRollingAdverseConfigFromEnvironment());
-        var tradeManagementUnderperformanceTimeout = new Tmg020UnderperformanceTimeoutExitStrategy(BuildTradeManagementUnderperformanceTimeoutConfigFromEnvironment());
-        var tradeManagementQuotePressure = new Tmg021QuotePressureExitStrategy(BuildTradeManagementQuotePressureConfigFromEnvironment());
-        var tradeManagementVolatilityShockWindow = new Tmg022VolatilityShockWindowExitStrategy(BuildTradeManagementVolatilityShockWindowConfigFromEnvironment());
-        var tradeManagementProfitReversionFailsafe = new Tmg023ProfitReversionFailsafeExitStrategy(BuildTradeManagementProfitReversionFailsafeConfigFromEnvironment());
-        var tradeManagementRangeCompression = new Tmg024RangeCompressionExitStrategy(BuildTradeManagementRangeCompressionConfigFromEnvironment());
-        var tradeManagementRollingVolatilityFloor = new Tmg025RollingVolatilityFloorExitStrategy(BuildTradeManagementRollingVolatilityFloorConfigFromEnvironment());
-        var tradeManagementChopAdverse = new Tmg026ChopAdverseExitStrategy(BuildTradeManagementChopAdverseConfigFromEnvironment());
-        var tradeManagementTrendExhaustion = new Tmg027TrendExhaustionExitStrategy(BuildTradeManagementTrendExhaustionConfigFromEnvironment());
-        var tradeManagementReversalAcceleration = new Tmg028ReversalAccelerationExitStrategy(BuildTradeManagementReversalAccelerationConfigFromEnvironment());
-        var tradeManagementSustainedReversion = new Tmg029SustainedReversionExitStrategy(BuildTradeManagementSustainedReversionConfigFromEnvironment());
-        var tradeManagementRecoveryFailure = new Tmg030RecoveryFailureExitStrategy(BuildTradeManagementRecoveryFailureConfigFromEnvironment());
-        var tradeManagementReboundStall = new Tmg031ReboundStallExitStrategy(BuildTradeManagementReboundStallConfigFromEnvironment());
-        var tradeManagementWeakBounceFailure = new Tmg032WeakBounceFailureExitStrategy(BuildTradeManagementWeakBounceFailureConfigFromEnvironment());
-        var tradeManagementReboundRollunder = new Tmg033ReboundRollunderExitStrategy(BuildTradeManagementReboundRollunderConfigFromEnvironment());
-        var tradeManagementPostReboundFade = new Tmg034PostReboundFadeExitStrategy(BuildTradeManagementPostReboundFadeConfigFromEnvironment());
-        var tradeManagementReboundRejectionAccel = new Tmg035ReboundRejectionAccelExitStrategy(BuildTradeManagementReboundRejectionAccelConfigFromEnvironment());
-        var tradeManagementRejectionStallBreak = new Tmg036RejectionStallBreakExitStrategy(BuildTradeManagementRejectionStallBreakConfigFromEnvironment());
-        var tradeManagementRejectionReboundFail = new Tmg037RejectionReboundFailExitStrategy(BuildTradeManagementRejectionReboundFailConfigFromEnvironment());
-        var tradeManagementRejectionContinuationConfirm = new Tmg038RejectionContinuationConfirmExitStrategy(BuildTradeManagementRejectionContinuationConfirmConfigFromEnvironment());
-        var tradeManagementDoubleRejectionWeakRebound = new Tmg039DoubleRejectionWeakReboundExitStrategy(BuildTradeManagementDoubleRejectionWeakReboundConfigFromEnvironment());
-        var tradeManagementDoubleReboundFailure = new Tmg040DoubleReboundFailureExitStrategy(BuildTradeManagementDoubleReboundFailureConfigFromEnvironment());
-        var tradeManagementTripleStepBreak = new Tmg041TripleStepBreakExitStrategy(BuildTradeManagementTripleStepBreakConfigFromEnvironment());
-        var tradeManagementReboundPullbackFail = new Tmg042ReboundPullbackFailExitStrategy(BuildTradeManagementReboundPullbackFailConfigFromEnvironment());
-        var tradeManagementReboundPullbackRejection = new Tmg043ReboundPullbackRejectionExitStrategy(BuildTradeManagementReboundPullbackRejectionConfigFromEnvironment());
-        var tradeManagementReboundPullbackRejectionConfirm = new Tmg044ReboundPullbackRejectionConfirmExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmConfigFromEnvironment());
-        var tradeManagementReboundPullbackRejectionConfirmFailRebound = new Tmg045ReboundPullbackRejectionConfirmFailReboundExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundConfigFromEnvironment());
-        var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown = new Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfigFromEnvironment());
-        var tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm = new Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitStrategy(BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirmConfigFromEnvironment());
-        var tradeManagementMtfCandleReversal = new Tmg048MtfCandleReversalExitStrategy(_mtfSignalEngine, BuildTradeManagementMtfCandleReversalConfigFromEnvironment());
-        var tradeManagementMtfRegimeAtr = new Tmg049MtfRegimeAtrExitStrategy(_mtfSignalEngine, BuildTradeManagementMtfRegimeAtrConfigFromEnvironment());
-        var endOfDay = new Eod001ForceFlatStrategy(BuildEndOfDayConfigFromEnvironment());
-        _pipeline = new ReplayDayTradingPipeline(
-            globalSafetyOverlays: [_overlay],
-            entryStrategies: [entry],
-            tradeManagementStrategies: [tradeManagement, tradeManagementBreakEven, tradeManagementTrailing, tradeManagementPartialRunner, tradeManagementTimeStop, tradeManagementAdaptive, tradeManagementDrawdownDerisk, tradeManagementVwapReversion, tradeManagementSpreadGuard, tradeManagementEventRisk, tradeManagementStallExit, tradeManagementPnlCapExit, tradeManagementSpreadPersistence, tradeManagementGapRisk, tradeManagementAdverseDrift, tradeManagementPeakPullback, tradeManagementMicroStress, tradeManagementStaleFavorable, tradeManagementRollingAdverse, tradeManagementUnderperformanceTimeout, tradeManagementQuotePressure, tradeManagementVolatilityShockWindow, tradeManagementProfitReversionFailsafe, tradeManagementRangeCompression, tradeManagementRollingVolatilityFloor, tradeManagementChopAdverse, tradeManagementTrendExhaustion, tradeManagementReversalAcceleration, tradeManagementSustainedReversion, tradeManagementRecoveryFailure, tradeManagementReboundStall, tradeManagementWeakBounceFailure, tradeManagementReboundRollunder, tradeManagementPostReboundFade, tradeManagementReboundRejectionAccel, tradeManagementRejectionStallBreak, tradeManagementRejectionReboundFail, tradeManagementRejectionContinuationConfirm, tradeManagementDoubleRejectionWeakRebound, tradeManagementDoubleReboundFailure, tradeManagementTripleStepBreak, tradeManagementReboundPullbackFail, tradeManagementReboundPullbackRejection, tradeManagementReboundPullbackRejectionConfirm, tradeManagementReboundPullbackRejectionConfirmFailRebound, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdown, tradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirm, tradeManagementMtfCandleReversal, tradeManagementMtfRegimeAtr],
-            endOfDayStrategies: [endOfDay]);
-        _ramSessionState = new ReplayRamSessionState(maxBarsPerSymbol: 2000, maxBucketMinutes: 60, imbalanceTopN: 5);
-        _episodeRecorder = new ReplayTradeEpisodeRecorder(Path.Combine(Directory.GetCurrentDirectory(), "temp", "episodes"));
-        _positionBySymbol = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        _positionQuantity = 0;
-        _averagePrice = 0;
+        return [
+            new Tmg001BracketExitStrategy(BuildTmg001Config()),
+            new Tmg002BreakEvenEscalationStrategy(BuildTmg002Config()),
+            new Tmg003TrailingProgressionStrategy(BuildTmg003Config()),
+            new Tmg004PartialTakeProfitRunnerTrailStrategy(BuildTmg004Config()),
+            new Tmg005TimeStopStrategy(BuildTmg005Config()),
+            new Tmg006VolatilityAdaptiveExitStrategy(BuildTmg006Config()),
+            new Tmg007DrawdownDeriskStrategy(BuildTmg007Config()),
+            new Tmg008SessionVwapReversionExitStrategy(BuildTmg008Config()),
+            new Tmg009LiquiditySpreadExitStrategy(BuildTmg009Config()),
+            new Tmg010EventRiskCooldownGuardStrategy(BuildTmg010Config()),
+            new Tmg011StallExitGuardStrategy(BuildTmg011Config()),
+            new Tmg012PnlCapExitStrategy(BuildTmg012Config()),
+            new Tmg013SpreadPersistenceExitStrategy(BuildTmg013Config()),
+            new Tmg014GapRiskExitStrategy(BuildTmg014Config()),
+            new Tmg015AdverseDriftExitStrategy(BuildTmg015Config()),
+            new Tmg016PeakPullbackExitStrategy(BuildTmg016Config()),
+            new Tmg017MicrostructureStressExitStrategy(BuildTmg017Config()),
+            new Tmg018StaleFavorableMoveExitStrategy(BuildTmg018Config()),
+            new Tmg019RollingAdverseWindowExitStrategy(BuildTmg019Config()),
+            new Tmg020UnderperformanceTimeoutExitStrategy(BuildTmg020Config()),
+            new Tmg021QuotePressureExitStrategy(BuildTmg021Config()),
+            new Tmg022VolatilityShockWindowExitStrategy(BuildTmg022Config()),
+            new Tmg023ProfitReversionFailsafeExitStrategy(BuildTmg023Config()),
+            new Tmg024RangeCompressionExitStrategy(BuildTmg024Config()),
+            new Tmg025RollingVolatilityFloorExitStrategy(BuildTmg025Config()),
+            new Tmg026ChopAdverseExitStrategy(BuildTmg026Config()),
+            new Tmg027TrendExhaustionExitStrategy(BuildTmg027Config()),
+            new Tmg028ReversalAccelerationExitStrategy(BuildTmg028Config()),
+            new Tmg029SustainedReversionExitStrategy(BuildTmg029Config()),
+            new Tmg030RecoveryFailureExitStrategy(BuildTmg030Config()),
+            new Tmg031ReboundStallExitStrategy(BuildTmg031Config()),
+            new Tmg032WeakBounceFailureExitStrategy(BuildTmg032Config()),
+            new Tmg033ReboundRollunderExitStrategy(BuildTmg033Config()),
+            new Tmg034PostReboundFadeExitStrategy(BuildTmg034Config()),
+            new Tmg035ReboundRejectionAccelExitStrategy(BuildTmg035Config()),
+            new Tmg036RejectionStallBreakExitStrategy(BuildTmg036Config()),
+            new Tmg037RejectionReboundFailExitStrategy(BuildTmg037Config()),
+            new Tmg038RejectionContinuationConfirmExitStrategy(BuildTmg038Config()),
+            new Tmg039DoubleRejectionWeakReboundExitStrategy(BuildTmg039Config()),
+            new Tmg040DoubleReboundFailureExitStrategy(BuildTmg040Config()),
+            new Tmg041TripleStepBreakExitStrategy(BuildTmg041Config()),
+            new Tmg042ReboundPullbackFailExitStrategy(BuildTmg042Config()),
+            new Tmg043ReboundPullbackRejectionExitStrategy(BuildTmg043Config()),
+            new Tmg044ReboundPullbackRejectionConfirmExitStrategy(BuildTmg044Config()),
+            new Tmg045ReboundPullbackRejectionConfirmFailReboundExitStrategy(BuildTmg045Config()),
+            new Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitStrategy(BuildTmg046Config()),
+            new Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitStrategy(BuildTmg047Config()),
+            new Tmg048MtfCandleReversalExitStrategy(mtfEngine, BuildTmg048Config()),
+            new Tmg049MtfRegimeAtrExitStrategy(mtfEngine, BuildTmg049Config()),
+        ];
     }
 
-    public Task InitializeAsync(StrategyRuntimeContext context, CancellationToken cancellationToken)
-    {
-        return Task.CompletedTask;
-    }
+    // ─────────────────────────────────────────────────────────────────
+    // CONFIG BUILDERS
+    // ─────────────────────────────────────────────────────────────────
 
-    public Task OnScheduledEventAsync(string eventName, StrategyRuntimeContext context, CancellationToken cancellationToken)
-    {
-        return Task.CompletedTask;
-    }
-
-    public Task OnDataAsync(StrategyDataSlice dataSlice, CancellationToken cancellationToken)
-    {
-        return Task.CompletedTask;
-    }
-
-    public Task OnShutdownAsync(StrategyRuntimeContext context, int exitCode, CancellationToken cancellationToken)
-    {
-        return Task.CompletedTask;
-    }
-
-    public ReplayScannerSymbolSelectionSnapshotRow GetScannerSelectionSnapshot()
-    {
-        return _selectionSnapshot;
-    }
-
-    public IReadOnlyList<ReplayOrderIntent> GetReplayOrderIntents(StrategyDataSlice dataSlice, StrategyRuntimeContext context)
-    {
-        var symbol = (context.Symbol ?? string.Empty).Trim().ToUpperInvariant();
-        if (string.IsNullOrWhiteSpace(symbol))
-        {
-            return [];
-        }
-
-        if (!_selectionSnapshot.SelectedSymbols.Contains(symbol, StringComparer.OrdinalIgnoreCase))
-        {
-            return [];
-        }
-
-        var bidPrice = ResolveBidPrice(dataSlice);
-        var askPrice = ResolveAskPrice(dataSlice);
-        var markPrice = ResolveMarkPrice(dataSlice, bidPrice, askPrice);
-        if (markPrice <= 0)
-        {
-            return [];
-        }
-
-        if (bidPrice <= 0)
-        {
-            bidPrice = markPrice;
-        }
-
-        if (askPrice <= 0)
-        {
-            askPrice = markPrice;
-        }
-
-        if (dataSlice.HistoricalBars.Count > 0)
-        {
-            foreach (var historicalBar in dataSlice.HistoricalBars)
-            {
-                _mtfSignalEngine.UpdateFromHistoricalBar(symbol, historicalBar);
-            }
-        }
-        else
-        {
-            _mtfSignalEngine.Update(symbol, dataSlice.TimestampUtc, markPrice);
-        }
-
-        var latestBar = dataSlice.HistoricalBars.LastOrDefault();
-
-        var dayTradingContext = new ReplayDayTradingContext(
-            TimestampUtc: dataSlice.TimestampUtc,
-            Symbol: symbol,
-            MarkPrice: markPrice,
-            BidPrice: bidPrice,
-            AskPrice: askPrice,
-            PositionQuantity: _positionQuantity,
-            AveragePrice: _averagePrice,
-            BarOpen: latestBar?.Open ?? markPrice,
-            BarHigh: latestBar?.High ?? markPrice,
-            BarLow: latestBar?.Low ?? markPrice,
-            BarClose: latestBar?.Close ?? markPrice,
-            BarVolume: latestBar is null ? 0.0 : (double)latestBar.Volume);
-        var intents = _pipeline.Evaluate(dayTradingContext, _selectionSnapshot);
-
-        var gateCodes = intents
-            .Select(x => x.Source)
-            .Where(x => !string.IsNullOrWhiteSpace(x))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        _ramSessionState.UpdateSlice(symbol, dataSlice, gateCodes);
-
-        return intents;
-    }
-
-    public void OnReplaySliceResult(StrategyDataSlice dataSlice, ReplaySliceSimulationResult result, string activeSymbol)
-    {
-        _positionQuantity = result.Portfolio.PositionQuantity;
-        _averagePrice = result.Portfolio.AveragePrice;
-
-        var symbol = (activeSymbol ?? string.Empty).Trim().ToUpperInvariant();
-        if (!string.IsNullOrWhiteSpace(symbol))
-        {
-            _positionBySymbol[symbol] = result.Portfolio.PositionQuantity;
-            _episodeRecorder.ProcessSlice(symbol, result, _ramSessionState.GetBuckets(symbol));
-        }
-
-        _overlay.OnPositionEvent(
-            symbol,
-            result.Portfolio.TimestampUtc,
-            result.Portfolio.PositionQuantity,
-            result.Portfolio.AveragePrice,
-            result.Fills);
-    }
-
-    private static double ResolveMarkPrice(StrategyDataSlice dataSlice, double bidPrice, double askPrice)
-    {
-        var last = dataSlice.TopTicks
-            .Where(x => x.Field == 4)
-            .Select(x => x.Price)
-            .LastOrDefault(x => x > 0);
-        if (last > 0)
-        {
-            return last;
-        }
-
-        if (bidPrice > 0 && askPrice > 0)
-        {
-            return (bidPrice + askPrice) / 2.0;
-        }
-
-        return dataSlice.HistoricalBars.LastOrDefault()?.Close ?? 0;
-    }
-
-    private static double ResolveBidPrice(StrategyDataSlice dataSlice)
-    {
-        var depthBid = dataSlice.DepthRows
-            .Where(x => x.Side == 1 && x.Price > 0 && x.Size > 0)
-            .OrderByDescending(x => x.TimestampUtc)
-            .ThenBy(x => x.Position)
-            .Select(x => x.Price)
-            .FirstOrDefault();
-        if (depthBid > 0)
-        {
-            return depthBid;
-        }
-
-        return dataSlice.TopTicks
-            .Where(x => x.Field == 1)
-            .Select(x => x.Price)
-            .LastOrDefault(x => x > 0);
-    }
-
-    private static double ResolveAskPrice(StrategyDataSlice dataSlice)
-    {
-        var depthAsk = dataSlice.DepthRows
-            .Where(x => x.Side == 0 && x.Price > 0 && x.Size > 0)
-            .OrderByDescending(x => x.TimestampUtc)
-            .ThenBy(x => x.Position)
-            .Select(x => x.Price)
-            .FirstOrDefault();
-        if (depthAsk > 0)
-        {
-            return depthAsk;
-        }
-
-        return dataSlice.TopTicks
-            .Where(x => x.Field == 2)
-            .Select(x => x.Price)
-            .LastOrDefault(x => x > 0);
-    }
-
-    private static Ovl001FlattenConfig BuildOverlayConfigFromEnvironment()
-    {
-        return new Ovl001FlattenConfig(
-            ImmediateWindowSec: Math.Max(1, TryReadEnvironmentInt("OVL_001_IMMEDIATE_WINDOW_SEC", 5)),
-            ImmediateAdverseMovePct: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_IMMEDIATE_ADVERSE_MOVE_PCT", 0.002)),
-            ImmediateAdverseMoveUsd: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_IMMEDIATE_ADVERSE_MOVE_USD", 10.0)),
-            GivebackPctOfNotional: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_GIVEBACK_PCT_OF_NOTIONAL", 0.01)),
-            GivebackUsdCap: Math.Max(0.0, TryReadEnvironmentDouble("OVL_001_GIVEBACK_USD_CAP", 30.0)),
-            TrailingActivatesOnlyAfterProfit: TryReadEnvironmentBool("OVL_001_TRAILING_ACTIVATES_ONLY_AFTER_PROFIT", true),
-            FlattenRoute: TryReadEnvironmentString("OVL_001_FLATTEN_ROUTE", "SMART"),
-            FlattenTif: TryReadEnvironmentString("OVL_001_FLATTEN_TIF", "DAY+"),
-            FlattenOrderType: TryReadEnvironmentString("OVL_001_FLATTEN_ORDER_TYPE", "MARKET"));
-    }
-
-    private static Tmg001BracketConfig BuildTradeManagementConfigFromEnvironment()
+    private static Tmg001BracketConfig BuildTmg001Config()
     {
         return new Tmg001BracketConfig(
             Enabled: TryReadEnvironmentBool("TMG_001_ENABLED", true),
@@ -355,37 +79,7 @@ public sealed class ScannerCandidateReplayRuntime :
             TimeInForce: TryReadEnvironmentString("TMG_001_TIF", "DAY").ToUpperInvariant());
     }
 
-    private static bool BuildScannerRequireMtfAlignmentFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_MTF_ALIGNMENT", false);
-    }
-
-    private static bool BuildScannerRequireBuySetupConfirmationFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_BUY_SETUP_CONFIRMATION", false);
-    }
-
-    private static bool BuildScannerRequireEnhancedBuySetupConfirmationFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_ENHANCED_BUY_SETUP_CONFIRMATION", false);
-    }
-
-    private static bool BuildScannerRequireSellSetupConfirmationFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_SELL_SETUP_CONFIRMATION", false);
-    }
-
-    private static bool BuildScannerRequireBreakoutConfirmationFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_BREAKOUT_CONFIRMATION", false);
-    }
-
-    private static bool BuildScannerRequireOneTwoThreeConfirmationFromEnvironment()
-    {
-        return TryReadEnvironmentBool("SCN_001_REQUIRE_123_CONFIRMATION", false);
-    }
-
-    private static Tmg002BreakEvenConfig BuildTradeManagementBreakEvenConfigFromEnvironment()
+    private static Tmg002BreakEvenConfig BuildTmg002Config()
     {
         return new Tmg002BreakEvenConfig(
             Enabled: TryReadEnvironmentBool("TMG_002_ENABLED", false),
@@ -394,7 +88,7 @@ public sealed class ScannerCandidateReplayRuntime :
             TimeInForce: TryReadEnvironmentString("TMG_002_TIF", "DAY").ToUpperInvariant());
     }
 
-    private static Tmg003TrailingProgressionConfig BuildTradeManagementTrailingConfigFromEnvironment()
+    private static Tmg003TrailingProgressionConfig BuildTmg003Config()
     {
         return new Tmg003TrailingProgressionConfig(
             Enabled: TryReadEnvironmentBool("TMG_003_ENABLED", false),
@@ -403,7 +97,7 @@ public sealed class ScannerCandidateReplayRuntime :
             TimeInForce: TryReadEnvironmentString("TMG_003_TIF", "DAY").ToUpperInvariant());
     }
 
-    private static Tmg004PartialTakeProfitRunnerTrailConfig BuildTradeManagementPartialRunnerConfigFromEnvironment()
+    private static Tmg004PartialTakeProfitRunnerTrailConfig BuildTmg004Config()
     {
         return new Tmg004PartialTakeProfitRunnerTrailConfig(
             Enabled: TryReadEnvironmentBool("TMG_004_ENABLED", false),
@@ -414,7 +108,7 @@ public sealed class ScannerCandidateReplayRuntime :
             TimeInForce: TryReadEnvironmentString("TMG_004_TIF", "DAY").ToUpperInvariant());
     }
 
-    private static Tmg005TimeStopConfig BuildTradeManagementTimeStopConfigFromEnvironment()
+    private static Tmg005TimeStopConfig BuildTmg005Config()
     {
         return new Tmg005TimeStopConfig(
             Enabled: TryReadEnvironmentBool("TMG_005_ENABLED", false),
@@ -425,7 +119,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_005_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg006VolatilityAdaptiveExitConfig BuildTradeManagementAdaptiveConfigFromEnvironment()
+    private static Tmg006VolatilityAdaptiveExitConfig BuildTmg006Config()
     {
         return new Tmg006VolatilityAdaptiveExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_006_ENABLED", false),
@@ -440,7 +134,7 @@ public sealed class ScannerCandidateReplayRuntime :
             TimeInForce: TryReadEnvironmentString("TMG_006_TIF", "DAY").ToUpperInvariant());
     }
 
-    private static Tmg007DrawdownDeriskConfig BuildTradeManagementDrawdownDeriskConfigFromEnvironment()
+    private static Tmg007DrawdownDeriskConfig BuildTmg007Config()
     {
         return new Tmg007DrawdownDeriskConfig(
             Enabled: TryReadEnvironmentBool("TMG_007_ENABLED", false),
@@ -452,7 +146,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_007_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg008SessionVwapReversionConfig BuildTradeManagementVwapReversionConfigFromEnvironment()
+    private static Tmg008SessionVwapReversionConfig BuildTmg008Config()
     {
         return new Tmg008SessionVwapReversionConfig(
             Enabled: TryReadEnvironmentBool("TMG_008_ENABLED", false),
@@ -463,7 +157,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_008_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg009LiquiditySpreadExitConfig BuildTradeManagementSpreadGuardConfigFromEnvironment()
+    private static Tmg009LiquiditySpreadExitConfig BuildTmg009Config()
     {
         return new Tmg009LiquiditySpreadExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_009_ENABLED", false),
@@ -475,7 +169,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_009_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
-    private static Tmg010EventRiskCooldownConfig BuildTradeManagementEventRiskConfigFromEnvironment()
+    private static Tmg010EventRiskCooldownConfig BuildTmg010Config()
     {
         return new Tmg010EventRiskCooldownConfig(
             Enabled: TryReadEnvironmentBool("TMG_010_ENABLED", false),
@@ -487,7 +181,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_010_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg011StallExitConfig BuildTradeManagementStallExitConfigFromEnvironment()
+    private static Tmg011StallExitConfig BuildTmg011Config()
     {
         return new Tmg011StallExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_011_ENABLED", false),
@@ -498,7 +192,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_011_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg012PnlCapExitConfig BuildTradeManagementPnlCapExitConfigFromEnvironment()
+    private static Tmg012PnlCapExitConfig BuildTmg012Config()
     {
         return new Tmg012PnlCapExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_012_ENABLED", false),
@@ -509,7 +203,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_012_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg013SpreadPersistenceExitConfig BuildTradeManagementSpreadPersistenceConfigFromEnvironment()
+    private static Tmg013SpreadPersistenceExitConfig BuildTmg013Config()
     {
         return new Tmg013SpreadPersistenceExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_013_ENABLED", false),
@@ -520,7 +214,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_013_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
-    private static Tmg014GapRiskExitConfig BuildTradeManagementGapRiskConfigFromEnvironment()
+    private static Tmg014GapRiskExitConfig BuildTmg014Config()
     {
         return new Tmg014GapRiskExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_014_ENABLED", false),
@@ -531,7 +225,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_014_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg015AdverseDriftExitConfig BuildTradeManagementAdverseDriftConfigFromEnvironment()
+    private static Tmg015AdverseDriftExitConfig BuildTmg015Config()
     {
         return new Tmg015AdverseDriftExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_015_ENABLED", false),
@@ -542,7 +236,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_015_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg016PeakPullbackExitConfig BuildTradeManagementPeakPullbackConfigFromEnvironment()
+    private static Tmg016PeakPullbackExitConfig BuildTmg016Config()
     {
         return new Tmg016PeakPullbackExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_016_ENABLED", false),
@@ -553,7 +247,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_016_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg017MicrostructureStressExitConfig BuildTradeManagementMicrostructureStressConfigFromEnvironment()
+    private static Tmg017MicrostructureStressExitConfig BuildTmg017Config()
     {
         return new Tmg017MicrostructureStressExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_017_ENABLED", false),
@@ -565,7 +259,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_017_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
-    private static Tmg018StaleFavorableMoveExitConfig BuildTradeManagementStaleFavorableConfigFromEnvironment()
+    private static Tmg018StaleFavorableMoveExitConfig BuildTmg018Config()
     {
         return new Tmg018StaleFavorableMoveExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_018_ENABLED", false),
@@ -576,7 +270,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_018_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg019RollingAdverseWindowExitConfig BuildTradeManagementRollingAdverseConfigFromEnvironment()
+    private static Tmg019RollingAdverseWindowExitConfig BuildTmg019Config()
     {
         return new Tmg019RollingAdverseWindowExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_019_ENABLED", false),
@@ -587,7 +281,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_019_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg020UnderperformanceTimeoutExitConfig BuildTradeManagementUnderperformanceTimeoutConfigFromEnvironment()
+    private static Tmg020UnderperformanceTimeoutExitConfig BuildTmg020Config()
     {
         return new Tmg020UnderperformanceTimeoutExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_020_ENABLED", false),
@@ -598,7 +292,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_020_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg021QuotePressureExitConfig BuildTradeManagementQuotePressureConfigFromEnvironment()
+    private static Tmg021QuotePressureExitConfig BuildTmg021Config()
     {
         return new Tmg021QuotePressureExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_021_ENABLED", false),
@@ -609,7 +303,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_021_FLATTEN_ORDER_TYPE", "MARKETABLE_LIMIT"));
     }
 
-    private static Tmg022VolatilityShockWindowExitConfig BuildTradeManagementVolatilityShockWindowConfigFromEnvironment()
+    private static Tmg022VolatilityShockWindowExitConfig BuildTmg022Config()
     {
         return new Tmg022VolatilityShockWindowExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_022_ENABLED", false),
@@ -621,7 +315,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_022_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg023ProfitReversionFailsafeExitConfig BuildTradeManagementProfitReversionFailsafeConfigFromEnvironment()
+    private static Tmg023ProfitReversionFailsafeExitConfig BuildTmg023Config()
     {
         return new Tmg023ProfitReversionFailsafeExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_023_ENABLED", false),
@@ -633,7 +327,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_023_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg024RangeCompressionExitConfig BuildTradeManagementRangeCompressionConfigFromEnvironment()
+    private static Tmg024RangeCompressionExitConfig BuildTmg024Config()
     {
         return new Tmg024RangeCompressionExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_024_ENABLED", false),
@@ -645,7 +339,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_024_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg025RollingVolatilityFloorExitConfig BuildTradeManagementRollingVolatilityFloorConfigFromEnvironment()
+    private static Tmg025RollingVolatilityFloorExitConfig BuildTmg025Config()
     {
         return new Tmg025RollingVolatilityFloorExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_025_ENABLED", false),
@@ -657,7 +351,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_025_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg026ChopAdverseExitConfig BuildTradeManagementChopAdverseConfigFromEnvironment()
+    private static Tmg026ChopAdverseExitConfig BuildTmg026Config()
     {
         return new Tmg026ChopAdverseExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_026_ENABLED", false),
@@ -670,7 +364,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_026_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg027TrendExhaustionExitConfig BuildTradeManagementTrendExhaustionConfigFromEnvironment()
+    private static Tmg027TrendExhaustionExitConfig BuildTmg027Config()
     {
         return new Tmg027TrendExhaustionExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_027_ENABLED", false),
@@ -683,7 +377,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_027_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg028ReversalAccelerationExitConfig BuildTradeManagementReversalAccelerationConfigFromEnvironment()
+    private static Tmg028ReversalAccelerationExitConfig BuildTmg028Config()
     {
         return new Tmg028ReversalAccelerationExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_028_ENABLED", false),
@@ -696,7 +390,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_028_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg029SustainedReversionExitConfig BuildTradeManagementSustainedReversionConfigFromEnvironment()
+    private static Tmg029SustainedReversionExitConfig BuildTmg029Config()
     {
         return new Tmg029SustainedReversionExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_029_ENABLED", false),
@@ -709,7 +403,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_029_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg030RecoveryFailureExitConfig BuildTradeManagementRecoveryFailureConfigFromEnvironment()
+    private static Tmg030RecoveryFailureExitConfig BuildTmg030Config()
     {
         return new Tmg030RecoveryFailureExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_030_ENABLED", false),
@@ -723,7 +417,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_030_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg031ReboundStallExitConfig BuildTradeManagementReboundStallConfigFromEnvironment()
+    private static Tmg031ReboundStallExitConfig BuildTmg031Config()
     {
         return new Tmg031ReboundStallExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_031_ENABLED", false),
@@ -737,7 +431,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_031_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg032WeakBounceFailureExitConfig BuildTradeManagementWeakBounceFailureConfigFromEnvironment()
+    private static Tmg032WeakBounceFailureExitConfig BuildTmg032Config()
     {
         return new Tmg032WeakBounceFailureExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_032_ENABLED", false),
@@ -752,7 +446,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_032_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg033ReboundRollunderExitConfig BuildTradeManagementReboundRollunderConfigFromEnvironment()
+    private static Tmg033ReboundRollunderExitConfig BuildTmg033Config()
     {
         return new Tmg033ReboundRollunderExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_033_ENABLED", false),
@@ -768,7 +462,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_033_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg034PostReboundFadeExitConfig BuildTradeManagementPostReboundFadeConfigFromEnvironment()
+    private static Tmg034PostReboundFadeExitConfig BuildTmg034Config()
     {
         return new Tmg034PostReboundFadeExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_034_ENABLED", false),
@@ -785,7 +479,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_034_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg035ReboundRejectionAccelExitConfig BuildTradeManagementReboundRejectionAccelConfigFromEnvironment()
+    private static Tmg035ReboundRejectionAccelExitConfig BuildTmg035Config()
     {
         return new Tmg035ReboundRejectionAccelExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_035_ENABLED", false),
@@ -803,7 +497,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_035_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg036RejectionStallBreakExitConfig BuildTradeManagementRejectionStallBreakConfigFromEnvironment()
+    private static Tmg036RejectionStallBreakExitConfig BuildTmg036Config()
     {
         return new Tmg036RejectionStallBreakExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_036_ENABLED", false),
@@ -821,7 +515,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_036_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg037RejectionReboundFailExitConfig BuildTradeManagementRejectionReboundFailConfigFromEnvironment()
+    private static Tmg037RejectionReboundFailExitConfig BuildTmg037Config()
     {
         return new Tmg037RejectionReboundFailExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_037_ENABLED", false),
@@ -839,7 +533,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_037_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg038RejectionContinuationConfirmExitConfig BuildTradeManagementRejectionContinuationConfirmConfigFromEnvironment()
+    private static Tmg038RejectionContinuationConfirmExitConfig BuildTmg038Config()
     {
         return new Tmg038RejectionContinuationConfirmExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_038_ENABLED", false),
@@ -857,7 +551,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_038_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg039DoubleRejectionWeakReboundExitConfig BuildTradeManagementDoubleRejectionWeakReboundConfigFromEnvironment()
+    private static Tmg039DoubleRejectionWeakReboundExitConfig BuildTmg039Config()
     {
         return new Tmg039DoubleRejectionWeakReboundExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_039_ENABLED", false),
@@ -877,7 +571,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_039_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg040DoubleReboundFailureExitConfig BuildTradeManagementDoubleReboundFailureConfigFromEnvironment()
+    private static Tmg040DoubleReboundFailureExitConfig BuildTmg040Config()
     {
         return new Tmg040DoubleReboundFailureExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_040_ENABLED", false),
@@ -897,7 +591,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_040_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg041TripleStepBreakExitConfig BuildTradeManagementTripleStepBreakConfigFromEnvironment()
+    private static Tmg041TripleStepBreakExitConfig BuildTmg041Config()
     {
         return new Tmg041TripleStepBreakExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_041_ENABLED", false),
@@ -917,7 +611,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_041_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg042ReboundPullbackFailExitConfig BuildTradeManagementReboundPullbackFailConfigFromEnvironment()
+    private static Tmg042ReboundPullbackFailExitConfig BuildTmg042Config()
     {
         return new Tmg042ReboundPullbackFailExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_042_ENABLED", false),
@@ -937,7 +631,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_042_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg043ReboundPullbackRejectionExitConfig BuildTradeManagementReboundPullbackRejectionConfigFromEnvironment()
+    private static Tmg043ReboundPullbackRejectionExitConfig BuildTmg043Config()
     {
         return new Tmg043ReboundPullbackRejectionExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_043_ENABLED", false),
@@ -958,7 +652,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_043_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg044ReboundPullbackRejectionConfirmExitConfig BuildTradeManagementReboundPullbackRejectionConfirmConfigFromEnvironment()
+    private static Tmg044ReboundPullbackRejectionConfirmExitConfig BuildTmg044Config()
     {
         return new Tmg044ReboundPullbackRejectionConfirmExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_044_ENABLED", false),
@@ -980,7 +674,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_044_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg045ReboundPullbackRejectionConfirmFailReboundExitConfig BuildTradeManagementReboundPullbackRejectionConfirmFailReboundConfigFromEnvironment()
+    private static Tmg045ReboundPullbackRejectionConfirmFailReboundExitConfig BuildTmg045Config()
     {
         return new Tmg045ReboundPullbackRejectionConfirmFailReboundExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_045_ENABLED", false),
@@ -1004,7 +698,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_045_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitConfig BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfigFromEnvironment()
+    private static Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitConfig BuildTmg046Config()
     {
         return new Tmg046ReboundPullbackRejectionConfirmFailReboundBreakdownExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_046_ENABLED", false),
@@ -1030,7 +724,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_046_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitConfig BuildTradeManagementReboundPullbackRejectionConfirmFailReboundBreakdownConfirmConfigFromEnvironment()
+    private static Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitConfig BuildTmg047Config()
     {
         return new Tmg047ReboundPullbackRejectionConfirmFailReboundBreakdownConfirmExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_047_ENABLED", false),
@@ -1058,7 +752,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_047_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg048MtfCandleReversalExitConfig BuildTradeManagementMtfCandleReversalConfigFromEnvironment()
+    private static Tmg048MtfCandleReversalExitConfig BuildTmg048Config()
     {
         return new Tmg048MtfCandleReversalExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_048_ENABLED", false),
@@ -1068,7 +762,7 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_048_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Tmg049MtfRegimeAtrExitConfig BuildTradeManagementMtfRegimeAtrConfigFromEnvironment()
+    private static Tmg049MtfRegimeAtrExitConfig BuildTmg049Config()
     {
         return new Tmg049MtfRegimeAtrExitConfig(
             Enabled: TryReadEnvironmentBool("TMG_049_ENABLED", false),
@@ -1081,17 +775,9 @@ public sealed class ScannerCandidateReplayRuntime :
             FlattenOrderType: TryReadEnvironmentString("TMG_049_FLATTEN_ORDER_TYPE", "MARKET"));
     }
 
-    private static Eod001ForceFlatConfig BuildEndOfDayConfigFromEnvironment()
-    {
-        return new Eod001ForceFlatConfig(
-            Enabled: TryReadEnvironmentBool("EOD_001_ENABLED", true),
-            SessionCloseHourUtc: Math.Clamp(TryReadEnvironmentInt("EOD_001_SESSION_CLOSE_HOUR_UTC", 21), 0, 23),
-            SessionCloseMinuteUtc: Math.Clamp(TryReadEnvironmentInt("EOD_001_SESSION_CLOSE_MINUTE_UTC", 0), 0, 59),
-            FlattenLeadMinutes: Math.Max(0, TryReadEnvironmentInt("EOD_001_FLATTEN_LEAD_MINUTES", 5)),
-            FlattenRoute: TryReadEnvironmentString("EOD_001_FLATTEN_ROUTE", "SMART"),
-            FlattenTif: TryReadEnvironmentString("EOD_001_FLATTEN_TIF", "DAY+"),
-            FlattenOrderType: TryReadEnvironmentString("EOD_001_FLATTEN_ORDER_TYPE", "MARKET"));
-    }
+    // ─────────────────────────────────────────────────────────────────
+    // ENVIRONMENT HELPERS
+    // ─────────────────────────────────────────────────────────────────
 
     private static bool TryReadEnvironmentBool(string name, bool fallback)
     {
@@ -1147,101 +833,5 @@ public sealed class ScannerCandidateReplayRuntime :
         return string.IsNullOrWhiteSpace(value)
             ? fallback
             : value.Trim();
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // SCANNER SELECTION V2 HELPERS
-    // ─────────────────────────────────────────────────────────────────
-
-    private static ScannerSelectionV2Config BuildScannerSelectionV2ConfigFromEnvironment(int topN, double minScore)
-    {
-        return new ScannerSelectionV2Config
-        {
-            TopN = Math.Max(1, TryReadEnvironmentInt("SCN_V2_TOP_N", topN)),
-            MinFileScore = TryReadEnvironmentDouble("SCN_V2_MIN_FILE_SCORE", minScore),
-            MinPrice = TryReadEnvironmentDouble("SCN_V2_MIN_PRICE", 0.50),
-            MaxPrice = TryReadEnvironmentDouble("SCN_V2_MAX_PRICE", 10.0),
-            MaxSpreadPct = TryReadEnvironmentDouble("SCN_V2_MAX_SPREAD_PCT", 0.03),
-            MinVolume = TryReadEnvironmentDouble("SCN_V2_MIN_VOLUME", 1000),
-            MinBidDepthShares = TryReadEnvironmentDouble("SCN_V2_MIN_BID_DEPTH", 500),
-            MinAskDepthShares = TryReadEnvironmentDouble("SCN_V2_MIN_ASK_DEPTH", 500),
-            DepthLevels = Math.Max(1, TryReadEnvironmentInt("SCN_V2_DEPTH_LEVELS", 5)),
-            MaxAdverseMomentumBps = TryReadEnvironmentDouble("SCN_V2_MAX_ADVERSE_MOMENTUM_BPS", 50.0),
-            MaxBiasShift = TryReadEnvironmentDouble("SCN_V2_MAX_BIAS_SHIFT", 20.0),
-            OpenPhaseMinutes = Math.Max(0, TryReadEnvironmentInt("SCN_V2_OPEN_PHASE_MINUTES", 15)),
-            ClosePhaseMinutes = Math.Max(0, TryReadEnvironmentInt("SCN_V2_CLOSE_PHASE_MINUTES", 30)),
-            OpenPhaseScoreMultiplier = TryReadEnvironmentDouble("SCN_V2_OPEN_PHASE_MULTIPLIER", 0.90),
-            ClosePhaseScoreMultiplier = TryReadEnvironmentDouble("SCN_V2_CLOSE_PHASE_MULTIPLIER", 0.85),
-            MaxExchangeConcentration = Math.Clamp(TryReadEnvironmentDouble("SCN_V2_MAX_EXCHANGE_CONCENTRATION", 0.60), 0.0, 1.0),
-            // Weights (must sum to ~1.0)
-            FileScoreWeight = TryReadEnvironmentDouble("SCN_V2_W_FILE_SCORE", 0.25),
-            SpreadWeight = TryReadEnvironmentDouble("SCN_V2_W_SPREAD", 0.15),
-            VolumeWeight = TryReadEnvironmentDouble("SCN_V2_W_VOLUME", 0.10),
-            DepthWeight = TryReadEnvironmentDouble("SCN_V2_W_DEPTH", 0.10),
-            MomentumWeight = TryReadEnvironmentDouble("SCN_V2_W_MOMENTUM", 0.10),
-            BiasWeight = TryReadEnvironmentDouble("SCN_V2_W_BIAS", 0.10),
-            TimeOfDayWeight = TryReadEnvironmentDouble("SCN_V2_W_TIME_OF_DAY", 0.05),
-            DiversificationWeight = TryReadEnvironmentDouble("SCN_V2_W_DIVERSIFICATION", 0.05),
-            ConsistencyWeight = TryReadEnvironmentDouble("SCN_V2_W_CONSISTENCY", 0.10)
-        };
-    }
-
-    private static IReadOnlyList<ScannerV2SymbolBias> LoadScannerV2BiasEntries()
-    {
-        var biasPath = Environment.GetEnvironmentVariable("SCN_V2_BIAS_STORE_PATH");
-        if (string.IsNullOrWhiteSpace(biasPath))
-        {
-            // Try default path
-            biasPath = Path.Combine(Directory.GetCurrentDirectory(), "temp", "scanner_v2_bias_store.json");
-        }
-
-        if (!File.Exists(biasPath))
-        {
-            return Array.Empty<ScannerV2SymbolBias>();
-        }
-
-        try
-        {
-            var json = File.ReadAllText(biasPath);
-            return JsonSerializer.Deserialize<ScannerV2SymbolBias[]>(json, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            }) ?? Array.Empty<ScannerV2SymbolBias>();
-        }
-        catch
-        {
-            Console.WriteLine($"[WARN] Failed to load scanner V2 bias store from {biasPath}; using empty bias.");
-            return Array.Empty<ScannerV2SymbolBias>();
-        }
-    }
-
-    private static void ExportScannerV2Snapshot(ScannerV2SelectionSnapshot snapshot)
-    {
-        try
-        {
-            var dir = Path.Combine(Directory.GetCurrentDirectory(), "temp", "scanner_v2");
-            Directory.CreateDirectory(dir);
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-            var path = Path.Combine(dir, $"scanner_v2_selection_{timestamp}.json");
-            var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-            });
-            File.WriteAllText(path, json);
-            Console.WriteLine($"[OK] Scanner V2 selection export: {path}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[WARN] Failed to export scanner V2 snapshot: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// Returns the V2 selection snapshot if V2 is enabled, null otherwise.
-    /// </summary>
-    public ScannerV2SelectionSnapshot? GetScannerSelectionSnapshotV2()
-    {
-        return _selectionSnapshotV2;
     }
 }

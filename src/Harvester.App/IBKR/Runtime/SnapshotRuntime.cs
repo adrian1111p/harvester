@@ -6273,15 +6273,11 @@ public sealed partial class SnapshotRuntime
                     "USD",
                     _options.PrimaryExchange));
 
-                var type = string.IsNullOrWhiteSpace(intent.OrderType)
-                    ? "MKT"
-                    : intent.OrderType.Trim().ToUpperInvariant();
-                var tif = string.IsNullOrWhiteSpace(intent.TimeInForce)
-                    ? "DAY"
-                    : intent.TimeInForce.Trim().ToUpperInvariant();
+                var type = intent.OrderType.ToWireString();
+                var tif = intent.TimeInForce.ToWireString();
 
                 var orderIntent = new BrokerOrderIntent(
-                    Action: intent.Side,
+                    Action: intent.Side.ToWireString(),
                     Type: type,
                     Quantity: intent.Quantity,
                     LimitPrice: type is "LMT" or "STP LMT" ? Math.Max(0.01, intent.EntryPrice) : null,

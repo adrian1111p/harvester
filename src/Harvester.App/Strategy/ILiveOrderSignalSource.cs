@@ -37,9 +37,9 @@ public sealed record LiveOrderIntent(
     string IntentId,
     DateTime TimestampUtc,
     string Symbol,
-    string Side,
-    string OrderType,
-    string TimeInForce,
+    OrderSide Side,
+    OrderType OrderType,
+    OrderTimeInForce TimeInForce,
     int Quantity,
     double EntryPrice,
     double StopPrice,
@@ -47,4 +47,8 @@ public sealed record LiveOrderIntent(
     double EstimatedRiskDollars,
     string Setup,
     string Source
-);
+) : IOrderIntent
+{
+    string IOrderIntent.SideLabel => Side.ToString();
+    double IOrderIntent.OrderQuantity => Quantity;
+}

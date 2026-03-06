@@ -11,10 +11,15 @@ public sealed class V3LiveCandleAggregator
 {
     public static readonly int[] TimeframeSeconds = [60, 300, 900, 3600, 86400];
 
-    /// <summary>Max completed candles to retain per timeframe (rolling window).</summary>
-    private const int MaxHistoryPerTimeframe = 500;
-
     private readonly Dictionary<string, SymbolCandleState> _stateBySymbol = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TimeProvider _timeProvider;
+    private readonly int _maxHistoryPerTimeframe;
+
+    public V3LiveCandleAggregator(TimeProvider? timeProvider = null, int maxHistoryPerTimeframe = 500)
+    {
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _maxHistoryPerTimeframe = maxHistoryPerTimeframe;
+    }
 
     /// <summary>
     /// Update from a live L1 tick (price update).
@@ -119,7 +124,7 @@ public sealed class V3LiveCandleAggregator
                 CurrentCandle: current);
         }
 
-        return new V3LiveCandleSnapshot(normalized, DateTime.UtcNow, timeframes);
+        return new V3LiveCandleSnapshot(normalized, _timeProvider.GetUtcNow().UtcDateTime, timeframes);
     }
 
     /// <summary>
@@ -206,7 +211,7 @@ public sealed class V3LiveCandleAggregator
         return state;
     }
 
-    private static void AppendToHistory(SymbolCandleState state, int timeframeSeconds, LiveCandle completedCandle)
+    private void AppendToHistory(SymbolCandleState state, int timeframeSeconds, LiveCandle completedCandle)
     {
         if (!state.HistoryByTimeframe.TryGetValue(timeframeSeconds, out var list))
         {
@@ -217,16 +222,12 @@ public sealed class V3LiveCandleAggregator
         list.Add(completedCandle);
 
         // Trim to max history size
-        while (list.Count > MaxHistoryPerTimeframe)
+        while (list.Count > _maxHistoryPerTimeframe)
             list.RemoveAt(0);
     }
 
     private static DateTime AlignToBucketStart(DateTime timestampUtc, int bucketSeconds)
-    {
-        var epochSeconds = (long)(timestampUtc - DateTime.UnixEpoch).TotalSeconds;
-        var aligned = epochSeconds - (epochSeconds % Math.Max(1, bucketSeconds));
-        return DateTime.UnixEpoch.AddSeconds(aligned);
-    }
+        => CandleTimeUtils.AlignToBucketStart(timestampUtc, bucketSeconds);
 
     private sealed class SymbolCandleState
     {
@@ -276,8 +277,11 @@ public sealed record V3LiveMtfAlignment(
     bool AllBearish,
     bool ShortTermBearish,
     bool ShortTermBullish,
-    IReadOnlyDictionary<int, V3LiveMtfTimeframeStatus> TimeframeDetails)
+    IReadOnlyDictionary<int, V3LiveMtfTimeframeStatus> TimeframeDetails) : IMtfAlignment
 {
+    bool IMtfAlignment.IsBullish => AllBullish;
+    bool IMtfAlignment.IsBearish => AllBearish;
+
     public static readonly V3LiveMtfAlignment Empty = new(
         false, 0, 0, 0, false, false, false, false,
         new Dictionary<int, V3LiveMtfTimeframeStatus>());

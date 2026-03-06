@@ -48,9 +48,13 @@ public sealed class V3LivePositionMonitor
         if (price <= 0)
             return V3LiveExitDecision.Hold("no-price");
 
-        var isLong = position.Side == "LONG";
+        var isLong = position.Side == PositionSide.Long;
         var entryPrice = position.EntryPrice;
-        var riskPerShare = _config.HardStopR * (double.IsNaN(features.Atr14) || features.Atr14 <= 0 ? 1.0 : features.Atr14);
+        // Use entry-time ATR when available to prevent stop/TP drift as volatility changes
+        var atrForRisk = position.EntryAtr14 > 0 && !double.IsNaN(position.EntryAtr14)
+            ? position.EntryAtr14
+            : (double.IsNaN(features.Atr14) || features.Atr14 <= 0 ? 1.0 : features.Atr14);
+        var riskPerShare = _config.HardStopR * atrForRisk;
         var holdSeconds = (nowUtc - position.EntryUtc).TotalSeconds;
 
         // --- E11: Session end / close-only mode ---
@@ -64,7 +68,7 @@ public sealed class V3LivePositionMonitor
         if (features.L1.HasQuote)
         {
             var quotAge = (nowUtc - features.L1.TimestampUtc).TotalSeconds;
-            if (quotAge > _config.MaxQuoteStalenessSeconds * 3) // 3× tolerance for exit vs entry
+            if (quotAge > _config.MaxQuoteStalenessSeconds * _config.ExitQuoteStalenessMultiplier)
             {
                 return V3LiveExitDecision.Exit("l1-stale-exit",
                     $"L1 quote stale for {quotAge:F0}s (3× threshold)");
@@ -88,7 +92,7 @@ public sealed class V3LivePositionMonitor
         }
 
         // --- E7: Take-profit 2 (full exit) ---
-        var tp2Distance = _config.Tp2R * (double.IsNaN(features.Atr14) ? riskPerShare : features.Atr14);
+        var tp2Distance = _config.Tp2R * atrForRisk;
         var tp2Price = position.TakeProfitPrice > 0
             ? position.TakeProfitPrice
             : (isLong ? entryPrice + tp2Distance : entryPrice - tp2Distance);
@@ -128,25 +132,25 @@ public sealed class V3LivePositionMonitor
         }
 
         // --- E6: Trailing stop (after break-even activation) ---
-        var beActivationDistance = _config.BreakevenR * (double.IsNaN(features.Atr14) ? riskPerShare : features.Atr14);
-        var trailDistance = _config.TrailR * (double.IsNaN(features.Atr14) ? riskPerShare : features.Atr14);
+        var beActivationDistance = _config.BreakevenR * atrForRisk;
+        var trailDistance = _config.TrailR * atrForRisk;
 
-        if (isLong && position.PeakPriceSinceEntry >= entryPrice + beActivationDistance)
+        if (isLong && position.MostFavorablePriceSinceEntry >= entryPrice + beActivationDistance)
         {
-            var trailStop = position.PeakPriceSinceEntry - trailDistance;
+            var trailStop = position.MostFavorablePriceSinceEntry - trailDistance;
             if (price <= trailStop)
             {
                 return V3LiveExitDecision.Exit("trailing-stop",
-                    $"Price {price:F2} <= trail from peak {position.PeakPriceSinceEntry:F2} - {trailDistance:F2}");
+                    $"Price {price:F2} <= trail from peak {position.MostFavorablePriceSinceEntry:F2} - {trailDistance:F2}");
             }
         }
-        if (!isLong && position.PeakPriceSinceEntry > 0 && position.PeakPriceSinceEntry <= entryPrice - beActivationDistance)
+        if (!isLong && position.MostFavorablePriceSinceEntry > 0 && position.MostFavorablePriceSinceEntry <= entryPrice - beActivationDistance)
         {
-            var trailStop = position.PeakPriceSinceEntry + trailDistance;
+            var trailStop = position.MostFavorablePriceSinceEntry + trailDistance;
             if (price >= trailStop)
             {
                 return V3LiveExitDecision.Exit("trailing-stop",
-                    $"Price {price:F2} >= trail from peak {position.PeakPriceSinceEntry:F2} + {trailDistance:F2}");
+                    $"Price {price:F2} >= trail from peak {position.MostFavorablePriceSinceEntry:F2} + {trailDistance:F2}");
             }
         }
 
@@ -155,7 +159,7 @@ public sealed class V3LivePositionMonitor
         if (holdSeconds >= maxHoldSeconds)
         {
             var progressR = position.UnrealizedPnl / (riskPerShare * Math.Abs(position.Quantity));
-            if (progressR < 0.5)
+            if (progressR < _config.TimeStopMinProgressR)
             {
                 return V3LiveExitDecision.Exit("time-stop",
                     $"Held {holdSeconds:F0}s (max {maxHoldSeconds:F0}s), progress only {progressR:F2}R");
@@ -185,7 +189,7 @@ public sealed class V3LivePositionMonitor
         if (_config.RequireL2Depth && features.L2.HasDepth)
         {
             var totalDepth = features.L2.BidDepthN + features.L2.AskDepthN;
-            if (totalDepth < _config.MinDepthPerSideShares * 0.3)
+            if (totalDepth < _config.MinDepthPerSideShares * _config.DepthDriedUpMultiplier)
             {
                 return V3LiveExitDecision.Exit("l2-depth-dried",
                     $"L2 total depth {totalDepth:F0} < 30% of threshold {_config.MinDepthPerSideShares:F0}");
@@ -201,7 +205,7 @@ public sealed class V3LivePositionMonitor
         }
 
         // --- E7: Take-profit 1 (advisory — signal partial or tighten stop) ---
-        var tp1Distance = _config.Tp1R * (double.IsNaN(features.Atr14) ? riskPerShare : features.Atr14);
+        var tp1Distance = _config.Tp1R * atrForRisk;
         if (isLong && price >= entryPrice + tp1Distance)
         {
             return V3LiveExitDecision.Advisory("take-profit-1-zone",
@@ -228,7 +232,7 @@ public sealed class V3LivePositionMonitor
         if (!features.SqueezeOn) return null; // Not in a squeeze — no squeeze exit logic
 
         // If squeeze is on and price is moving against us, it's a warning
-        var isLong = position.Side == "LONG";
+        var isLong = position.Side == PositionSide.Long;
         var price = features.Price;
 
         if (!double.IsNaN(features.KcMid) && features.KcMid > 0)

@@ -4,17 +4,16 @@ namespace Harvester.App.Strategy;
 
 /// <summary>
 /// Signal engine implementing V11-style composite scoring with regime filters.
+///
+/// NaN policy: indicators using NaN follow a consistent "no-data = no-contribution" rule.
+///   - Filters (ATR, ADX, price): NaN causes rejection or bypass — never contributes a false pass.
+///   - Scorers (RVOL, VWAP/RSI, BB, Squeeze, OFI): NaN means the indicator does not add to score.
+///   - All NaN comparisons use explicit double.IsNaN guards for clarity.
 /// </summary>
-public sealed class V3LiveSignalEngine
+public sealed class V3LiveSignalEngine : ILiveSignalEngine
 {
     /// <summary>Per-symbol squeeze state for tracking bar count and release transitions.</summary>
     private readonly Dictionary<string, SqueezeState> _squeezeBySymbol = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Minimum consecutive squeeze bars before a breakout signal fires.</summary>
-    private const int MinSqueezeBarCount = 8;
-
-    /// <summary>OFI tiebreaker threshold for resolving long/short conflicts.</summary>
-    private const double OfiTiebreakerThreshold = 0.05;
 
     public V3LiveSignalDecision Evaluate(V3LiveFeatureSnapshot f, V3LiveConfig cfg, string symbol = "")
     {
@@ -69,9 +68,11 @@ public sealed class V3LiveSignalEngine
             }
         }
 
-        // Mean-reversion setup components
-        var vwapLong = f.DistFromVwapAtr <= -cfg.VwapDeviationAtr && f.Rsi14 <= cfg.RsiOversold;
-        var vwapShort = f.DistFromVwapAtr >= cfg.VwapDeviationAtr && f.Rsi14 >= cfg.RsiOverbought;
+        // Mean-reversion setup components (NaN-safe: no score when indicator missing)
+        var vwapLong = !double.IsNaN(f.DistFromVwapAtr) && !double.IsNaN(f.Rsi14)
+            && f.DistFromVwapAtr <= -cfg.VwapDeviationAtr && f.Rsi14 <= cfg.RsiOversold;
+        var vwapShort = !double.IsNaN(f.DistFromVwapAtr) && !double.IsNaN(f.Rsi14)
+            && f.DistFromVwapAtr >= cfg.VwapDeviationAtr && f.Rsi14 >= cfg.RsiOverbought;
         if (vwapLong)
         {
             longScore += 2;
@@ -83,8 +84,8 @@ public sealed class V3LiveSignalEngine
             shortReasons.Add("VWAP");
         }
 
-        var bbLong = f.BbPctB <= cfg.BbEntryPctbLow;
-        var bbShort = f.BbPctB >= cfg.BbEntryPctbHigh;
+        var bbLong = !double.IsNaN(f.BbPctB) && f.BbPctB <= cfg.BbEntryPctbLow;
+        var bbShort = !double.IsNaN(f.BbPctB) && f.BbPctB >= cfg.BbEntryPctbHigh;
         if (bbLong)
         {
             longScore += 2;
@@ -134,7 +135,7 @@ public sealed class V3LiveSignalEngine
 
         if (longValid && shortValid)
         {
-            if (Math.Abs(f.OfiSignal) >= OfiTiebreakerThreshold)
+            if (Math.Abs(f.OfiSignal) >= cfg.OfiTiebreakerThreshold)
             {
                 var side = f.OfiSignal >= 0 ? TradeSide.Long : TradeSide.Short;
                 var setup = side == TradeSide.Long
@@ -172,7 +173,7 @@ public sealed class V3LiveSignalEngine
         }
 
         // Squeeze is OFF now
-        if (state.WasSqueezing && state.ConsecutiveSqueezeCount >= MinSqueezeBarCount)
+        if (state.WasSqueezing && state.ConsecutiveSqueezeCount >= cfg.MinSqueezeBarCount)
         {
             // Squeeze just released after sufficient buildup — check breakout direction
             state.WasSqueezing = false;

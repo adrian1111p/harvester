@@ -4,25 +4,19 @@ using Harvester.App.IBKR.Runtime;
 
 namespace Harvester.App.Strategy;
 
-public sealed class V3LiveFeatureBuilder
+public sealed class V3LiveFeatureBuilder : ILiveFeatureBuilder
 {
     public V3LiveFeatureSnapshot Build(StrategyDataSlice dataSlice, int depthLevels)
     {
         var l1 = BuildL1Snapshot(dataSlice);
         var l2 = BuildL2Snapshot(dataSlice, depthLevels);
 
-        var bars = dataSlice.HistoricalBars
-            .OrderBy(x => x.TimestampUtc)
-            .Select(x => new BacktestBar(
-                Timestamp: x.TimestampUtc,
-                Open: x.Open,
-                High: x.High,
-                Low: x.Low,
-                Close: x.Close,
-                Volume: (double)x.Volume))
-            .ToArray();
+        // Sort source rows and build bars + parallel arrays in a single pass
+        // (eliminates 3 intermediate LINQ allocations per tick)
+        var sortedRows = dataSlice.HistoricalBars.OrderBy(x => x.TimestampUtc).ToArray();
+        var count = sortedRows.Length;
 
-        if (bars.Length < 30)
+        if (count < 30)
         {
             return new V3LiveFeatureSnapshot(
                 TimestampUtc: dataSlice.TimestampUtc,
@@ -46,8 +40,17 @@ public sealed class V3LiveFeatureBuilder
                 RejectReason: "insufficient-bars");
         }
 
-        var closes = bars.Select(x => x.Close).ToArray();
-        var volumes = bars.Select(x => x.Volume).ToArray();
+        var bars = new BacktestBar[count];
+        var closes = new double[count];
+        var volumes = new double[count];
+
+        for (var i = 0; i < count; i++)
+        {
+            var r = sortedRows[i];
+            bars[i] = new BacktestBar(r.TimestampUtc, r.Open, r.High, r.Low, r.Close, (double)r.Volume);
+            closes[i] = r.Close;
+            volumes[i] = (double)r.Volume;
+        }
 
         var atr = TechnicalIndicators.Atr(bars, 14);
         var rsi = TechnicalIndicators.Rsi(closes, 14);
@@ -58,7 +61,7 @@ public sealed class V3LiveFeatureBuilder
         var adx = TechnicalIndicators.Adx(bars, 14);
         var rvol = TechnicalIndicators.RelativeVolume(volumes, 20);
 
-        var lastIdx = bars.Length - 1;
+        var lastIdx = count - 1;
         var prevIdx = Math.Max(0, lastIdx - 1);
 
         var price = bars[lastIdx].Close;
@@ -209,4 +212,4 @@ public sealed record V3LiveFeatureSnapshot(
     double VolAccel,
     double OfiSignal,
     bool SqueezeOn,
-    string RejectReason);
+    string RejectReason) : IFeatureSnapshot;

@@ -1,6 +1,6 @@
 namespace Harvester.App.Strategy;
 
-public sealed class V3LiveRiskGuard
+public sealed class V3LiveRiskGuard : ILiveRiskGuard
 {
     private readonly V3LiveConfig _config;
 
@@ -57,12 +57,12 @@ public sealed class V3LiveRiskGuard
 
         if (_config.RequireL2Depth)
         {
-            if (order.Side == "BUY" && features.L2.ImbalanceRatio < _config.MinImbalanceLong)
+            if (order.Side == OrderSide.Buy && features.L2.ImbalanceRatio < _config.MinImbalanceLong)
             {
                 reasons.Add("risk-imbalance-long");
             }
 
-            if (order.Side == "SELL" && features.L2.ImbalanceRatio > _config.MaxImbalanceShort)
+            if (order.Side == OrderSide.Sell && features.L2.ImbalanceRatio > _config.MaxImbalanceShort)
             {
                 reasons.Add("risk-imbalance-short");
             }
