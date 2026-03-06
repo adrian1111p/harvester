@@ -935,6 +935,9 @@ public sealed partial class SnapshotRuntime
     {
         EnsureSteadyStateForOrderRoute(nameof(RunPositionsAutoReplaceScanLoopMode));
 
+        const int maxTradesPerRun = 8;
+        var scannerRefreshInterval = TimeSpan.FromMinutes(15);
+
         var allowed = _options.AllowedSymbols
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(x => x.Trim().ToUpperInvariant())
@@ -948,11 +951,17 @@ public sealed partial class SnapshotRuntime
         var initialPlans = (await LoadActivePositionMonitorPlansAsync(client, brokerAdapter, token, nameof(RunPositionsAutoReplaceScanLoopMode)))
             .Where(p => allowed.Contains(p.Symbol))
             .ToArray();
+        var desiredSlots = Math.Clamp(_options.LiveScannerTopN, 5, 8);
         var targetSlots = initialPlans.Length > 0
-            ? initialPlans.Length
-            : Math.Min(5, allowed.Count);
+            ? Math.Clamp(initialPlans.Length, 1, 8)
+            : Math.Min(desiredSlots, allowed.Count);
+
+        DateTime nextScannerRefreshUtc = DateTime.MinValue;
+        Queue<ScannerReplacementCandidate> replacementCandidates = new();
+        var placedTrades = 0;
 
         Console.WriteLine($"[INFO] Auto-replace loop: allowedSymbols={allowed.Count} targetSlots={targetSlots}.");
+        Console.WriteLine($"[INFO] Auto-replace loop: scanner-refresh={scannerRefreshInterval.TotalMinutes:F0}m history-batch-size=20 max-trades={maxTradesPerRun}.");
 
         var previousBySymbol = initialPlans
             .GroupBy(p => p.Symbol, StringComparer.OrdinalIgnoreCase)
@@ -982,6 +991,27 @@ public sealed partial class SnapshotRuntime
                     Console.WriteLine($"[INFO] Auto-replace loop: detected closed symbol(s): {string.Join(",", closedSymbols)}.");
                 }
 
+                var nowUtc = DateTime.UtcNow;
+                if (nowUtc >= nextScannerRefreshUtc || replacementCandidates.Count == 0)
+                {
+                    var excludedForRefresh = new HashSet<string>(currentSymbols, StringComparer.OrdinalIgnoreCase);
+                    foreach (var closedSymbol in closedSymbols)
+                    {
+                        excludedForRefresh.Add(closedSymbol);
+                    }
+
+                    var refreshed = await BuildScannerReplacementCandidatesAsync(
+                        client,
+                        brokerAdapter,
+                        allowed,
+                        excludedForRefresh,
+                        token);
+                    replacementCandidates = new Queue<ScannerReplacementCandidate>(refreshed);
+                    nextScannerRefreshUtc = nowUtc.Add(scannerRefreshInterval);
+
+                    Console.WriteLine($"[INFO] Auto-replace loop: scanner refresh produced {refreshed.Length} candidate(s); next refresh at {nextScannerRefreshUtc:O}.");
+                }
+
                 var replacementQuantityQueue = new Queue<double>(
                     closedSymbols
                         .Select(symbol => previousBySymbol.TryGetValue(symbol, out var plan)
@@ -997,6 +1027,12 @@ public sealed partial class SnapshotRuntime
 
                 for (var slot = 0; slot < missingSlots && !token.IsCancellationRequested; slot++)
                 {
+                    if (placedTrades >= maxTradesPerRun)
+                    {
+                        Console.WriteLine($"[WARN] Auto-replace loop: max trade cap reached ({maxTradesPerRun}); no further entries will be placed this run.");
+                        break;
+                    }
+
                     var excluded = new HashSet<string>(currentSymbols, StringComparer.OrdinalIgnoreCase);
                     foreach (var closedSymbol in closedSymbols)
                     {
@@ -1008,20 +1044,38 @@ public sealed partial class SnapshotRuntime
                         : Math.Max(1, _options.LiveQuantity);
 
                     LiveOrderPlacementPlan replacementPlan;
-                    try
+                    while (replacementCandidates.Count > 0 && excluded.Contains(replacementCandidates.Peek().Symbol))
                     {
-                        replacementPlan = await ResolveLiveOrderPlacementPlanAsync(
-                            client,
-                            brokerAdapter,
-                            actionOverride: "BUY",
-                            excludedSymbols: excluded,
-                            quantityOverride: replacementQuantity,
-                            token);
+                        replacementCandidates.Dequeue();
                     }
-                    catch (Exception ex)
+
+                    if (replacementCandidates.Count > 0)
                     {
-                        Console.WriteLine($"[WARN] Auto-replace loop: scanner selection blocked for slot {slot + 1}/{missingSlots}. reason={ex.Message}");
-                        break;
+                        var chosen = replacementCandidates.Dequeue();
+                        replacementPlan = new LiveOrderPlacementPlan(
+                            Symbol: chosen.Symbol,
+                            Action: "BUY",
+                            Quantity: replacementQuantity,
+                            LimitPrice: chosen.SeedLimitPrice,
+                            Source: $"scanner-refresh:{chosen.SourceTag}");
+                    }
+                    else
+                    {
+                        try
+                        {
+                            replacementPlan = await ResolveLiveOrderPlacementPlanAsync(
+                                client,
+                                brokerAdapter,
+                                actionOverride: "BUY",
+                                excludedSymbols: excluded,
+                                quantityOverride: replacementQuantity,
+                                token);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[WARN] Auto-replace loop: scanner selection blocked for slot {slot + 1}/{missingSlots}. reason={ex.Message}");
+                            break;
+                        }
                     }
 
                     try
@@ -1033,6 +1087,7 @@ public sealed partial class SnapshotRuntime
                             nameof(RunPositionsAutoReplaceScanLoopMode),
                             token,
                             quoteRequestSeed: 12917 + (cycle * 100) + (slot * 10));
+                        placedTrades++;
                     }
                     catch (Exception ex)
                     {
@@ -1058,6 +1113,204 @@ public sealed partial class SnapshotRuntime
             return;
         }
     }
+
+    private async Task<ScannerReplacementCandidate[]> BuildScannerReplacementCandidatesAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        IReadOnlySet<string> allowedSymbols,
+        IReadOnlySet<string> excludedSymbols,
+        CancellationToken token)
+    {
+        var scannerRows = LoadConfiguredScannerRowsForCurrentPhase();
+        if (scannerRows.Length == 0)
+        {
+            return [];
+        }
+
+        var filteredRows = scannerRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.Symbol))
+            .Select(x => new LiveScannerCandidateRow
+            {
+                Symbol = x.Symbol.Trim().ToUpperInvariant(),
+                WeightedScore = x.WeightedScore,
+                Eligible = x.Eligible,
+                AverageRank = x.AverageRank,
+                Bid = x.Bid,
+                Ask = x.Ask,
+                Mark = x.Mark
+            })
+            .Where(x => x.Eligible is not false)
+            .Where(x => x.WeightedScore >= _options.LiveScannerMinScore)
+            .Where(x => allowedSymbols.Contains(x.Symbol))
+            .Where(x => !excludedSymbols.Contains(x.Symbol))
+            .GroupBy(x => x.Symbol, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g
+                .OrderByDescending(row => row.WeightedScore)
+                .ThenBy(row => row.AverageRank)
+                .First())
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenBy(x => x.AverageRank)
+            .Take(400)
+            .ToArray();
+
+        if (filteredRows.Length == 0)
+        {
+            return [];
+        }
+
+        var historyMetrics = await LoadHistoryMetricsInBatchesAsync(
+            client,
+            brokerAdapter,
+            filteredRows.Select(x => x.Symbol).ToArray(),
+            token);
+
+        var targetCount = Math.Min(Math.Clamp(_options.LiveScannerTopN, 5, 8), filteredRows.Length);
+
+        var selected = filteredRows
+            .Where(x => historyMetrics.TryGetValue(x.Symbol, out var metric)
+                        && metric.LastClose > 0
+                        && metric.LastClose <= _options.MaxPrice
+                        && (_options.ScannerAboveVolume <= 0 || metric.AverageVolume20 >= _options.ScannerAboveVolume))
+            .OrderByDescending(x => x.WeightedScore)
+            .ThenByDescending(x => historyMetrics.TryGetValue(x.Symbol, out var metric) ? metric.AverageVolume20 : 0)
+            .ThenBy(x => x.AverageRank)
+            .Take(targetCount)
+            .Select(x => new ScannerReplacementCandidate(
+                x.Symbol,
+                SeedLimitPrice: x.Ask > 0 ? x.Ask : (x.Mark > 0 ? x.Mark : (x.Bid > 0 ? x.Bid : Math.Max(0.01, _options.LiveLimitPrice))),
+                SourceTag: "excel-history-filtered"))
+            .ToArray();
+
+        return selected;
+    }
+
+    private LiveScannerCandidateRow[] LoadConfiguredScannerRowsForCurrentPhase()
+    {
+        if (string.IsNullOrWhiteSpace(_options.LiveScannerOpenPhaseInputPath)
+            || string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenGainersInputPath)
+            || string.IsNullOrWhiteSpace(_options.LiveScannerPostOpenLosersInputPath))
+        {
+            var singlePath = ResolveLiveScannerInputPath("BUY");
+            if (string.IsNullOrWhiteSpace(singlePath))
+            {
+                return [];
+            }
+
+            var full = Path.GetFullPath(singlePath);
+            return File.Exists(full)
+                ? LoadLiveScannerCandidateRows(full)
+                : [];
+        }
+
+        var openPath = Path.GetFullPath(_options.LiveScannerOpenPhaseInputPath);
+        var gainersPath = Path.GetFullPath(_options.LiveScannerPostOpenGainersInputPath);
+        var losersPath = Path.GetFullPath(_options.LiveScannerPostOpenLosersInputPath);
+        var allThreeExist = File.Exists(openPath) && File.Exists(gainersPath) && File.Exists(losersPath);
+
+        if (!allThreeExist)
+        {
+            return [];
+        }
+
+        var calendar = new UsEquitiesExchangeCalendarService();
+        var nowUtc = DateTime.UtcNow;
+        var useGapOpenPhaseOnly = false;
+
+        if (calendar.TryGetSessionWindowUtc("US-EQUITIES", nowUtc, out var session) && session.IsTradingDay)
+        {
+            var gapWindowEnd = session.SessionOpenUtc.AddMinutes(Math.Max(1, _options.LiveScannerOpenPhaseMinutes));
+            useGapOpenPhaseOnly = nowUtc >= session.SessionOpenUtc && nowUtc < gapWindowEnd;
+        }
+
+        if (useGapOpenPhaseOnly)
+        {
+            return LoadLiveScannerCandidateRows(openPath);
+        }
+
+        var merged = new List<LiveScannerCandidateRow>();
+        merged.AddRange(LoadLiveScannerCandidateRows(gainersPath));
+        merged.AddRange(LoadLiveScannerCandidateRows(losersPath));
+        return merged.ToArray();
+    }
+
+    private async Task<Dictionary<string, HistoricalProbeMetric>> LoadHistoryMetricsInBatchesAsync(
+        EClientSocket client,
+        IBrokerAdapter brokerAdapter,
+        IReadOnlyList<string> symbols,
+        CancellationToken token)
+    {
+        var results = new Dictionary<string, HistoricalProbeMetric>(StringComparer.OrdinalIgnoreCase);
+        if (symbols.Count == 0)
+        {
+            return results;
+        }
+
+        var reqIdSeed = 19100;
+        foreach (var batch in symbols.Chunk(20))
+        {
+            token.ThrowIfCancellationRequested();
+
+            var requests = new List<(int RequestId, string Symbol)>();
+            foreach (var symbol in batch)
+            {
+                var requestId = reqIdSeed++;
+                var contract = brokerAdapter.BuildContract(new BrokerContractSpec(
+                    BrokerAssetType.Stock,
+                    symbol,
+                    "SMART",
+                    "USD",
+                    _options.PrimaryExchange));
+
+                brokerAdapter.RequestHistoricalData(
+                    client,
+                    requestId,
+                    contract,
+                    string.Empty,
+                    "1 D",
+                    "5 mins",
+                    "TRADES",
+                    1,
+                    1,
+                    keepUpToDate: false);
+                requests.Add((requestId, symbol));
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+
+            var bars = _wrapper.HistoricalBars.ToArray();
+            foreach (var req in requests)
+            {
+                var byReq = bars
+                    .Where(x => x.RequestId == req.RequestId)
+                    .OrderBy(x => x.TimestampUtc)
+                    .ToArray();
+                if (byReq.Length == 0)
+                {
+                    continue;
+                }
+
+                var latestClose = byReq[^1].Close;
+                var lookback = byReq.TakeLast(Math.Min(20, byReq.Length)).ToArray();
+                var avgVolume20 = lookback.Length == 0
+                    ? 0
+                    : lookback.Average(x => (double)x.Volume);
+
+                results[req.Symbol] = new HistoricalProbeMetric(latestClose, avgVolume20, byReq.Length);
+            }
+        }
+
+        return results;
+    }
+
+    private sealed record ScannerReplacementCandidate(
+        string Symbol,
+        double SeedLimitPrice,
+        string SourceTag);
+
+    private sealed record HistoricalProbeMetric(
+        double LastClose,
+        double AverageVolume20,
+        int BarCount);
 
     private async Task<PositionMonitorPlan[]> LoadActivePositionMonitorPlansAsync(EClientSocket client, IBrokerAdapter brokerAdapter, CancellationToken token, string origin)
     {

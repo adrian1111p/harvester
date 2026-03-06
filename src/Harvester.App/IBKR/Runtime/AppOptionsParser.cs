@@ -42,7 +42,7 @@ internal static class AppOptionsParser
         var liveScannerOpenPhaseInputPath = string.Empty;
         var liveScannerPostOpenGainersInputPath = string.Empty;
         var liveScannerPostOpenLosersInputPath = string.Empty;
-        var liveScannerOpenPhaseMinutes = 60;
+        var liveScannerOpenPhaseMinutes = 45;
         var liveScannerPostOpenMinutes = 120;
         var liveScannerTopN = 5;
         var liveScannerMinScore = 60.0;
