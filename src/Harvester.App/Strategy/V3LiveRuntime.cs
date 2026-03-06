@@ -42,11 +42,11 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private readonly V3LivePositionTracker _positionTracker = new();
     private readonly V3LivePositionMonitor _positionMonitor;
     private readonly V3LiveExecutionStateMachine _executionStateMachine = new();
+    private readonly V3LiveHistoricalBarDeduplicator _historicalBarDeduplicator = new();
     private readonly ILogger<V3LiveRuntime> _logger;
 
     // ── Per-symbol state ───────────────────────────────────────────────────
     private readonly Dictionary<string, V3LiveSymbolState> _stateBySymbol = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, HistoricalBarWatermark> _historicalBarWatermarkBySymbol = new(StringComparer.OrdinalIgnoreCase);
 
     // ── Live order intent queue (consumed by SnapshotRuntime via ILiveOrderSignalSource) ──
     private readonly List<LiveOrderIntent> _pendingIntents = [];
@@ -89,7 +89,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
             _riskEvents.Clear();
         }
         _stateBySymbol.Clear();
-        _historicalBarWatermarkBySymbol.Clear();
+        _historicalBarDeduplicator.Reset();
         _executionStateMachine.Reset();
 
         lock (_intentLock) _pendingIntents.Clear();
@@ -131,7 +131,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
 
     public Task OnDataAsync(StrategyDataSlice dataSlice, CancellationToken cancellationToken)
     {
-        var symbol = ResolveSymbol(dataSlice);
+        var symbol = V3LiveSymbolResolver.Resolve(_context?.Symbol, dataSlice.Positions, _config.Symbols);
         if (string.IsNullOrWhiteSpace(symbol))
             return Task.CompletedTask;
 
@@ -654,39 +654,13 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     private void UpdateCandleAggregator(string symbol, StrategyDataSlice dataSlice)
     {
         // Feed historical bars (1m bars from IBKR) with dedupe watermark
-        var normalized = symbol.Trim().ToUpperInvariant();
-        _historicalBarWatermarkBySymbol.TryGetValue(normalized, out var watermark);
-
         foreach (var bar in dataSlice.HistoricalBars.OrderBy(x => x.TimestampUtc))
         {
-            if (watermark is not null &&
-                bar.TimestampUtc == watermark.TimestampUtc &&
-                bar.Open == watermark.Open &&
-                bar.High == watermark.High &&
-                bar.Low == watermark.Low &&
-                bar.Close == watermark.Close &&
-                bar.Volume == watermark.Volume)
-            {
+            if (!_historicalBarDeduplicator.ShouldAccept(symbol, bar))
                 continue;
-            }
-
-            if (watermark is not null && bar.TimestampUtc < watermark.TimestampUtc)
-            {
-                continue;
-            }
 
             _candleAggregator.UpdateFromHistoricalBar(symbol, bar);
-            watermark = new HistoricalBarWatermark(
-                bar.TimestampUtc,
-                bar.Open,
-                bar.High,
-                bar.Low,
-                bar.Close,
-                bar.Volume);
         }
-
-        if (watermark is not null)
-            _historicalBarWatermarkBySymbol[normalized] = watermark;
 
         // Feed L1 last tick for sub-minute candle updates
         var lastTick = dataSlice.TopTicks
@@ -714,33 +688,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  Symbol resolution (H-01 FIX)
-    // ════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Resolve the active symbol from available data sources.
-    /// Priority: 1) context.Symbol, 2) positions data, 3) config fallback.
-    /// </summary>
-    private string ResolveSymbol(StrategyDataSlice dataSlice)
-    {
-        // Primary: context symbol (set by SnapshotRuntime from _options.Symbol)
-        if (_context is not null && !string.IsNullOrWhiteSpace(_context.Symbol))
-            return _context.Symbol.Trim().ToUpperInvariant();
-
-        // Secondary: extract from position data
-        var posSymbol = dataSlice.Positions
-            .Where(p => !string.IsNullOrWhiteSpace(p.Symbol)
-                && string.Equals(p.SecurityType, "STK", StringComparison.OrdinalIgnoreCase))
-            .Select(p => p.Symbol.Trim().ToUpperInvariant())
-            .FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(posSymbol))
-            return posSymbol;
-
-        // Fallback: first configured symbol
-        return _config.Symbols.FirstOrDefault() ?? string.Empty;
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
     //  Utilities
     // ════════════════════════════════════════════════════════════════════════
 
@@ -757,32 +704,7 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         string symbol,
         V3LiveFeatureSnapshot features)
     {
-        if (_tradeUniverse.Count > 0 && !_tradeUniverse.Contains(symbol))
-            return (false, "scanner-symbol-outside-universe");
-
-        if (!features.L1.HasQuote)
-            return (false, "scanner-l1-missing");
-
-        var spreadScore = features.L1.SpreadPct <= 0
-            ? 0.0
-            : Math.Clamp(((_config.MaxSpreadPct - features.L1.SpreadPct) / Math.Max(1e-6, _config.MaxSpreadPct)) * 100.0, 0.0, 100.0);
-
-        var depthMin = Math.Min(features.L2.BidDepthN, features.L2.AskDepthN);
-        var depthScore = Math.Clamp((depthMin / Math.Max(1.0, _config.MinDepthPerSideShares)) * 100.0, 0.0, 100.0);
-
-        var rvolScore = double.IsNaN(features.Rvol)
-            ? 0.0
-            : Math.Clamp((features.Rvol / Math.Max(0.1, _config.RvolMin)) * 100.0, 0.0, 100.0);
-
-        var imbalanceMid = 0.5 * (_config.MinImbalanceLong + _config.MaxImbalanceShort);
-        var imbalancePenalty = Math.Min(1.0, Math.Abs(features.L2.ImbalanceRatio - imbalanceMid));
-        var imbalanceScore = Math.Clamp((1.0 - imbalancePenalty) * 100.0, 0.0, 100.0);
-
-        var composite = 0.35 * spreadScore + 0.30 * depthScore + 0.25 * rvolScore + 0.10 * imbalanceScore;
-        if (composite < _config.ScannerMinCompositeScore)
-            return (false, "scanner-score-low");
-
-        return (true, string.Empty);
+        return V3LiveSelectionGate.Evaluate(symbol, features, _config, _tradeUniverse);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -796,14 +718,6 @@ public sealed class V3LiveRuntime : IStrategyRuntime, ILiveOrderSignalSource
         /// <summary>Last accepted proposed order — cached for AcknowledgeOrderTransmitted.</summary>
         public V3LiveProposedOrder? LastProposedOrder { get; set; }
     }
-
-    private sealed record HistoricalBarWatermark(
-        DateTime TimestampUtc,
-        double Open,
-        double High,
-        double Low,
-        double Close,
-        decimal Volume);
 
     private sealed record V3LiveRuntimeSummary(
         DateTime TimestampUtc,
