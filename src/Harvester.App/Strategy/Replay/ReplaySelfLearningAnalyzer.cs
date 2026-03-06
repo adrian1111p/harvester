@@ -47,6 +47,13 @@ public sealed record ReplaySelfLearningResult(
     ReplaySelfLearningSummaryRow Summary
 );
 
+/// <summary>
+/// V1 Self-learning analyzer (DEPRECATED — retained for backward compatibility).
+/// All new development should use <see cref="ReplaySelfLearningEngine"/> (V2.1).
+/// V1 uses only 6 features, no normalization, no walk-forward, no AUC-ROC.
+/// Math utilities now delegate to <see cref="SelfLearningMathUtils"/>.
+/// </summary>
+[Obsolete("Use ReplaySelfLearningEngine (V2.1) instead. V1 retained for backward-compatible JSON export only.")]
 public sealed class ReplaySelfLearningAnalyzer
 {
     public ReplaySelfLearningResult Analyze(
@@ -133,14 +140,16 @@ public sealed class ReplaySelfLearningAnalyzer
         }
 
         var weights = TrainLogisticRegression(features, labels);
-        var raw = features.Select(x => Sigmoid(Dot(weights, x))).ToArray();
+        var raw = features.Select(x => SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(weights, x))).ToArray();
 
         var baseRate = labels.Average();
         var averageRaw = raw.Average();
-        var shift = Logit(ClampProbability(baseRate)) - Logit(ClampProbability(averageRaw));
+        var shift = SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(baseRate))
+            - SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(averageRaw));
 
         var calibrated = raw
-            .Select(p => Sigmoid(Logit(ClampProbability(p)) + shift))
+            .Select(p => SelfLearningMathUtils.Sigmoid(
+                SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(p)) + shift))
             .ToArray();
 
         var predictions = sampleRows
@@ -162,10 +171,10 @@ public sealed class ReplaySelfLearningAnalyzer
             baseRate,
             averageRaw,
             calibrated.Average(),
-            BrierScore(labels, raw),
-            BrierScore(labels, calibrated),
-            LogLoss(labels, raw),
-            LogLoss(labels, calibrated),
+            SelfLearningMathUtils.BrierScore(labels, raw),
+            SelfLearningMathUtils.BrierScore(labels, calibrated),
+            SelfLearningMathUtils.LogLoss(labels, raw),
+            SelfLearningMathUtils.LogLoss(labels, calibrated),
             weights);
 
         return new ReplaySelfLearningResult(sampleRows, predictions, summary);
@@ -186,7 +195,7 @@ public sealed class ReplaySelfLearningAnalyzer
             {
                 var x = features[i];
                 var y = labels[i];
-                var prediction = Sigmoid(Dot(weights, x));
+                var prediction = SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(weights, x));
                 var error = y - prediction;
 
                 for (var j = 0; j < dimension; j++)
@@ -197,73 +206,5 @@ public sealed class ReplaySelfLearningAnalyzer
         }
 
         return weights;
-    }
-
-    private static double Dot(IReadOnlyList<double> left, IReadOnlyList<double> right)
-    {
-        var total = 0.0;
-        for (var i = 0; i < left.Count; i++)
-        {
-            total += left[i] * right[i];
-        }
-
-        return total;
-    }
-
-    private static double Sigmoid(double value)
-    {
-        if (value >= 0)
-        {
-            var z = Math.Exp(-value);
-            return 1.0 / (1.0 + z);
-        }
-
-        var exp = Math.Exp(value);
-        return exp / (1.0 + exp);
-    }
-
-    private static double Logit(double probability)
-    {
-        var clamped = ClampProbability(probability);
-        return Math.Log(clamped / (1.0 - clamped));
-    }
-
-    private static double ClampProbability(double probability)
-    {
-        return Math.Clamp(probability, 1e-6, 1.0 - 1e-6);
-    }
-
-    private static double BrierScore(IReadOnlyList<int> labels, IReadOnlyList<double> probabilities)
-    {
-        if (labels.Count == 0)
-        {
-            return 0;
-        }
-
-        var total = 0.0;
-        for (var i = 0; i < labels.Count; i++)
-        {
-            var diff = labels[i] - probabilities[i];
-            total += diff * diff;
-        }
-
-        return total / labels.Count;
-    }
-
-    private static double LogLoss(IReadOnlyList<int> labels, IReadOnlyList<double> probabilities)
-    {
-        if (labels.Count == 0)
-        {
-            return 0;
-        }
-
-        var total = 0.0;
-        for (var i = 0; i < labels.Count; i++)
-        {
-            var probability = ClampProbability(probabilities[i]);
-            total += labels[i] == 1 ? Math.Log(probability) : Math.Log(1.0 - probability);
-        }
-
-        return -total / labels.Count;
     }
 }

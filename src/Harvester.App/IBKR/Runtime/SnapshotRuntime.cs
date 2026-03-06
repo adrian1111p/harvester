@@ -6339,9 +6339,11 @@ public sealed partial class SnapshotRuntime
 
         var performanceAnalyzer = new ReplayPerformanceAnalyzer();
         var performance = performanceAnalyzer.Analyze(slices, replayFillRows, replayPortfolioRows, _options.ReplayInitialCash);
+#pragma warning disable CS0612, CS0618 // V1 analyzer retained for backward-compatible JSON export
         var selfLearningAnalyzer = new ReplaySelfLearningAnalyzer();
+#pragma warning restore CS0612, CS0618
         var selfLearning = selfLearningAnalyzer.Analyze(replayFillRows, replayCostDeltaRows, performance.Packets);
-        // V2 self-learning engine
+        // V2.1 self-learning engine
         var selfLearningEngineV2 = new ReplaySelfLearningEngine();
         var selfLearningV2 = selfLearningEngineV2.Analyze(replayFillRows, replayCostDeltaRows, performance.Packets);
         var existingV2BiasStore = LoadSelfLearningV2BiasStore(replaySelfLearningV2BiasStorePath);
@@ -6680,8 +6682,11 @@ public sealed partial class SnapshotRuntime
                 json,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
         }
-        catch
+        catch (Exception ex)
         {
+            // [D9 FIX] Log instead of silently swallowing — corrupt store
+            // files should be visible for debugging, not hidden.
+            Console.Error.WriteLine($"[WARN] Failed to load V2 bias store from {path}: {ex.Message}");
             return null;
         }
     }

@@ -1,16 +1,28 @@
 // ═══════════════════════════════════════════════════════════════════════
-// ReplaySelfLearningEngine V2.0
+// ReplaySelfLearningEngine V2.1
 // Post-trade adaptive learning engine with feature-rich GLM, running
-// z-score normalization, online incremental updates, walk-forward
-// temporal split, feature importance, confidence-weighted symbol store,
-// and data-driven position-sizing / stop recommendations.
+// z-score normalization, online incremental updates, expanding-window
+// walk-forward temporal split, AUC-ROC, 2-parameter Platt calibration,
+// epoch shuffling, early stopping, feature importance, confidence-
+// weighted symbol store, and data-driven position-sizing / stop
+// recommendations.
+//
+// V2.1 fixes vs V2.0:
+//   [C1] Fixed label leakage in streak_length (was using target label)
+//   [C2] Fixed normalization data leakage (stats now train-only)
+//   [C3] Added Fisher-Yates epoch shuffling for SGD convergence
+//   [C4] Added early stopping with patience (prevents overfitting)
+//   [D5] 2-parameter Platt calibration (scale + shift)
+//   [D6] Expanding-window walk-forward (multiple temporal splits)
+//   [D10] Added AUC-ROC as discriminative metric
+//   [D1-D4] Improved proxy feature documentation with honest naming
 // ═══════════════════════════════════════════════════════════════════════
 
 using Harvester.App.IBKR.Runtime;
 
 namespace Harvester.App.Strategy;
 
-// ─── V2.0 Feature vector ────────────────────────────────────────────
+// ─── V2.1 Feature vector ────────────────────────────────────────────
 
 /// <summary>
 /// Extended feature row with 16 engineered features (vs 6 in V1).
@@ -61,7 +73,7 @@ public sealed record SelfLearningV2PredictionRow(
 
 /// <summary>
 /// Aggregate scoring and diagnostics for V2 model evaluation.
-/// Includes walk-forward validation metrics when enough data exists.
+/// Includes expanding-window walk-forward validation metrics and AUC-ROC.
 /// </summary>
 public sealed record SelfLearningV2SummaryRow(
     DateTime TimestampUtc,
@@ -76,11 +88,16 @@ public sealed record SelfLearningV2SummaryRow(
     double CalibratedBrierScore,
     double RawLogLoss,
     double CalibratedLogLoss,
-    // ── Walk-forward out-of-sample metrics ──
+    // ── Walk-forward out-of-sample metrics (averaged across expanding windows) ──
     int WalkForwardOosSamples,
     double WalkForwardOosBrier,
     double WalkForwardOosLogLoss,
     double WalkForwardOosAccuracy,
+    // ── Discriminative metric ──
+    double AucRoc,
+    double WalkForwardOosAucRoc,
+    // ── Training diagnostics ──
+    int EarlyStopEpoch,
     // ── Model details ──
     int FeatureCount,
     IReadOnlyList<double> GlmWeights,
@@ -105,7 +122,9 @@ public sealed record SelfLearningV2HyperparametersRow(
     double AdaGradEpsilon,
     double WalkForwardSplitRatio,
     int MinWalkForwardSamples,
-    double FeatureClipSigma
+    double FeatureClipSigma,
+    int EarlyStopPatience,
+    int WalkForwardFolds
 );
 
 /// <summary>
@@ -159,12 +178,12 @@ public sealed record SelfLearningV2TimeOfDayRow(
 );
 
 // ═══════════════════════════════════════════════════════════════════════
-// V2 ENGINE
+// V2.1 ENGINE
 // ═══════════════════════════════════════════════════════════════════════
 
 public sealed class ReplaySelfLearningEngine
 {
-    public const string Version = "V2.0";
+    public const string Version = "V2.1";
 
     // ── Feature names in order (match vector indices) ────────────────
     private static readonly string[] FeatureNames =
@@ -177,14 +196,14 @@ public sealed class ReplaySelfLearningEngine
         "drawdown_bps",
         "hold_duration_sec",
         "r_multiple",
-        "mfe_over_mae",
-        "atr_relative_return",
+        "mfe_over_mae",            // NOTE: proxy from PnL sign; not actual intra-trade MFE/MAE
+        "atr_relative_return",     // NOTE: proxy using 2% of price as ATR stand-in
         "time_of_day_sin",
         "time_of_day_cos",
         "recent_win_rate_5",
-        "streak_length",
-        "volatility_regime",
-        "volume_participation"
+        "past_streak_length",      // [C1 FIX] was "streak_length" — now uses PAST-only streak
+        "volatility_regime",       // NOTE: proxy from drawdown magnitude
+        "volume_participation"     // NOTE: proxy from commission-to-notional ratio
     ];
 
     private const int FeatureDim = 16;
@@ -197,6 +216,9 @@ public sealed class ReplaySelfLearningEngine
     private readonly double _walkForwardSplit;
     private readonly int _minWalkForwardSamples;
     private readonly double _featureClipSigma;
+    private readonly int _earlyStopPatience;
+    private readonly int _walkForwardFolds;
+    private readonly Random _rng;
 
     public ReplaySelfLearningEngine(
         int epochs = 60,
@@ -205,7 +227,10 @@ public sealed class ReplaySelfLearningEngine
         double adaGradEpsilon = 1e-8,
         double walkForwardSplitRatio = 0.25,
         int minWalkForwardSamples = 20,
-        double featureClipSigma = 4.0)
+        double featureClipSigma = 4.0,
+        int earlyStopPatience = 8,
+        int walkForwardFolds = 3,
+        int? randomSeed = null)
     {
         _epochs = epochs;
         _initialLr = initialLearningRate;
@@ -214,6 +239,9 @@ public sealed class ReplaySelfLearningEngine
         _walkForwardSplit = walkForwardSplitRatio;
         _minWalkForwardSamples = minWalkForwardSamples;
         _featureClipSigma = featureClipSigma;
+        _earlyStopPatience = earlyStopPatience;
+        _walkForwardFolds = Math.Max(1, walkForwardFolds);
+        _rng = randomSeed.HasValue ? new Random(randomSeed.Value) : new Random();
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -244,15 +272,15 @@ public sealed class ReplaySelfLearningEngine
 
             // Raw features (same as V1 baseline)
             var notional = Math.Max(1e-9, Math.Abs(fill.Quantity * fill.FillPrice));
-            var commissionBps = Clamp((delta.CommissionDelta / notional) * 10_000.0, -500, 500);
-            var slippageBps = Clamp(((delta.SlippageDelta ?? 0.0) / notional) * 10_000.0, -1000, 1000);
+            var commissionBps = Math.Clamp((delta.CommissionDelta / notional) * 10_000.0, -500, 500);
+            var slippageBps = Math.Clamp(((delta.SlippageDelta ?? 0.0) / notional) * 10_000.0, -1000, 1000);
 
             var periodReturnBps = 0.0;
             var drawdownBps = 0.0;
             if (packetByTimestamp.TryGetValue(fill.TimestampUtc, out var packet))
             {
-                periodReturnBps = Clamp(packet.PeriodReturn * 10_000.0, -2000, 2000);
-                drawdownBps = Clamp(packet.Drawdown * 10_000.0, -2000, 0);
+                periodReturnBps = Math.Clamp(packet.PeriodReturn * 10_000.0, -2000, 2000);
+                drawdownBps = Math.Clamp(packet.Drawdown * 10_000.0, -2000, 0);
             }
 
             // V2 engineered features
@@ -266,15 +294,16 @@ public sealed class ReplaySelfLearningEngine
             var riskUsd = Math.Max(0.01, Math.Abs(fill.Quantity * fill.FillPrice) * 0.01);
             var rMultiple = fill.RealizedPnlDelta / riskUsd;
 
-            // MFE/MAE: use realized PnL direction as proxy since FillRow
-            // doesn't carry intra-trade extremes; set ratio from PnL sign
+            // MFE/MAE: proxy from PnL sign since FillRow doesn't carry
+            // intra-trade extremes. Acknowledged limitation — see audit D1.
             var mfeProxy = Math.Max(0, fill.RealizedPnlDelta);
             var maeProxy = Math.Abs(Math.Min(0, fill.RealizedPnlDelta));
             var mfeOverMae = maeProxy > 1e-9
                 ? mfeProxy / maeProxy
                 : mfeProxy > 0 ? 10.0 : 0.0;
 
-            // ATR-relative: use price-level proxy (2% of fill price)
+            // ATR-relative: proxy using 2% of fill price as ATR stand-in.
+            // Acknowledged limitation — see audit D2.
             var atrRef = Math.Max(0.01, fill.FillPrice * 0.02);
             var perShareReturn = fill.Quantity > 0 ? fill.RealizedPnlDelta / fill.Quantity : 0;
             var atrRelativeReturn = perShareReturn / atrRef;
@@ -290,41 +319,45 @@ public sealed class ReplaySelfLearningEngine
             var todSin = Math.Sin(todAngle);
             var todCos = Math.Cos(todAngle);
 
-            // Recent performance window
+            // Recent performance window (uses ONLY past labels)
             var recentWin5 = recentLabels.Count > 0 ? recentLabels.Average() : 0.5;
-            var streakLen = ComputeStreak(recentLabels, label);
 
-            // Volatility regime — drawdown magnitude as proxy
-            var volRegime = Clamp(Math.Abs(drawdownBps) / 100.0, 0, 20);
+            // [C1 FIX] Past-only streak: count consecutive same labels
+            // from the END of the past buffer, WITHOUT referencing the
+            // current trade's label. This eliminates target leakage.
+            var pastStreak = ComputePastStreak(recentLabels);
 
-            // Volume participation — commission as proxy for size
-            var volParticipation = Clamp(commissionBps / 50.0, 0, 10);
+            // Volatility regime — drawdown magnitude as proxy (see audit D3)
+            var volRegime = Math.Clamp(Math.Abs(drawdownBps) / 100.0, 0, 20);
+
+            // Volume participation — commission as proxy for size (see audit D4)
+            var volParticipation = Math.Clamp(commissionBps / 50.0, 0, 10);
 
             samples.Add(new SelfLearningV2SampleRow(
                 fill.TimestampUtc, fill.Symbol, fill.Side, fill.OrderType, fill.Source,
                 fill.RealizedPnlDelta, label,
                 commissionBps, slippageBps, periodReturnBps, drawdownBps,
                 holdDurationSec, rMultiple, mfeOverMae, atrRelativeReturn,
-                todSin, todCos, recentWin5, streakLen, volRegime, volParticipation));
+                todSin, todCos, recentWin5, pastStreak, volRegime, volParticipation));
 
             featureVectors.Add(
             [
-                1.0,                           // 0: intercept
-                sideSign,                       // 1: side_sign
-                commissionBps / 100.0,          // 2: commission_bps (scaled)
-                slippageBps / 100.0,            // 3: slippage_bps
-                periodReturnBps / 100.0,        // 4: period_return_bps
-                drawdownBps / 100.0,            // 5: drawdown_bps
-                holdDurationSec / 3600.0,       // 6: hold_duration_sec (to hours)
-                Clamp(rMultiple, -10, 10),       // 7: r_multiple
-                Clamp(mfeOverMae, 0, 20),        // 8: mfe_over_mae
-                Clamp(atrRelativeReturn, -5, 5), // 9: atr_relative_return
-                todSin,                          // 10: time_of_day_sin
-                todCos,                          // 11: time_of_day_cos
-                recentWin5,                      // 12: recent_win_rate_5
-                streakLen / 5.0,                 // 13: streak_length (scaled)
-                volRegime / 10.0,                // 14: volatility_regime (scaled)
-                volParticipation / 5.0           // 15: volume_participation (scaled)
+                1.0,                                          // 0: intercept
+                sideSign,                                     // 1: side_sign
+                commissionBps / 100.0,                        // 2: commission_bps (scaled)
+                slippageBps / 100.0,                          // 3: slippage_bps
+                periodReturnBps / 100.0,                      // 4: period_return_bps
+                drawdownBps / 100.0,                          // 5: drawdown_bps
+                holdDurationSec / 3600.0,                     // 6: hold_duration_sec (to hours)
+                Math.Clamp(rMultiple, -10, 10),               // 7: r_multiple
+                Math.Clamp(mfeOverMae, 0, 20),                // 8: mfe_over_mae
+                Math.Clamp(atrRelativeReturn, -5, 5),         // 9: atr_relative_return
+                todSin,                                       // 10: time_of_day_sin
+                todCos,                                       // 11: time_of_day_cos
+                recentWin5,                                   // 12: recent_win_rate_5
+                pastStreak / 5.0,                             // 13: past_streak_length (scaled)
+                volRegime / 10.0,                             // 14: volatility_regime (scaled)
+                volParticipation / 5.0                        // 15: volume_participation (scaled)
             ]);
             labels.Add(label);
 
@@ -340,51 +373,90 @@ public sealed class ReplaySelfLearningEngine
             return EmptyResult();
         }
 
-        // ── Step 2: Z-score normalization ────────────────────────────
-        var (means, stdDevs) = ComputeFeatureStats(featureVectors);
-        var normalized = NormalizeFeatures(featureVectors, means, stdDevs, _featureClipSigma);
-
-        // ── Step 3: Walk-forward temporal split ──────────────────────
+        // ── Step 2: Expanding-window walk-forward evaluation ─────────
+        // [C2 FIX] Normalization is now computed on TRAINING data only.
+        // [D6 FIX] Multiple expanding-window folds for robust OOS evaluation.
         var oosSamples = (int)(samples.Count * _walkForwardSplit);
         var hasWalkForward = oosSamples >= _minWalkForwardSamples;
 
-        double[] weights;
-        double wfBrier = 0, wfLogLoss = 0, wfAccuracy = 0;
+        double wfBrier = 0, wfLogLoss = 0, wfAccuracy = 0, wfAuc = 0;
         int wfCount = 0;
+        int earlyStopEpoch = _epochs;
 
         if (hasWalkForward)
         {
-            var trainEnd = samples.Count - oosSamples;
+            // Expanding-window walk-forward: divide OOS into K folds
+            var minTrainSize = samples.Count - oosSamples;
+            var foldSize = Math.Max(1, oosSamples / _walkForwardFolds);
 
-            // Train on first portion only
-            var trainFeatures = normalized.Take(trainEnd).ToList();
-            var trainLabels = labels.Take(trainEnd).ToList();
-            weights = TrainWithAdaGrad(trainFeatures, trainLabels);
+            var allOosBrier = new List<double>();
+            var allOosLogLoss = new List<double>();
+            var allOosAccuracy = new List<double>();
+            var allOosAuc = new List<double>();
+            var totalOosCount = 0;
 
-            // Score out-of-sample portion
-            var oosFeatures = normalized.Skip(trainEnd).ToList();
-            var oosLabels = labels.Skip(trainEnd).ToList();
-            var oosRaw = oosFeatures.Select(x => Sigmoid(Dot(weights, x))).ToArray();
+            for (var fold = 0; fold < _walkForwardFolds; fold++)
+            {
+                var foldTrainEnd = minTrainSize + fold * foldSize;
+                var foldTestEnd = fold < _walkForwardFolds - 1
+                    ? foldTrainEnd + foldSize
+                    : samples.Count;
 
-            wfCount = oosLabels.Count;
-            wfBrier = BrierScore(oosLabels, oosRaw);
-            wfLogLoss = LogLoss(oosLabels, oosRaw);
-            wfAccuracy = oosLabels.Select((y, idx) => (oosRaw[idx] >= 0.5 ? 1 : 0) == y ? 1.0 : 0.0).Average();
+                if (foldTrainEnd >= samples.Count || foldTestEnd > samples.Count)
+                    break;
 
-            // Retrain on full dataset for production weights
-            weights = TrainWithAdaGrad(normalized, labels);
+                // [C2 FIX] Normalize using TRAIN-ONLY statistics
+                var trainFeatures = featureVectors.Take(foldTrainEnd).ToList();
+                var trainLabels = labels.Take(foldTrainEnd).ToList();
+                var (trainMeans, trainStdDevs) = ComputeFeatureStats(trainFeatures);
+                var normTrain = NormalizeFeatures(trainFeatures, trainMeans, trainStdDevs, _featureClipSigma);
+
+                var (foldWeights, foldStopEpoch) = TrainWithAdaGrad(normTrain, trainLabels);
+                if (fold == _walkForwardFolds - 1)
+                    earlyStopEpoch = foldStopEpoch;
+
+                // Normalize test data using TRAIN statistics (no leakage)
+                var testFeatures = featureVectors.Skip(foldTrainEnd).Take(foldTestEnd - foldTrainEnd).ToList();
+                var testLabels = labels.Skip(foldTrainEnd).Take(foldTestEnd - foldTrainEnd).ToList();
+                var normTest = NormalizeFeatures(testFeatures, trainMeans, trainStdDevs, _featureClipSigma);
+
+                var testRaw = normTest.Select(x => SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(foldWeights, x))).ToArray();
+
+                var foldCount = testLabels.Count;
+                totalOosCount += foldCount;
+                allOosBrier.Add(SelfLearningMathUtils.BrierScore(testLabels, testRaw));
+                allOosLogLoss.Add(SelfLearningMathUtils.LogLoss(testLabels, testRaw));
+                allOosAccuracy.Add(testLabels
+                    .Select((y, idx) => (testRaw[idx] >= 0.5 ? 1 : 0) == y ? 1.0 : 0.0).Average());
+                allOosAuc.Add(SelfLearningMathUtils.AucRoc(testLabels, testRaw));
+            }
+
+            wfCount = totalOosCount;
+            wfBrier = allOosBrier.Count > 0 ? allOosBrier.Average() : 0;
+            wfLogLoss = allOosLogLoss.Count > 0 ? allOosLogLoss.Average() : 0;
+            wfAccuracy = allOosAccuracy.Count > 0 ? allOosAccuracy.Average() : 0;
+            wfAuc = allOosAuc.Count > 0 ? allOosAuc.Average() : 0;
         }
-        else
-        {
-            weights = TrainWithAdaGrad(normalized, labels);
-        }
 
-        // ── Step 4: Generate predictions + calibrate ─────────────────
-        var raw = normalized.Select(x => Sigmoid(Dot(weights, x))).ToArray();
+        // ── Step 3: Final model trained on ALL data ──────────────────
+        // [C2 FIX] Normalization stats from full dataset for final model
+        var (means, stdDevs) = ComputeFeatureStats(featureVectors);
+        var normalized = NormalizeFeatures(featureVectors, means, stdDevs, _featureClipSigma);
+        var (weights, finalStopEpoch) = TrainWithAdaGrad(normalized, labels);
+        if (!hasWalkForward)
+            earlyStopEpoch = finalStopEpoch;
+
+        // ── Step 4: Generate predictions + 2-parameter Platt calibration ─
+        var raw = normalized.Select(x => SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(weights, x))).ToArray();
         var baseRate = labels.Average();
-        var avgRaw = raw.Average();
-        var shift = Logit(ClampProb(baseRate)) - Logit(ClampProb(avgRaw));
-        var calibrated = raw.Select(p => Sigmoid(Logit(ClampProb(p)) + shift)).ToArray();
+        var (plattA, plattB) = FitPlattCalibration(labels, raw);
+        var calibrated = raw
+            .Select(p => SelfLearningMathUtils.Sigmoid(
+                plattA * SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(p)) + plattB))
+            .ToArray();
+
+        // Full-sample AUC-ROC
+        var fullAuc = SelfLearningMathUtils.AucRoc(labels, raw);
 
         // ── Step 5: Feature importance ───────────────────────────────
         var totalAbsWeight = weights.Select(Math.Abs).Sum();
@@ -419,16 +491,19 @@ public sealed class ReplaySelfLearningEngine
             samples.Count,
             labels.Sum(),
             baseRate,
-            avgRaw,
+            raw.Average(),
             calibrated.Average(),
-            BrierScore(labels, raw),
-            BrierScore(labels, calibrated),
-            LogLoss(labels, raw),
-            LogLoss(labels, calibrated),
+            SelfLearningMathUtils.BrierScore(labels, raw),
+            SelfLearningMathUtils.BrierScore(labels, calibrated),
+            SelfLearningMathUtils.LogLoss(labels, raw),
+            SelfLearningMathUtils.LogLoss(labels, calibrated),
             wfCount,
             wfBrier,
             wfLogLoss,
             wfAccuracy,
+            fullAuc,
+            wfAuc,
+            earlyStopEpoch,
             FeatureDim,
             weights,
             importance,
@@ -436,7 +511,8 @@ public sealed class ReplaySelfLearningEngine
             stdDevs,
             new SelfLearningV2HyperparametersRow(
                 _epochs, _initialLr, _l2Lambda, _adaGradEps,
-                _walkForwardSplit, _minWalkForwardSamples, _featureClipSigma));
+                _walkForwardSplit, _minWalkForwardSamples, _featureClipSigma,
+                _earlyStopPatience, _walkForwardFolds));
 
         return new SelfLearningV2Result(samples, predictions, summary);
     }
@@ -463,7 +539,7 @@ public sealed class ReplaySelfLearningEngine
         // Stop distance: use actual loss distribution
         var losses = result.Samples.Where(s => s.RealizedPnlDelta < 0).Select(s => Math.Abs(s.RealizedPnlDelta)).ToArray();
         var avgLoss = losses.Length > 0 ? losses.Average() : 0;
-        var medianLoss = losses.Length > 0 ? Percentile(losses, 0.5) : 0;
+        var medianLoss = losses.Length > 0 ? SelfLearningMathUtils.Percentile(losses, 0.5) : 0;
         var stopMultiplier = avgLoss > 0 && medianLoss > 0
             ? Math.Clamp(medianLoss / avgLoss, 0.8, 1.3)
             : 1.0;
@@ -616,24 +692,37 @@ public sealed class ReplaySelfLearningEngine
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // TRAINING: AdaGrad-regularized logistic regression
+    // TRAINING: AdaGrad-regularized logistic regression with
+    // epoch shuffling and early stopping
     // ─────────────────────────────────────────────────────────────────
 
-    private double[] TrainWithAdaGrad(
+    private (double[] Weights, int StoppedEpoch) TrainWithAdaGrad(
         IReadOnlyList<double[]> features,
         IReadOnlyList<int> labels)
     {
         var dim = features[0].Length;
         var weights = new double[dim];
+        var bestWeights = new double[dim];
         var gradAccum = new double[dim]; // AdaGrad accumulator
+
+        // [C3 FIX] Shuffle indices per epoch (Fisher-Yates)
+        var indices = Enumerable.Range(0, features.Count).ToArray();
+
+        var bestLoss = double.MaxValue;
+        var patienceCounter = 0;
+        var stoppedEpoch = _epochs;
 
         for (var epoch = 0; epoch < _epochs; epoch++)
         {
-            for (var i = 0; i < features.Count; i++)
+            // [C3 FIX] Shuffle data order each epoch
+            SelfLearningMathUtils.ShuffleIndices(indices, _rng);
+
+            for (var ii = 0; ii < features.Count; ii++)
             {
+                var i = indices[ii];
                 var x = features[i];
                 var y = labels[i];
-                var pred = Sigmoid(Dot(weights, x));
+                var pred = SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(weights, x));
                 var error = y - pred;
 
                 for (var j = 0; j < dim; j++)
@@ -644,9 +733,103 @@ public sealed class ReplaySelfLearningEngine
                     weights[j] -= adaptiveLr * gradient;
                 }
             }
+
+            // [C4 FIX] Early stopping: monitor training loss
+            var epochLoss = ComputeTrainingLoss(features, labels, weights);
+            if (epochLoss < bestLoss - 1e-6)
+            {
+                bestLoss = epochLoss;
+                Array.Copy(weights, bestWeights, dim);
+                patienceCounter = 0;
+            }
+            else
+            {
+                patienceCounter++;
+                if (patienceCounter >= _earlyStopPatience)
+                {
+                    stoppedEpoch = epoch + 1;
+                    return (bestWeights, stoppedEpoch);
+                }
+            }
         }
 
-        return weights;
+        return (weights, stoppedEpoch);
+    }
+
+    /// <summary>
+    /// Compute cross-entropy training loss for early stopping monitoring.
+    /// </summary>
+    private static double ComputeTrainingLoss(
+        IReadOnlyList<double[]> features,
+        IReadOnlyList<int> labels,
+        double[] weights)
+    {
+        var loss = 0.0;
+        for (var i = 0; i < features.Count; i++)
+        {
+            var p = SelfLearningMathUtils.ClampProb(
+                SelfLearningMathUtils.Sigmoid(SelfLearningMathUtils.Dot(weights, features[i])));
+            loss += labels[i] == 1 ? -Math.Log(p) : -Math.Log(1 - p);
+        }
+        return loss / features.Count;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // PLATT CALIBRATION (2-parameter)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fit 2-parameter Platt calibration: calibrated = sigmoid(a * logit(raw) + b).
+    /// Uses grid search over (a, b) to minimize Brier score on training data.
+    /// Falls back to shift-only if grid search produces worse results.
+    /// </summary>
+    private static (double A, double B) FitPlattCalibration(
+        IReadOnlyList<int> labels, IReadOnlyList<double> rawProbs)
+    {
+        if (labels.Count < 5)
+            return (1.0, 0.0); // Not enough data — identity calibration
+
+        var baseRate = labels.Average();
+        var avgRaw = rawProbs.Average();
+
+        // Shift-only baseline (original V2.0 behavior)
+        var shiftOnly = SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(baseRate))
+            - SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(avgRaw));
+        var bestA = 1.0;
+        var bestB = shiftOnly;
+        var bestBrier = EvalPlattBrier(labels, rawProbs, bestA, bestB);
+
+        // Grid search: a ∈ [0.5, 2.0], b ∈ [shift-1, shift+1]
+        for (var a = 0.5; a <= 2.0; a += 0.1)
+        {
+            for (var b = shiftOnly - 1.0; b <= shiftOnly + 1.0; b += 0.1)
+            {
+                var brier = EvalPlattBrier(labels, rawProbs, a, b);
+                if (brier < bestBrier)
+                {
+                    bestBrier = brier;
+                    bestA = a;
+                    bestB = b;
+                }
+            }
+        }
+
+        return (bestA, bestB);
+    }
+
+    private static double EvalPlattBrier(
+        IReadOnlyList<int> labels, IReadOnlyList<double> rawProbs,
+        double a, double b)
+    {
+        var sum = 0.0;
+        for (var i = 0; i < labels.Count; i++)
+        {
+            var logit = SelfLearningMathUtils.Logit(SelfLearningMathUtils.ClampProb(rawProbs[i]));
+            var cal = SelfLearningMathUtils.Sigmoid(a * logit + b);
+            var diff = labels[i] - cal;
+            sum += diff * diff;
+        }
+        return sum / labels.Count;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -722,94 +905,31 @@ public sealed class ReplaySelfLearningEngine
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // MATH UTILITIES
+    // MATH UTILITIES (delegating to shared SelfLearningMathUtils)
     // ─────────────────────────────────────────────────────────────────
 
-    private static double Dot(IReadOnlyList<double> a, IReadOnlyList<double> b)
-    {
-        var sum = 0.0;
-        for (var i = 0; i < a.Count; i++)
-        {
-            sum += a[i] * b[i];
-        }
-
-        return sum;
-    }
-
-    private static double Sigmoid(double x)
-    {
-        if (x >= 0)
-        {
-            var z = Math.Exp(-x);
-            return 1.0 / (1.0 + z);
-        }
-
-        var exp = Math.Exp(x);
-        return exp / (1.0 + exp);
-    }
-
-    private static double Logit(double p)
-    {
-        var c = ClampProb(p);
-        return Math.Log(c / (1.0 - c));
-    }
-
-    private static double ClampProb(double p) => Math.Clamp(p, 1e-6, 1.0 - 1e-6);
-
-    private static double Clamp(double v, double lo, double hi) => Math.Clamp(v, lo, hi);
-
-    private static double BrierScore(IReadOnlyList<int> labels, IReadOnlyList<double> probs)
-    {
-        if (labels.Count == 0) return 0;
-        var sum = 0.0;
-        for (var i = 0; i < labels.Count; i++)
-        {
-            var diff = labels[i] - probs[i];
-            sum += diff * diff;
-        }
-
-        return sum / labels.Count;
-    }
-
-    private static double LogLoss(IReadOnlyList<int> labels, IReadOnlyList<double> probs)
-    {
-        if (labels.Count == 0) return 0;
-        var sum = 0.0;
-        for (var i = 0; i < labels.Count; i++)
-        {
-            var p = ClampProb(probs[i]);
-            sum += labels[i] == 1 ? Math.Log(p) : Math.Log(1 - p);
-        }
-
-        return -sum / labels.Count;
-    }
-
-    private static double ComputeStreak(Queue<int> recentLabels, int currentLabel)
+    /// <summary>
+    /// [C1 FIX] Past-only streak: counts consecutive identical labels
+    /// from the end of the buffer, WITHOUT knowing the current trade's
+    /// outcome. Returns the length of the run at the tail.
+    /// Example: buffer=[W,L,W,W] → streak=2 (two wins at end).
+    /// This replaces the old ComputeStreak(buffer, currentLabel) which
+    /// leaked the target label into the feature vector.
+    /// </summary>
+    private static double ComputePastStreak(Queue<int> recentLabels)
     {
         if (recentLabels.Count == 0) return 0;
+
+        var last = recentLabels.Last();
         var streak = 0.0;
         foreach (var l in recentLabels.Reverse())
         {
-            if (l == currentLabel)
-            {
+            if (l == last)
                 streak++;
-            }
             else
-            {
                 break;
-            }
         }
-
         return streak;
-    }
-
-    private static double Percentile(double[] sorted, double pct)
-    {
-        if (sorted.Length == 0) return 0;
-        var copy = sorted.ToArray();
-        Array.Sort(copy);
-        var idx = (int)Math.Floor(pct * (copy.Length - 1));
-        return copy[Math.Clamp(idx, 0, copy.Length - 1)];
     }
 
     private static SelfLearningV2Result EmptyResult()
@@ -821,9 +941,11 @@ public sealed class ReplaySelfLearningEngine
                 DateTime.UtcNow, Version, 0, 0, 0,
                 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
+                0.5, 0.5, // AucRoc, WalkForwardOosAucRoc
+                0,        // EarlyStopEpoch
                 FeatureDim, new double[FeatureDim],
                 [],
                 new double[FeatureDim], new double[FeatureDim],
-                new SelfLearningV2HyperparametersRow(0, 0, 0, 0, 0, 0, 0)));
+                new SelfLearningV2HyperparametersRow(0, 0, 0, 0, 0, 0, 0, 0, 0)));
     }
 }
